@@ -197,7 +197,12 @@ class NPUPlatform(Platform):
                     quant_action.choices.append(ASCEND_QUANTIZATION_METHOD)
 
         if not is_310p():
-            from vllm_ascend.quantization import AscendCompressedTensorsConfig, AscendFp8Config, AscendModelSlimConfig  # noqa: F401
+            from vllm_ascend.quantization import (  # noqa: F401
+                AscendCompressedTensorsConfig,
+                AscendFp8Config,
+                AscendModelSlimConfig,
+                AscendVQ2A8Config,
+            )
         else:
             from vllm_ascend._310p.quantization import AscendModelSlimConfig310  # noqa: F401
 
