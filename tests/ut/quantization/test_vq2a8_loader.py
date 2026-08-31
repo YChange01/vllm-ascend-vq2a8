@@ -35,6 +35,9 @@ def _write_repacked_layer(tmp_path, num_experts: int = 2) -> None:
         "tp_size": 4,
         "tp_rank": 1,
         "expert_ids": list(range(num_experts)),
+        "complete": True,
+        "rht_block_size": 4,
+        "row_group_size": 2,
     }
     (rank_path / "experts_vq_layer_7.json").write_text(
         json.dumps(metadata), encoding="utf-8"
@@ -62,6 +65,7 @@ def test_config_registers_and_resolves_model_relative_paths(tmp_path) -> None:
     assert "vq2a8" in QUANTIZATION_METHODS
     assert config.experts_path == str(tmp_path / "experts_vq")
     assert config.kernel_path == str(tmp_path / "experts_vq_ascend")
+    assert config.allow_reference_fallback is True
 
 
 def test_load_repacked_layer_validates_and_loads_headers(tmp_path) -> None:
@@ -79,3 +83,13 @@ def test_load_repacked_layer_rejects_wrong_expert_count(tmp_path) -> None:
     _write_repacked_layer(tmp_path)
     with pytest.raises(ValueError, match="has 2 experts, expected 256"):
         load_repacked_layer(tmp_path, 7, 4, 1, 256)
+
+
+def test_config_can_require_compiled_operators() -> None:
+    config = AscendVQ2A8Config.from_config(
+        {
+            "experts_path": "experts_vq",
+            "allow_reference_fallback": False,
+        }
+    )
+    assert config.allow_reference_fallback is False

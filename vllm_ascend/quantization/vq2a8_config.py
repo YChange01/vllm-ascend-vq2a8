@@ -35,10 +35,12 @@ class AscendVQ2A8Config(QuantizationConfig):
         self,
         experts_path: str,
         kernel_path: str = "experts_vq_ascend",
+        allow_reference_fallback: bool = True,
     ) -> None:
         super().__init__()
         self.experts_path = experts_path
         self.kernel_path = kernel_path
+        self.allow_reference_fallback = allow_reference_fallback
 
     @classmethod
     def get_name(cls) -> str:
@@ -62,7 +64,14 @@ class AscendVQ2A8Config(QuantizationConfig):
     def from_config(cls, config: dict[str, Any]) -> AscendVQ2A8Config:
         experts_path = cls.get_from_keys(config, ["experts_path"])
         kernel_path = config.get("kernel_path", "experts_vq_ascend")
-        return cls(str(experts_path), str(kernel_path))
+        allow_reference_fallback = bool(
+            config.get("allow_reference_fallback", True)
+        )
+        return cls(
+            str(experts_path),
+            str(kernel_path),
+            allow_reference_fallback,
+        )
 
     def maybe_update_config(
         self,
@@ -96,6 +105,7 @@ class AscendVQ2A8Config(QuantizationConfig):
                 self.kernel_path,
                 prefix,
                 tid2eid=tid2eid,
+                allow_reference_fallback=self.allow_reference_fallback,
             )
         if isinstance(layer, LinearBase):
             return None

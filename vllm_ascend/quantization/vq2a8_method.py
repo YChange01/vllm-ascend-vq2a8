@@ -14,6 +14,7 @@ from safetensors import safe_open
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.utils import set_weight_attrs
@@ -115,6 +116,17 @@ def load_repacked_layer(
             f"Layer {layer_index} repack has {len(expert_ids)} experts, "
             f"expected {expected_experts}."
         )
+    if metadata.get("complete") is not True:
+        raise ValueError(f"Layer {layer_index} repack is not marked complete.")
+    if expert_ids != list(range(expected_experts)):
+        raise ValueError(
+            f"Layer {layer_index} VQ2 expert IDs must be contiguous from zero."
+        )
+    for key in ("rht_block_size", "row_group_size"):
+        if not isinstance(metadata.get(key), int) or metadata[key] <= 0:
+            raise ValueError(
+                f"Layer {layer_index} has invalid {key}={metadata.get(key)!r}."
+            )
     expected_keys = {
         f"{kind}_{field}"
         for kind in ASCEND_VQ2_KINDS
@@ -140,6 +152,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         kernel_path: str,
         prefix: str,
         tid2eid: torch.Tensor | None = None,
+        allow_reference_fallback: bool = True,
     ) -> None:
         super().__init__(moe_config)
         self.kernel_path = kernel_path
@@ -147,6 +160,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tid2eid = tid2eid
+        self.allow_reference_fallback = allow_reference_fallback
 
     def create_weights(
         self,
@@ -184,6 +198,8 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         layer.vq_expert_ids = torch.tensor(
             metadata["expert_ids"], device=device, dtype=torch.int32
         )
+        layer.vq_rht_block_size = int(metadata["rht_block_size"])
+        layer.vq_row_group_size = int(metadata["row_group_size"])
         layer._vq2a8_ascend_loaded = True
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module):
@@ -219,31 +235,83 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        del (
-            layer,
-            x,
-            router_logits,
-            top_k,
-            renormalize,
-            use_grouped_topk,
-            num_experts,
-            expert_map,
-            topk_group,
-            num_expert_group,
-            custom_routing_function,
-            scoring_func,
-            routed_scaling_factor,
-            e_score_correction_bias,
-            is_prefill,
-            enable_force_load_balance,
-            log2phy,
-            global_redundant_expert_num,
-            pertoken_scale,
+        del is_prefill, pertoken_scale
+        if expert_map is not None:
+            raise NotImplementedError("VQ2A8 does not support expert parallelism yet.")
+        if (
+            enable_force_load_balance
+            or log2phy is not None
+            or global_redundant_expert_num
+            or mc2_mask is not None
+        ):
+            raise NotImplementedError(
+                "VQ2A8 bring-up supports tensor parallelism without EPLB or MC2."
+            )
+
+        from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+        from vllm_ascend.quantization.vq2a8_ops import (
+            vq2a8_down_reduce,
+            vq2a8_gate_up,
+        )
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=layer.num_experts if num_experts == -1 else num_experts,
+            tid2eid=self.tid2eid,
+        )
+        token_ids = (
+            torch.arange(x.shape[0], device=x.device, dtype=torch.int64)
+            .unsqueeze(1)
+            .expand_as(topk_ids)
+            .reshape(-1)
+        )
+        expert_ids = topk_ids.reshape(-1).to(torch.int32)
+        routing_weights = topk_weights.reshape(-1)
+        expanded_x = x.index_select(0, token_ids)
+        if apply_router_weight_on_input:
+            expanded_x = expanded_x * routing_weights.to(x.dtype).unsqueeze(-1)
+            routing_weights = torch.ones_like(routing_weights)
+
+        gate_up = vq2a8_gate_up(
+            expanded_x,
+            expert_ids,
+            layer.vq_gate_up_packed_indices,
+            layer.vq_gate_up_codebooks,
+            layer.vq_gate_up_codebook_tile_ids,
+            layer.vq_gate_up_weight_scale,
+            layer.vq_gate_up_weight_bias,
+            layer.vq_gate_up_rht_sign,
+            layer.vq_rht_block_size,
+            layer.vq_row_group_size,
             activation,
-            apply_router_weight_on_input,
-            mc2_mask,
+            self.allow_reference_fallback,
         )
-        raise NotImplementedError(
-            "Ascend 950 VQ2A8 custom operators are not built. "
-            "Build the vq2a8_gate_up and vq2a8_down_reduce operators."
+        output = vq2a8_down_reduce(
+            gate_up,
+            expert_ids,
+            token_ids,
+            routing_weights,
+            layer.vq_down_packed_indices,
+            layer.vq_down_codebooks,
+            layer.vq_down_codebook_tile_ids,
+            layer.vq_down_weight_scale,
+            layer.vq_down_weight_bias,
+            layer.vq_down_rht_sign,
+            layer.vq_rht_block_size,
+            layer.vq_row_group_size,
+            x.shape[0],
+            self.allow_reference_fallback,
         )
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output
