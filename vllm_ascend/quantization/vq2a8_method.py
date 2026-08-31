@@ -18,9 +18,11 @@ from vllm.distributed import (
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.utils import set_weight_attrs
 
-from vllm_ascend.quantization.vq2a8_format import extract_decoder_layer_index
+from vllm_ascend.quantization.vq2a8_format import (
+    ASCEND_VQ2_TP_FORMAT,
+    extract_decoder_layer_index,
+)
 
-ASCEND_VQ2_TP_FORMAT = "vq2a8_ascend_tp_v1"
 ASCEND_VQ2_FIELDS = (
     "packed_indices",
     "codebooks",

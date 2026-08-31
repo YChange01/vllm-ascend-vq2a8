@@ -19,6 +19,7 @@ VQ2_CODEBOOK_SIZE = 16
 VQ2_INDEX_BITS = 4
 VQ2_VECTOR_LENGTH = 2
 VQ2_MATRIX_KINDS = ("gate_up", "down")
+ASCEND_VQ2_TP_FORMAT = "vq2a8_ascend_tp_v1"
 
 _EXPERT_NAME_PATTERN = re.compile(
     r"^(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
@@ -194,6 +195,19 @@ def unpack_vq2_indices(
     word_indices = torch.div(positions, 8, rounding_mode="floor")
     shifts = positions.remainder(8) * VQ2_INDEX_BITS
     return (words[word_indices] >> shifts) & (VQ2_CODEBOOK_SIZE - 1)
+
+
+def unpack_repacked_indices(
+    packed: torch.Tensor, input_size: int
+) -> torch.Tensor:
+    """Unpack a TP-local index grid to ``[output_pair, input]``."""
+    if packed.ndim != 2:
+        raise ValueError(
+            f"Repacked VQ2 indices must be 2D, got {tuple(packed.shape)}."
+        )
+    positions = torch.arange(input_size, device=packed.device, dtype=torch.int64)
+    words = packed.to(torch.int64) & 0xFFFFFFFF
+    return (words[:, positions // 8] >> ((positions % 8) * 4)) & 15
 
 
 @functools.cache
@@ -420,6 +434,52 @@ def decode_expert_weight(
     weight = decode_codebook_weight(tensors, metadata, device)
     weight = apply_vq2_weight_transforms(weight, tensors, metadata)
     return weight.reshape(metadata["orig_shape"]).to(torch.bfloat16)
+
+
+def decode_repacked_vq2_weight(
+    packed_indices: torch.Tensor,
+    codebooks: torch.Tensor,
+    codebook_tile_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+    row_group_size: int = 32,
+) -> torch.Tensor:
+    """Decode one TP-local matrix for repack correctness tests."""
+    input_size = codebook_tile_ids.numel()
+    indices = unpack_repacked_indices(packed_indices, input_size)
+    output_size = indices.shape[0] * VQ2_VECTOR_LENGTH
+    if output_size % row_group_size:
+        raise ValueError(
+            f"Output size {output_size} is not divisible by "
+            f"row group size {row_group_size}."
+        )
+    expected_codebook_shape = (
+        codebooks.shape[0],
+        output_size // row_group_size,
+        VQ2_CODEBOOK_SIZE,
+        VQ2_VECTOR_LENGTH,
+    )
+    if tuple(codebooks.shape) != expected_codebook_shape:
+        raise ValueError(
+            f"Codebook shape is {tuple(codebooks.shape)}, expected "
+            f"{expected_codebook_shape}."
+        )
+    output_rows = torch.arange(output_size, device=indices.device)
+    vector_rows = torch.div(output_rows, VQ2_VECTOR_LENGTH, rounding_mode="floor")
+    row_tiles = torch.div(output_rows, row_group_size, rounding_mode="floor")
+    components = output_rows.remainder(VQ2_VECTOR_LENGTH)
+    source_tiles = codebook_tile_ids.to(torch.int64)
+    weight = codebooks[
+        source_tiles.unsqueeze(0),
+        row_tiles.unsqueeze(1),
+        indices[vector_rows],
+        components.unsqueeze(1),
+    ].float()
+    weight = weight * weight_scale.float().unsqueeze(0)
+    weight += weight_bias.float().unsqueeze(0)
+    return _inverse_rht(weight, rht_block_size, rht_sign).to(torch.bfloat16)
 
 
 def shard_decoded_expert_weight(
