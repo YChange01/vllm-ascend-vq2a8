@@ -109,3 +109,28 @@ def test_reference_gate_up_rejects_unsupported_activation() -> None:
             row_group_size=2,
             activation=MoEActivation.GELU,
         )
+
+
+def test_reference_gate_up_casts_fp8_codebooks_before_lookup() -> None:
+    gate_payload = list(_payload(output_size=4, input_size=8, row_group_size=2))
+    gate_payload[1] = gate_payload[1].to(torch.float8_e4m3fn)
+    x = torch.arange(16, dtype=torch.float32).reshape(2, 8) / 17
+    expert_ids = torch.zeros(2, dtype=torch.int32)
+
+    actual = reference_vq2a8_gate_up(
+        x,
+        expert_ids,
+        *gate_payload,
+        rht_block_size=4,
+        row_group_size=2,
+    )
+    gate_payload[1] = gate_payload[1].to(torch.bfloat16)
+    expected = reference_vq2a8_gate_up(
+        x,
+        expert_ids,
+        *gate_payload,
+        rht_block_size=4,
+        row_group_size=2,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

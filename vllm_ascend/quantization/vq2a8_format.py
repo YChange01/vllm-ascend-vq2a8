@@ -471,7 +471,13 @@ def decode_repacked_vq2_weight(
     row_tiles = torch.div(output_rows, row_group_size, rounding_mode="floor")
     components = output_rows.remainder(VQ2_VECTOR_LENGTH)
     source_tiles = codebook_tile_ids.to(torch.int64)
-    weight = codebooks[
+    # Ascend aclnnIndex cannot use an FP8 tensor as the indexed source. The
+    # reference path reconstructs BF16 weights, and BF16 represents every
+    # finite E4M3FN value exactly, so cast before the advanced lookup.
+    lookup_codebooks = codebooks
+    if lookup_codebooks.dtype == torch.float8_e4m3fn:
+        lookup_codebooks = lookup_codebooks.to(torch.bfloat16)
+    weight = lookup_codebooks[
         source_tiles.unsqueeze(0),
         row_tiles.unsqueeze(1),
         indices[vector_rows],
