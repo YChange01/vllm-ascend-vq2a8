@@ -24,7 +24,6 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
-from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
@@ -62,6 +61,15 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     }
+
+
+def _is_w8a8_dynamic(linear) -> bool:
+    """Return whether a linear layer uses the dynamic W8A8 adapter."""
+    quant_method = getattr(linear, "quant_method", None)
+    inner_method = getattr(quant_method, "quant_method", None)
+    return isinstance(quant_method, AscendW8A8DynamicLinearMethod) or isinstance(
+        inner_method, AscendW8A8DynamicLinearMethod
+    )
 
 
 @dataclass
@@ -1316,9 +1324,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
-        if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
-            self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
-        ):
+        if _is_w8a8_dynamic(self.wq_b):
             q_a = self.wq_a(hidden_states_local)
             qr_local, qr_pertoken_scale_local = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
                 q_a, self.q_norm.weight, epsilon=self.eps
@@ -1613,8 +1619,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
         assert indexer_kv_scale_metadata is not None
 
         if (
-            (not isinstance(self.inderxer_wq_b.quant_method, AscendUnquantizedLinearMethod))
-            and isinstance(self.inderxer_wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod)
+            _is_w8a8_dynamic(self.inderxer_wq_b)
             and qr_pertoken_scale is not None
             and get_ascend_device_type() not in {AscendDeviceType.A5}
         ):
