@@ -63,9 +63,23 @@ def apply_unquantized_grouped_o_proj(
         num_groups,
         o_lora_rank,
     )
+    if o_proj_input.shape[2] != grouped_weight.shape[2]:
+        raise ValueError(
+            "Grouped o-proj input and weight have different reduction "
+            f"dimensions: got {o_proj_input.shape[2]} and "
+            f"{grouped_weight.shape[2]}"
+        )
+
+    # torch.nn.Linear stores weight as (out_features, in_features), so the
+    # restored tensor is (groups, o_lora_rank, input_size).  The unquantized
+    # TransposeBatchMatMul API only supports identity perm_x2 and expects its
+    # weight in (batch, K, N) order.  Pass a transposed view here; reusing the
+    # quantized path's device-weight layout would make the operator interpret
+    # o_lora_rank as K.
+    npu_weight = grouped_weight.transpose(1, 2)
     return batch_matmul(
         o_proj_input,
-        grouped_weight,
+        npu_weight,
         bias=None,
         scale=None,
         perm_x1=(1, 0, 2),
