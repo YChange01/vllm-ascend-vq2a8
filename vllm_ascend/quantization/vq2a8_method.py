@@ -64,9 +64,7 @@ def create_compact_expert_parameters(
         set_weight_attrs(parameter, attrs)
     for kind in ASCEND_VQ2_KINDS:
         for field in ASCEND_VQ2_FIELDS:
-            layer.register_buffer(
-                f"vq_{kind}_{field}", torch.empty(0), persistent=False
-            )
+            layer.register_buffer(f"vq_{kind}_{field}", torch.empty(0), persistent=False)
     layer.register_buffer("vq_expert_ids", torch.empty(0), persistent=False)
 
 
@@ -87,11 +85,10 @@ def load_repacked_layer(
     tp_size: int,
     tp_rank: int,
     expected_experts: int,
+    allow_compact_experts: bool = False,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Load and validate one TP-local packed VQ2 layer on CPU."""
-    metadata_path, tensor_path = repacked_layer_paths(
-        kernel_path, layer_index, tp_size, tp_rank
-    )
+    metadata_path, tensor_path = repacked_layer_paths(kernel_path, layer_index, tp_size, tp_rank)
     if not metadata_path.is_file():
         raise FileNotFoundError(f"Missing Ascend VQ2 metadata: {metadata_path}.")
     if not tensor_path.is_file():
@@ -107,38 +104,26 @@ def load_repacked_layer(
     for key, expected_value in expected_metadata.items():
         if metadata.get(key) != expected_value:
             raise ValueError(
-                f"Ascend VQ2 metadata {key}={metadata.get(key)!r}, "
-                f"expected {expected_value!r}: {metadata_path}."
+                f"Ascend VQ2 metadata {key}={metadata.get(key)!r}, expected {expected_value!r}: {metadata_path}."
             )
     expert_ids = metadata.get("expert_ids", [])
-    if len(expert_ids) != expected_experts:
-        raise ValueError(
-            f"Layer {layer_index} repack has {len(expert_ids)} experts, "
-            f"expected {expected_experts}."
-        )
+    expert_count_matches = len(expert_ids) == expected_experts
+    compact_expert_count_is_valid = allow_compact_experts and 0 < len(expert_ids) <= expected_experts
+    if not expert_count_matches and not compact_expert_count_is_valid:
+        raise ValueError(f"Layer {layer_index} repack has {len(expert_ids)} experts, expected {expected_experts}.")
     if metadata.get("complete") is not True:
         raise ValueError(f"Layer {layer_index} repack is not marked complete.")
-    if expert_ids != list(range(expected_experts)):
-        raise ValueError(
-            f"Layer {layer_index} VQ2 expert IDs must be contiguous from zero."
-        )
+    if expert_ids != list(range(len(expert_ids))):
+        raise ValueError(f"Layer {layer_index} VQ2 expert IDs must be contiguous from zero.")
     for key in ("rht_block_size", "row_group_size"):
         if not isinstance(metadata.get(key), int) or metadata[key] <= 0:
-            raise ValueError(
-                f"Layer {layer_index} has invalid {key}={metadata.get(key)!r}."
-            )
-    expected_keys = {
-        f"{kind}_{field}"
-        for kind in ASCEND_VQ2_KINDS
-        for field in ASCEND_VQ2_FIELDS
-    }
+            raise ValueError(f"Layer {layer_index} has invalid {key}={metadata.get(key)!r}.")
+    expected_keys = {f"{kind}_{field}" for kind in ASCEND_VQ2_KINDS for field in ASCEND_VQ2_FIELDS}
     with safe_open(tensor_path, framework="pt", device="cpu") as handle:
         actual_keys = set(handle.keys())
         missing = sorted(expected_keys - actual_keys)
         if missing:
-            raise ValueError(
-                f"Layer {layer_index} repack is missing {missing[0]!r}."
-            )
+            raise ValueError(f"Layer {layer_index} repack is missing {missing[0]!r}.")
         tensors = {key: handle.get_tensor(key) for key in sorted(expected_keys)}
     return tensors, metadata
 
@@ -174,9 +159,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         del hidden_size, intermediate_size_per_partition
         layer.num_experts = num_experts
         layer.orig_dtype = params_dtype
-        create_compact_expert_parameters(
-            layer, num_experts, params_dtype, extra_weight_attrs
-        )
+        create_compact_expert_parameters(layer, num_experts, params_dtype, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if getattr(layer, "_vq2a8_ascend_loaded", False):
@@ -187,6 +170,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
             self.tp_size,
             self.tp_rank,
             layer.num_experts,
+            allow_compact_experts=self.tid2eid is not None,
         )
         device = layer.w13_weight.device
         for key, tensor in tensors.items():
@@ -195,9 +179,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
                 f"vq_{key}",
                 tensor.to(device=device, non_blocking=True).contiguous(),
             )
-        layer.vq_expert_ids = torch.tensor(
-            metadata["expert_ids"], device=device, dtype=torch.int32
-        )
+        layer.vq_expert_ids = torch.tensor(metadata["expert_ids"], device=device, dtype=torch.int32)
         layer.vq_rht_block_size = int(metadata["rht_block_size"])
         layer.vq_row_group_size = int(metadata["row_group_size"])
         layer._vq2a8_ascend_loaded = True
@@ -238,15 +220,8 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         del is_prefill, pertoken_scale
         if expert_map is not None:
             raise NotImplementedError("VQ2A8 does not support expert parallelism yet.")
-        if (
-            enable_force_load_balance
-            or log2phy is not None
-            or global_redundant_expert_num
-            or mc2_mask is not None
-        ):
-            raise NotImplementedError(
-                "VQ2A8 bring-up supports tensor parallelism without EPLB or MC2."
-            )
+        if enable_force_load_balance or log2phy is not None or global_redundant_expert_num or mc2_mask is not None:
+            raise NotImplementedError("VQ2A8 bring-up supports tensor parallelism without EPLB or MC2.")
 
         from vllm_ascend.ops.fused_moe.experts_selector import select_experts
         from vllm_ascend.quantization.vq2a8_ops import (
@@ -270,10 +245,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
             tid2eid=self.tid2eid,
         )
         token_ids = (
-            torch.arange(x.shape[0], device=x.device, dtype=torch.int64)
-            .unsqueeze(1)
-            .expand_as(topk_ids)
-            .reshape(-1)
+            torch.arange(x.shape[0], device=x.device, dtype=torch.int64).unsqueeze(1).expand_as(topk_ids).reshape(-1)
         )
         expert_ids = topk_ids.reshape(-1).to(torch.int32)
         routing_weights = topk_weights.reshape(-1)

@@ -39,9 +39,7 @@ def _write_repacked_layer(tmp_path, num_experts: int = 2) -> None:
         "rht_block_size": 4,
         "row_group_size": 2,
     }
-    (rank_path / "experts_vq_layer_7.json").write_text(
-        json.dumps(metadata), encoding="utf-8"
-    )
+    (rank_path / "experts_vq_layer_7.json").write_text(json.dumps(metadata), encoding="utf-8")
     save_file(
         _repacked_tensors(num_experts),
         rank_path / "experts_vq_layer_7.safetensors",
@@ -72,17 +70,27 @@ def test_load_repacked_layer_validates_and_loads_headers(tmp_path) -> None:
     _write_repacked_layer(tmp_path)
     tensors, metadata = load_repacked_layer(tmp_path, 7, 4, 1, 2)
     assert metadata["expert_ids"] == [0, 1]
-    assert set(tensors) == {
-        f"{kind}_{field}"
-        for kind in ASCEND_VQ2_KINDS
-        for field in ASCEND_VQ2_FIELDS
-    }
+    assert set(tensors) == {f"{kind}_{field}" for kind in ASCEND_VQ2_KINDS for field in ASCEND_VQ2_FIELDS}
 
 
 def test_load_repacked_layer_rejects_wrong_expert_count(tmp_path) -> None:
     _write_repacked_layer(tmp_path)
     with pytest.raises(ValueError, match="has 2 experts, expected 256"):
         load_repacked_layer(tmp_path, 7, 4, 1, 256)
+
+
+def test_load_repacked_layer_accepts_compact_hash_experts(tmp_path) -> None:
+    _write_repacked_layer(tmp_path, num_experts=1)
+    tensors, metadata = load_repacked_layer(
+        tmp_path,
+        7,
+        4,
+        1,
+        expected_experts=256,
+        allow_compact_experts=True,
+    )
+    assert metadata["expert_ids"] == [0]
+    assert tensors["gate_up_packed_indices"].shape[0] == 1
 
 
 def test_config_can_require_compiled_operators() -> None:
