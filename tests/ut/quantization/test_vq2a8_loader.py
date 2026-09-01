@@ -2,6 +2,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
 import json
+import sys
+import types
 
 import pytest
 import torch
@@ -18,6 +20,7 @@ from vllm_ascend.quantization.vq2a8_method import (
     ASCEND_VQ2_KINDS,
     ASCEND_VQ2_TP_FORMAT,
     _validate_runtime_options,
+    _wrap_fused_experts_result,
     create_compact_expert_parameters,
     load_repacked_layer,
 )
@@ -147,3 +150,20 @@ def test_runtime_guard_still_rejects_eplb_and_mc2(
             global_redundant_expert_num=global_redundant_expert_num,
             mc2_mask=mc2_mask,
         )
+
+
+def test_vq2_output_uses_fused_experts_result_protocol(monkeypatch) -> None:
+    module_name = "vllm_ascend.ops.fused_moe.moe_comm_method"
+    fake_module = types.ModuleType(module_name)
+
+    class FakeFusedExpertsResult:
+        def __init__(self, *, routed_out: torch.Tensor) -> None:
+            self.routed_out = routed_out
+
+    fake_module.FusedExpertsResult = FakeFusedExpertsResult
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+    output = torch.arange(4)
+
+    result = _wrap_fused_experts_result(output)
+
+    assert result.routed_out is output

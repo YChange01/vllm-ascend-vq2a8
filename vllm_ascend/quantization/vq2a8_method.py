@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from safetensors import safe_open
@@ -23,6 +23,9 @@ from vllm_ascend.quantization.vq2a8_format import (
     ASCEND_VQ2_TP_FORMAT,
     extract_decoder_layer_index,
 )
+
+if TYPE_CHECKING:
+    from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 
 ASCEND_VQ2_FIELDS = (
     "packed_indices",
@@ -143,6 +146,13 @@ def _validate_runtime_options(
         )
 
 
+def _wrap_fused_experts_result(output: torch.Tensor) -> FusedExpertsResult:
+    # Keep this import lazy so format/loader tests do not require torch-npu.
+    from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
+
+    return FusedExpertsResult(routed_out=output)
+
+
 class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
     """vLLM MoE method backed by TP-local packed VQ2 artifacts."""
 
@@ -231,7 +241,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         activation: str = "silu",
         apply_router_weight_on_input: bool = False,
         mc2_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> FusedExpertsResult:
         del is_prefill, pertoken_scale
         if expert_map is not None:
             raise NotImplementedError("VQ2A8 does not support expert parallelism yet.")
@@ -305,4 +315,4 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         )
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
-        return output
+        return _wrap_fused_experts_result(output)
