@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import pytest
 import torch
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
 from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
 from vllm_ascend.quantization.vq2a8_ops import (
@@ -44,7 +46,13 @@ def _payload(
     )
 
 
-def test_reference_two_stage_moe_matches_decoded_dense_weights() -> None:
+@pytest.mark.parametrize(
+    "activation",
+    ["silu", "swiglu", MoEActivation.SILU],
+)
+def test_reference_two_stage_moe_matches_decoded_dense_weights(
+    activation: str | MoEActivation,
+) -> None:
     gate_payload = _payload(output_size=4, input_size=8, row_group_size=2)
     down_payload = _payload(output_size=8, input_size=2, row_group_size=2)
     x = torch.arange(24, dtype=torch.float32).reshape(3, 8) / 17
@@ -58,6 +66,7 @@ def test_reference_two_stage_moe_matches_decoded_dense_weights() -> None:
         *gate_payload,
         rht_block_size=4,
         row_group_size=2,
+        activation=activation,
     )
     actual = reference_vq2a8_down_reduce(
         gate_up,
@@ -84,3 +93,19 @@ def test_reference_two_stage_moe_matches_decoded_dense_weights() -> None:
     expected = (torch.nn.functional.silu(gate) * up) @ down_weight.T
     expected *= routing_weights.unsqueeze(-1)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_reference_gate_up_rejects_unsupported_activation() -> None:
+    gate_payload = _payload(output_size=4, input_size=8, row_group_size=2)
+    x = torch.arange(8, dtype=torch.float32).reshape(1, 8) / 17
+    expert_ids = torch.zeros(1, dtype=torch.int32)
+
+    with pytest.raises(NotImplementedError, match="only supports SwiGLU"):
+        reference_vq2a8_gate_up(
+            x,
+            expert_ids,
+            *gate_payload,
+            rht_block_size=4,
+            row_group_size=2,
+            activation=MoEActivation.GELU,
+        )

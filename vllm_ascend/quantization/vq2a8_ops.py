@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from enum import Enum
 
 import torch
 import torch.nn.functional as F
@@ -15,6 +16,16 @@ logger = logging.getLogger(__name__)
 _warned_reference_fallback = False
 
 VQ2A8_CUSTOM_OPS = ("vq2a8_gate_up", "vq2a8_down_reduce")
+
+
+def _normalize_activation_name(activation: str | Enum) -> str:
+    value = activation.value if isinstance(activation, Enum) else activation
+    if not isinstance(value, str):
+        raise TypeError(
+            "VQ2A8 activation must be a string or string-valued enum, "
+            f"got {activation!r}."
+        )
+    return value
 
 
 def _custom_op(name: str):
@@ -107,7 +118,7 @@ def reference_vq2a8_gate_up(
     rht_sign: torch.Tensor,
     rht_block_size: int,
     row_group_size: int,
-    activation: str = "silu",
+    activation: str | Enum = "silu",
 ) -> torch.Tensor:
     """Decode selected gate/up experts and apply SwiGLU for bring-up tests."""
     _validate_payload(
@@ -120,7 +131,8 @@ def reference_vq2a8_gate_up(
         weight_bias,
         rht_sign,
     )
-    if activation not in ("silu", "swiglu"):
+    activation_name = _normalize_activation_name(activation)
+    if activation_name not in ("silu", "swiglu"):
         raise NotImplementedError(
             f"VQ2A8 reference fallback only supports SwiGLU, got {activation!r}."
         )
@@ -219,10 +231,11 @@ def vq2a8_gate_up(
     rht_sign: torch.Tensor,
     rht_block_size: int,
     row_group_size: int,
-    activation: str,
+    activation: str | Enum,
     allow_reference_fallback: bool,
 ) -> torch.Tensor:
     global _warned_reference_fallback
+    activation_name = _normalize_activation_name(activation)
     op = _custom_op("vq2a8_gate_up")
     if op is not None:
         return op(
@@ -236,7 +249,7 @@ def vq2a8_gate_up(
             rht_sign,
             rht_block_size,
             row_group_size,
-            activation,
+            activation_name,
         )
     if not allow_reference_fallback:
         raise RuntimeError("Ascend custom op _C_ascend.vq2a8_gate_up is unavailable.")
@@ -257,7 +270,7 @@ def vq2a8_gate_up(
         rht_sign,
         rht_block_size,
         row_group_size,
-        activation,
+        activation_name,
     )
 
 
