@@ -99,3 +99,51 @@ all-reduce after the down operator.
 The CPU reference and repack unit tests are the golden contract for the CANN
 kernel. Kernel results should first be checked against them at small shapes, then
 against real layer 0 and layer 3 payloads before performance tuning.
+
+## Small bring-up assets
+
+Do not use a uniformly down-sized toy matrix to tune the production kernel. Use
+two complementary assets while the full checkpoint is still being transferred:
+
+```bash
+# A four-layer/eight-expert checkpoint for vLLM loading and TP4 smoke tests.
+python tools/create_vq2a8_mini_checkpoint.py \
+  --source-model /path/to/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --output /path/to/DeepSeek-V4-Flash-VQ2A8-mini-4l-8e-tp4 \
+  --layers 4 --experts 8 --tp-size 4
+
+# One real layer-3 expert, TP4 payloads, and deterministic CPU goldens.
+python tools/export_vq2a8_kernel_fixture.py \
+  --input /path/to/DeepSeek-V4-Flash-VQ2A8-32x256/experts_vq \
+  --output /path/to/vq2a8-layer3-expert0-tp4 \
+  --layer 3 --expert 0 --tp-size 4
+```
+
+Layers 0 through 2 use hash routing and their canonical artifacts contain only
+expert 0. Layer 3 is therefore the first representative 256-expert layer for
+operator work. The mini checkpoint keeps layers 0 through 3 so it covers the
+uncompressed, c4, and c128 attention patterns; it is a functional integration
+fixture, not an accuracy model.
+
+Start the Mini checkpoint on an Ascend 950 host with the correctness-first
+settings:
+
+```bash
+vllm serve /path/to/DeepSeek-V4-Flash-VQ2A8-mini-4l-8e-tp4 \
+  --tensor-parallel-size 4 \
+  --dtype bfloat16 \
+  --kv-cache-dtype bfloat16 \
+  --max-model-len 128 \
+  --max-num-seqs 2 \
+  --enforce-eager
+```
+
+After installing the compiled operators, validate and benchmark one TP rank
+with:
+
+```bash
+python benchmarks/ops/benchmark_vq2a8_ascend950.py \
+  --fixture /path/to/vq2a8-layer3-expert0-tp4 \
+  --tp-size 4 --tp-rank 0 --iterations 100 \
+  --json-output vq2a8-rank0.json
+```
