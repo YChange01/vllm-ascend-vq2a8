@@ -6,6 +6,10 @@ import json
 import pytest
 import torch
 from safetensors.torch import save_file
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS
 
 from vllm_ascend.quantization.vq2a8_config import AscendVQ2A8Config
@@ -64,6 +68,14 @@ def test_config_registers_and_resolves_model_relative_paths(tmp_path) -> None:
     assert config.experts_path == str(tmp_path / "experts_vq")
     assert config.kernel_path == str(tmp_path / "experts_vq_ascend")
     assert config.allow_reference_fallback is True
+
+
+def test_config_keeps_dense_linears_unquantized() -> None:
+    config = AscendVQ2A8Config("unused")
+    layer = object.__new__(LinearBase)
+    method = config.get_quant_method(layer, "model.layers.0.self_attn.wq_a")
+
+    assert isinstance(method, UnquantizedLinearMethod)
 
 
 def test_load_repacked_layer_validates_and_loads_headers(tmp_path) -> None:

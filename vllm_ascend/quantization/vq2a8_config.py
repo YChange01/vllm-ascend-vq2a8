@@ -8,7 +8,10 @@ import os
 from typing import Any
 
 import torch
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    UnquantizedLinearMethod,
+)
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -108,5 +111,5 @@ class AscendVQ2A8Config(QuantizationConfig):
                 allow_reference_fallback=self.allow_reference_fallback,
             )
         if isinstance(layer, LinearBase):
-            return None
+            return UnquantizedLinearMethod()
         return None
