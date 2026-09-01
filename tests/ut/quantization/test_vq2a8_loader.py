@@ -68,6 +68,8 @@ def test_config_registers_and_resolves_model_relative_paths(tmp_path) -> None:
     assert config.experts_path == str(tmp_path / "experts_vq")
     assert config.kernel_path == str(tmp_path / "experts_vq_ascend")
     assert config.allow_reference_fallback is True
+    assert config.quant_description == {}
+    assert not any("norm.bias" in name for name in config.quant_description)
 
 
 def test_config_keeps_dense_linears_unquantized() -> None:

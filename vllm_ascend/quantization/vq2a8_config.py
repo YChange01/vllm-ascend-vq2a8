@@ -44,6 +44,7 @@ class AscendVQ2A8Config(QuantizationConfig):
         self.experts_path = experts_path
         self.kernel_path = kernel_path
         self.allow_reference_fallback = allow_reference_fallback
+        self.quant_description: dict[str, Any] = {}
 
     @classmethod
     def get_name(cls) -> str:
