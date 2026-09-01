@@ -129,14 +129,23 @@ Start the Mini checkpoint on an Ascend 950 host with the correctness-first
 settings:
 
 ```bash
+export VLLM_ASCEND_ENABLE_FLASHCOMM1=1
+
 vllm serve /path/to/DeepSeek-V4-Flash-VQ2A8-mini-4l-8e-tp4 \
   --tensor-parallel-size 4 \
   --dtype bfloat16 \
   --kv-cache-dtype bfloat16 \
   --max-model-len 128 \
   --max-num-seqs 2 \
+  --additional-config '{"enable_dsa_cp": true}' \
   --enforce-eager
 ```
+
+DeepSeek V4 on Ascend 950 does not support standalone TP-only attention. With
+TP4 the ordinary DSA metadata builder would pass 16 rank-local query heads,
+while the Ascend sparse-attention metadata operator accepts 64 or 128 heads.
+FlashComm1 plus DSA-CP keeps the global 64-head attention contract and is
+therefore required even for the Mini TP4 smoke test.
 
 After installing the compiled operators, validate and benchmark one TP rank
 with:

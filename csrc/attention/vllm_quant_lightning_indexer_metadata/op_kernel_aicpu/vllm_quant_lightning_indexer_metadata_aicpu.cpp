@@ -304,6 +304,7 @@ void VllmQuantLightningIndexerMetadataCpuKernel::CalcSplitInfo(SplitContext &spl
     for (uint32_t bIdx = 0; bIdx < batchSize_; bIdx++) {
         uint32_t s1Size = GetS1SeqSize(bIdx);
         uint32_t s2Size = GetS2SeqSize(bIdx) / cmpRatio_;
+        maxS2Size_ = std::max(maxS2Size_, s2Size);
         splitInfo.s1GBaseNum[bIdx] = (s1Size * groupSize_ + (mBaseSize_ - 1U)) / mBaseSize_;
         splitInfo.s1GTailSize[bIdx] = (s1Size * groupSize_) % mBaseSize_;
         splitInfo.s2BaseNum[bIdx] = (s2Size + s2BaseSize_ - 1U) / s2BaseSize_;
@@ -312,7 +313,20 @@ void VllmQuantLightningIndexerMetadataCpuKernel::CalcSplitInfo(SplitContext &spl
             splitInfo.isKvSeqAllZero = false;
         }
     }
-    return;
+    if (maxS2Size_ > sparseCount_) {
+        supportFd_ = true;
+        return;
+    }
+    validSocVersion_ = ProcessSocVersion();
+    if (validSocVersion_ == ValidSocVersion::ASCEND910B) {
+        if (maxS2Size_ > 2 * s2BaseSize_) {
+            supportFd_ = true;
+        }
+    } else if (validSocVersion_ == ValidSocVersion::ASCEND950) {
+        if (maxS2Size_ > 5 * s2BaseSize_) {
+            supportFd_ = true;
+        }
+    }
 }
 
 int64_t VllmQuantLightningIndexerMetadataCpuKernel::CalcPreTokenLeftUp(
@@ -821,6 +835,7 @@ void VllmQuantLightningIndexerMetadataCpuKernel::SplitFD(SplitResult &splitRes)
     uint32_t curCoreIndex = 0;
     for (uint32_t i = 0; i < splitRes.numOfFdHead; i++) {
         uint32_t curFDVectorNum = splitRes.fdRes.fdS2SplitNum[i] * splitRes.fdRes.fdMSize[i] / averageLoad; // 计算当前归约任务所用核数，向下取整，避免使用核数超出总核数
+        curFDVectorNum = std::max(1U, curFDVectorNum);
         uint32_t curAveMSize = (splitRes.fdRes.fdMSize[i] + curFDVectorNum - 1U) / curFDVectorNum; // 计算当前归约任务每个核的行数，向上取整，避免行数为0
         curFDVectorNum = (splitRes.fdRes.fdMSize[i] + curAveMSize -1U)/ curAveMSize;
         for (uint32_t vid = 0; vid < curFDVectorNum; vid++) {
