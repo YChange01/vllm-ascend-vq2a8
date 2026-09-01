@@ -89,12 +89,14 @@ an expert dimension prepended. `codebook_tile_ids` maps each TP-local input
 column back to its canonical codebook tile, so the device kernel does not need
 the original permutation.
 
-The optimized gate/up operator should dynamically quantize activation rows to
-the selected Ascend 950 A8 representation, look up VQ2 vectors without creating
-a dense weight matrix, accumulate in FP32, and fuse SwiGLU. The down operator
-should use the same lookup-matmul primitive, apply routing weights, reduce rows
-back to token order, and return the local TP contribution. vLLM performs the TP
-all-reduce after the down operator.
+The initial AscendC implementation dynamically quantizes activation rows to
+FP8 E4M3, looks up VQ2 vectors without creating a dense weight matrix,
+accumulates in FP32, and fuses SwiGLU. The down operator uses the same direct
+lookup-matmul primitive, applies routing weights, reduces rows back to token
+order, and returns the local TP contribution. vLLM performs the TP all-reduce
+after the down operator. This first implementation is a correctness baseline;
+replace its scalar codebook gather/dot loop with tiled Cube work only after the
+fixture checks below pass.
 
 The CPU reference and repack unit tests are the golden contract for the CANN
 kernel. Kernel results should first be checked against them at small shapes, then
@@ -147,12 +149,19 @@ while the Ascend sparse-attention metadata operator accepts 64 or 128 heads.
 FlashComm1 plus DSA-CP keeps the global 64-head attention contract and is
 therefore required even for the Mini TP4 smoke test.
 
-After installing the compiled operators, validate and benchmark one TP rank
-with:
+After installing the compiled operators, validate gate/up on one TP rank first:
 
 ```bash
 python benchmarks/ops/benchmark_vq2a8_ascend950.py \
   --fixture /path/to/vq2a8-layer3-expert0-tp4 \
-  --tp-size 4 --tp-rank 0 --iterations 100 \
+  --tp-size 4 --tp-rank 0 --stage gate-up --iterations 20
+```
+
+Then enable down/reduce and benchmark the complete local MoE path:
+
+```bash
+python benchmarks/ops/benchmark_vq2a8_ascend950.py \
+  --fixture /path/to/vq2a8-layer3-expert0-tp4 \
+  --tp-size 4 --tp-rank 0 --stage full --iterations 100 \
   --json-output vq2a8-rank0.json
 ```

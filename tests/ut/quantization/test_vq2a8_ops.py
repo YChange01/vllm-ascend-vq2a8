@@ -5,6 +5,7 @@ import pytest
 import torch
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 
+from vllm_ascend.quantization import vq2a8_ops
 from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
 from vllm_ascend.quantization.vq2a8_ops import (
     reference_vq2a8_down_reduce,
@@ -134,3 +135,87 @@ def test_reference_gate_up_casts_fp8_codebooks_before_lookup() -> None:
     )
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_gate_up_dispatch_forwards_the_native_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(output_size=4, input_size=8, row_group_size=2)
+    x = torch.zeros((2, 8), dtype=torch.bfloat16)
+    expert_ids = torch.zeros(2, dtype=torch.int32)
+    sentinel = torch.ones((2, 2), dtype=torch.bfloat16)
+    calls: list[tuple[object, ...]] = []
+
+    def fake_op(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(
+        vq2a8_ops,
+        "_custom_op",
+        lambda name: fake_op if name == "vq2a8_gate_up" else None,
+    )
+    actual = vq2a8_ops.vq2a8_gate_up(
+        x,
+        expert_ids,
+        *payload,
+        rht_block_size=4,
+        row_group_size=2,
+        activation="silu",
+        allow_reference_fallback=False,
+    )
+
+    assert actual is sentinel
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is expert_ids
+    assert all(
+        actual_arg is expected_arg
+        for actual_arg, expected_arg in zip(calls[0][2:8], payload)
+    )
+    assert calls[0][8:] == (4, 2, "silu")
+
+
+def test_down_reduce_dispatch_forwards_the_native_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = _payload(output_size=8, input_size=2, row_group_size=2)
+    x = torch.zeros((3, 2), dtype=torch.bfloat16)
+    expert_ids = torch.zeros(3, dtype=torch.int32)
+    token_ids = torch.arange(3, dtype=torch.int64)
+    routing_weights = torch.ones(3, dtype=torch.float32)
+    sentinel = torch.ones((3, 8), dtype=torch.bfloat16)
+    calls: list[tuple[object, ...]] = []
+
+    def fake_op(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(
+        vq2a8_ops,
+        "_custom_op",
+        lambda name: fake_op if name == "vq2a8_down_reduce" else None,
+    )
+    actual = vq2a8_ops.vq2a8_down_reduce(
+        x,
+        expert_ids,
+        token_ids,
+        routing_weights,
+        *payload,
+        rht_block_size=2,
+        row_group_size=2,
+        num_tokens=3,
+        allow_reference_fallback=False,
+    )
+
+    assert actual is sentinel
+    assert len(calls) == 1
+    assert calls[0][0] is x
+    assert calls[0][1] is expert_ids
+    assert calls[0][2] is token_ids
+    assert calls[0][3] is routing_weights
+    assert all(
+        actual_arg is expected_arg
+        for actual_arg, expected_arg in zip(calls[0][4:10], payload)
+    )
+    assert calls[0][10:] == (2, 2, 3)

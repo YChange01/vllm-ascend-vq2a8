@@ -14,7 +14,8 @@ from safetensors import safe_open
 
 from vllm_ascend.quantization.vq2a8_method import load_repacked_layer
 from vllm_ascend.quantization.vq2a8_ops import (
-    custom_vq2a8_ops_available,
+    custom_vq2a8_down_reduce_available,
+    custom_vq2a8_gate_up_available,
     vq2a8_down_reduce,
     vq2a8_gate_up,
 )
@@ -35,13 +36,21 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--rtol", type=float, default=0.08)
     parser.add_argument("--atol", type=float, default=1.0)
+    parser.add_argument(
+        "--stage",
+        choices=("gate-up", "full"),
+        default="full",
+        help="Validate gate/up alone first, then use full for gate/up plus down/reduce.",
+    )
     parser.add_argument("--json-output", type=Path)
     args = parser.parse_args()
 
     import torch_npu  # noqa: F401
 
-    if not custom_vq2a8_ops_available():
-        raise RuntimeError("Missing _C_ascend.vq2a8_gate_up or vq2a8_down_reduce.")
+    if not custom_vq2a8_gate_up_available():
+        raise RuntimeError("Missing _C_ascend.vq2a8_gate_up.")
+    if args.stage == "full" and not custom_vq2a8_down_reduce_available():
+        raise RuntimeError("Missing _C_ascend.vq2a8_down_reduce.")
     device = torch.device("npu")
     payload, metadata = load_repacked_layer(
         args.fixture / "ascend",
@@ -61,7 +70,7 @@ def main() -> None:
     routing_weights = golden["routing_weights"].to(device)
     num_tokens = int(token_ids.max().cpu()) + 1
 
-    def run_once() -> tuple[torch.Tensor, torch.Tensor]:
+    def run_once() -> tuple[torch.Tensor, torch.Tensor | None]:
         gate_up = vq2a8_gate_up(
             x,
             expert_ids,
@@ -76,22 +85,24 @@ def main() -> None:
             "silu",
             False,
         )
-        output = vq2a8_down_reduce(
-            gate_up,
-            expert_ids,
-            token_ids,
-            routing_weights,
-            payload["down_packed_indices"],
-            payload["down_codebooks"],
-            payload["down_codebook_tile_ids"],
-            payload["down_weight_scale"],
-            payload["down_weight_bias"],
-            payload["down_rht_sign"],
-            metadata["rht_block_size"],
-            metadata["row_group_size"],
-            num_tokens,
-            False,
-        )
+        output = None
+        if args.stage == "full":
+            output = vq2a8_down_reduce(
+                gate_up,
+                expert_ids,
+                token_ids,
+                routing_weights,
+                payload["down_packed_indices"],
+                payload["down_codebooks"],
+                payload["down_codebook_tile_ids"],
+                payload["down_weight_scale"],
+                payload["down_weight_bias"],
+                payload["down_rht_sign"],
+                metadata["rht_block_size"],
+                metadata["row_group_size"],
+                num_tokens,
+                False,
+            )
         return gate_up, output
 
     for _ in range(args.warmup):
@@ -103,12 +114,13 @@ def main() -> None:
         rtol=args.rtol,
         atol=args.atol,
     )
-    torch.testing.assert_close(
-        output.float().cpu(),
-        golden["expected_output_fp32"],
-        rtol=args.rtol,
-        atol=args.atol,
-    )
+    if output is not None:
+        torch.testing.assert_close(
+            output.float().cpu(),
+            golden["expected_output_fp32"],
+            rtol=args.rtol,
+            atol=args.atol,
+        )
 
     latencies_ms = []
     for _ in range(args.iterations):
@@ -119,6 +131,7 @@ def main() -> None:
         latencies_ms.append((time.perf_counter() - start) * 1000)
     result = {
         "fixture": str(args.fixture),
+        "stage": args.stage,
         "tp_rank": args.tp_rank,
         "tokens": num_tokens,
         "route_rows": x.shape[0],

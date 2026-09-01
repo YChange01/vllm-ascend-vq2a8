@@ -40,6 +40,16 @@ def custom_vq2a8_ops_available() -> bool:
     return all(_custom_op(name) is not None for name in VQ2A8_CUSTOM_OPS)
 
 
+def custom_vq2a8_gate_up_available() -> bool:
+    """Return whether the Ascend 950 packed gate/up kernel is registered."""
+    return _custom_op("vq2a8_gate_up") is not None
+
+
+def custom_vq2a8_down_reduce_available() -> bool:
+    """Return whether the Ascend 950 packed down/reduce kernel is registered."""
+    return _custom_op("vq2a8_down_reduce") is not None
+
+
 def _validate_payload(
     x: torch.Tensor,
     expert_ids: torch.Tensor,

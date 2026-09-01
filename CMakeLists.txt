@@ -69,6 +69,12 @@ if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "A5 hardware detected: disabling MLAPO operators")
     message(STATUS "A5 hardware detected: excluding batch_matmul_transpose operators")
     list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950})
+
+    # VQ2A8 is an Ascend 950-only direct kernel.  Keep it in a separate
+    # library so the legacy direct kernels above can remain disabled on A5.
+    ascendc_library(vllm_ascend_vq2a8_kernels SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/vq2a8/direct/vq2a8_kernel.cpp
+    )
 endif()
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
@@ -90,6 +96,12 @@ else()
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/aclnn_torch_adapter/*.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/batch_matmul_transpose/op_host/tiling/tiling_data.cpp)
+endif()
+
+if(NOT SOC_VERSION MATCHES "ascend950")
+    # The registration unit references the A5-only launchers above.
+    list(REMOVE_ITEM VLLM_ASCEND_SRC
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/vq2a8_torch.cpp)
 endif()
 
 include_directories(
@@ -181,11 +193,20 @@ set(VLLM_ASCEND_C_COMMON_LIBS
 )
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
-  target_link_libraries(
-    vllm_ascend_C
-    PUBLIC
-    ${VLLM_ASCEND_C_COMMON_LIBS}
-  )
+  if(SOC_VERSION MATCHES "ascend950")
+    target_link_libraries(
+      vllm_ascend_C
+      PUBLIC
+      vllm_ascend_vq2a8_kernels
+      ${VLLM_ASCEND_C_COMMON_LIBS}
+    )
+  else()
+    target_link_libraries(
+      vllm_ascend_C
+      PUBLIC
+      ${VLLM_ASCEND_C_COMMON_LIBS}
+    )
+  endif()
 else()
   target_link_libraries(
     vllm_ascend_C
@@ -197,7 +218,10 @@ endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend950")
+  install(TARGETS vllm_ascend_C vllm_ascend_vq2a8_kernels
+          DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+elseif(SOC_VERSION MATCHES "ascend310p.*")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
