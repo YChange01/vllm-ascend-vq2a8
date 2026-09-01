@@ -13,6 +13,11 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_o_proj import (
+    apply_unquantized_grouped_o_proj,
+    can_all_gather_dsa_cp_o_proj,
+    has_o_proj_weight_scale,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -1070,12 +1075,15 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 "DSA-CP expects full-head attn_sink loaded on every TP rank, "
                 f"got {self.attn_sink.numel()} heads, expected {self.num_heads}."
             )
+        self.enable_dsa_cp_with_o_proj_tp = self.enable_dsa_cp_with_o_proj_tp and can_all_gather_dsa_cp_o_proj(
+            self.wo_a, self.wo_b
+        )
         if self.enable_dsa_cp_with_o_proj_tp:
             self._maybe_init_o_proj_tp_full_params()
 
     @staticmethod
     def _check_dynamic_quant(layer: torch.nn.Module) -> bool:
-        return get_ascend_device_type() in {AscendDeviceType.A5} and hasattr(layer, "weight_scale")
+        return get_ascend_device_type() in {AscendDeviceType.A5} and has_o_proj_weight_scale(layer)
 
     def _maybe_init_o_proj_tp_full_params(self) -> None:
         self._wo_a_dynamic_quant = type(self)._check_dynamic_quant(self.wo_a)
@@ -1267,17 +1275,12 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 if olora_tp_enable():
                     o_proj_input = self.wo_a(o_proj_input)
                 else:
-                    # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
-                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
-                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
+                    o_proj_input = apply_unquantized_grouped_o_proj(
                         o_proj_input,
                         self.wo_a.weight,
-                        bias=None,
-                        scale=None,
-                        perm_x1=(1, 0, 2),
-                        perm_x2=(0, 1, 2),
-                        perm_y=(1, 0, 2),
-                        batch_split_factor=1,
+                        o_proj_groups,
+                        self.o_lora_rank,
+                        torch_npu.npu_transpose_batchmatmul,
                     )
                 o_proj_input = o_proj_input.reshape(num_tokens, -1)
                 output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)

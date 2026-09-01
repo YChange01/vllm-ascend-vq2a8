@@ -18,6 +18,10 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_mask import AttentionMaskBuilder
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.dsa_o_proj import (
+    apply_unquantized_grouped_o_proj,
+    has_o_proj_weight_scale,
+)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -1560,7 +1564,7 @@ class AscendDSAImpl(DSAAttentionImpl):
         # Quantized A5 (Ascend950) o_proj uses dynamic MX quant plus quantized
         # batch matmul. Unquantized projections (for example VQ2A8 attention)
         # must keep the BF16 path below because they have no weight_scale.
-        if get_ascend_device_type() in {AscendDeviceType.A5} and hasattr(self.wo_a, "weight_scale"):
+        if get_ascend_device_type() in {AscendDeviceType.A5} and has_o_proj_weight_scale(self.wo_a):
             o = o_proj_input
             o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
             o = torch_npu.npu_transpose_quant_batchmatmul(
@@ -1648,15 +1652,12 @@ class AscendDSAImpl(DSAAttentionImpl):
             o_proj_input = self.wo_a(o_proj_input)
             output[...] = self.wo_b(o_proj_input)
         else:
-            o_proj_input = torch_npu.npu_transpose_batchmatmul(
+            o_proj_input = apply_unquantized_grouped_o_proj(
                 o_proj_input,
                 self.wo_a.weight,
-                bias=None,
-                scale=None,
-                perm_x1=(1, 0, 2),
-                perm_x2=(0, 1, 2),
-                perm_y=(1, 0, 2),
-                batch_split_factor=1,
+                self.n_local_groups,
+                self.o_lora_rank,
+                torch_npu.npu_transpose_batchmatmul,
             )
             o_proj_input = o_proj_input.reshape(num_tokens, -1)
             output[...] = self.wo_b(o_proj_input)
