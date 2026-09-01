@@ -128,6 +128,21 @@ def load_repacked_layer(
     return tensors, metadata
 
 
+def _validate_runtime_options(
+    enable_force_load_balance: bool,
+    log2phy: torch.Tensor | None,
+    global_redundant_expert_num: int,
+    mc2_mask: torch.Tensor | None,
+) -> None:
+    # Profile/dummy runs use this flag only to spread synthetic tokens across
+    # experts. It does not mean that EPLB or MC2 is enabled.
+    del enable_force_load_balance
+    if log2phy is not None or global_redundant_expert_num or mc2_mask is not None:
+        raise NotImplementedError(
+            "VQ2A8 bring-up supports tensor parallelism without EPLB or MC2."
+        )
+
+
 class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
     """vLLM MoE method backed by TP-local packed VQ2 artifacts."""
 
@@ -220,8 +235,12 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         del is_prefill, pertoken_scale
         if expert_map is not None:
             raise NotImplementedError("VQ2A8 does not support expert parallelism yet.")
-        if enable_force_load_balance or log2phy is not None or global_redundant_expert_num or mc2_mask is not None:
-            raise NotImplementedError("VQ2A8 bring-up supports tensor parallelism without EPLB or MC2.")
+        _validate_runtime_options(
+            enable_force_load_balance,
+            log2phy,
+            global_redundant_expert_num,
+            mc2_mask,
+        )
 
         from vllm_ascend.ops.fused_moe.experts_selector import select_experts
         from vllm_ascend.quantization.vq2a8_ops import (

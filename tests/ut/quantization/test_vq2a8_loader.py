@@ -17,6 +17,7 @@ from vllm_ascend.quantization.vq2a8_method import (
     ASCEND_VQ2_FIELDS,
     ASCEND_VQ2_KINDS,
     ASCEND_VQ2_TP_FORMAT,
+    _validate_runtime_options,
     create_compact_expert_parameters,
     load_repacked_layer,
 )
@@ -115,3 +116,34 @@ def test_config_can_require_compiled_operators() -> None:
         }
     )
     assert config.allow_reference_fallback is False
+
+
+def test_profile_force_load_balance_is_not_treated_as_eplb() -> None:
+    _validate_runtime_options(
+        enable_force_load_balance=True,
+        log2phy=None,
+        global_redundant_expert_num=0,
+        mc2_mask=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("log2phy", "global_redundant_expert_num", "mc2_mask"),
+    [
+        (torch.empty(0), 0, None),
+        (None, 1, None),
+        (None, 0, torch.empty(0)),
+    ],
+)
+def test_runtime_guard_still_rejects_eplb_and_mc2(
+    log2phy: torch.Tensor | None,
+    global_redundant_expert_num: int,
+    mc2_mask: torch.Tensor | None,
+) -> None:
+    with pytest.raises(NotImplementedError, match="without EPLB or MC2"):
+        _validate_runtime_options(
+            enable_force_load_balance=True,
+            log2phy=log2phy,
+            global_redundant_expert_num=global_redundant_expert_num,
+            mc2_mask=mc2_mask,
+        )
