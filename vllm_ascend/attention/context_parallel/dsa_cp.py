@@ -1243,7 +1243,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self._switch_o_proj_to_full_weight(o_proj_full_handles)
         o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
         try:
-            if get_ascend_device_type() in {AscendDeviceType.A5}:
+            # VQ2A8 leaves attention projections in BF16, so A5 alone is not
+            # sufficient to select the MXFP8 path: wo_a must carry its scale.
+            if type(self)._check_dynamic_quant(self.wo_a):
                 o = o_proj_input.view(num_tokens, o_proj_groups, -1)
                 o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
                 o = torch_npu.npu_transpose_quant_batchmatmul(
