@@ -440,8 +440,10 @@ class DeepseekV4MoE(nn.Module):
             renormalize=config.norm_topk_prob,
             quant_config=quant_config,
             use_grouped_topk=True,
-            num_expert_group=getattr(config, "n_group", 1),
-            topk_group=getattr(config, "topk_group", 1),
+            # Some HF configs define these fields explicitly as None.
+            # Treat that as a single group for the grouped-topk router.
+            num_expert_group=getattr(config, "n_group", None) or 1,
+            topk_group=getattr(config, "topk_group", None) or 1,
             prefix=f"{prefix}.experts",
             scoring_func=getattr(config, "scoring_func", "softmax"),
             # Keep scaling outside the router path so the order matches
