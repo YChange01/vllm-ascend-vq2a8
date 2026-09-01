@@ -770,8 +770,23 @@ class NPUPlatform(Platform):
                 "Flash Comm v1 is only supported when tp_size > 1."
             )
 
-            assert not is_moe_model(vllm_config) or vllm_config.parallel_config.enable_expert_parallel, (
-                "Flash Comm v1 requires enable_expert_parallel=True for MoE models."
+            quant_cfg = getattr(
+                vllm_config.model_config.hf_config,
+                "quantization_config",
+                None,
+            ) or {}
+            is_vq2a8 = (
+                isinstance(quant_cfg, dict)
+                and quant_cfg.get("quant_method") == "vq2a8"
+            )
+
+            assert (
+                not is_moe_model(vllm_config)
+                or vllm_config.parallel_config.enable_expert_parallel
+                or is_vq2a8
+            ), (
+                "Flash Comm v1 requires enable_expert_parallel=True for MoE models, "
+                "except the VQ2A8 TP-repack path."
             )
 
         # Set "PYTORCH_NPU_ALLOC_CONF=expandable_segments:True" by default to optimize NPU memory management.
