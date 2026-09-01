@@ -78,14 +78,15 @@ public:
             }
         }
 
-        const float inverseNorm = 1.0F / sqrtf(static_cast<float>(rhtBlockSize_));
+        const float inverseNorm = 1.0F / sqrt(static_cast<float>(rhtBlockSize_));
         float amax = 0.0F;
         float bias = 0.0F;
         for (uint32_t column = 0; column < rhtBlockSize_; ++column) {
             const float rotated = values.GetValue(column) * inverseNorm;
             const float scaled = rotated * weightScaleGm_.GetValue(expertOffset + column);
             transformedGm_.SetValue(xOffset + column, scaled);
-            amax = fmaxf(amax, fabsf(scaled));
+            const float magnitude = scaled < 0.0F ? -scaled : scaled;
+            amax = magnitude > amax ? magnitude : amax;
             bias += rotated * weightBiasGm_.GetValue(expertOffset + column);
         }
         const uint64_t partialOffset = static_cast<uint64_t>(assignment) * numRhtBlocks_ + rhtBlock;
@@ -148,10 +149,12 @@ public:
         float amax = 0.0F;
         float bias = 0.0F;
         for (uint32_t block = 0; block < numRhtBlocks_; ++block) {
-            amax = fmaxf(amax, partialAmaxGm_.GetValue(partialOffset + block));
+            const float blockAmax = partialAmaxGm_.GetValue(partialOffset + block);
+            amax = blockAmax > amax ? blockAmax : amax;
             bias += partialBiasGm_.GetValue(partialOffset + block);
         }
-        const float scale = fmaxf(amax / kFp8Max, kMinScale);
+        const float unboundedScale = amax / kFp8Max;
+        const float scale = unboundedScale > kMinScale ? unboundedScale : kMinScale;
         activationScaleGm_.SetValue(assignment, scale);
         biasCorrectionGm_.SetValue(assignment, bias);
 
@@ -159,7 +162,8 @@ public:
         AscendC::LocalTensor<float> values = floatBuffer_.Get<float>();
         AscendC::LocalTensor<fp8_e4m3fn_t> fp8Values = fp8Buffer_.Get<fp8_e4m3fn_t>();
         AscendC::DataCopy(values, transformedGm_[rowOffset], sizeK_);
-        AscendC::SyncFunc<AscendC::HardEvent::MTE2_V>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::Muls(values, values, 1.0F / scale, sizeK_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Maxs(values, values, -kFp8Max, sizeK_);
@@ -167,7 +171,8 @@ public:
         AscendC::Mins(values, values, kFp8Max, sizeK_);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(fp8Values, values, AscendC::RoundMode::CAST_RINT, sizeK_);
-        AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
         AscendC::DataCopy(quantizedGm_[rowOffset], fp8Values, sizeK_);
     }
 
@@ -204,7 +209,8 @@ protected:
         AscendC::LocalTensor<float> activationFloat = activationFloatBuffer_.Get<float>();
         const uint64_t activationOffset = static_cast<uint64_t>(assignment) * sizeK;
         AscendC::DataCopy(activationFp8, quantizedGm_[activationOffset], sizeK);
-        AscendC::SyncFunc<AscendC::HardEvent::MTE2_V>();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::Cast(activationFloat, activationFp8, AscendC::RoundMode::CAST_NONE, sizeK);
         AscendC::PipeBarrier<PIPE_V>();
     }
@@ -300,7 +306,7 @@ public:
         codebooksGm_.SetGlobalBuffer((__gm__ fp8_e4m3fn_t*)codebooks);
         codebookTileIdsGm_.SetGlobalBuffer((__gm__ uint8_t*)codebookTileIds);
         outputGm_.SetGlobalBuffer((__gm__ bfloat16_t*)output);
-        InitLookupBuffers(pipe, sizeK);
+        InitLookupBuffers(pipe_, sizeK);
         pipe_->InitBuffer(gateBuffer_, kOutputTile * sizeof(float));
         pipe_->InitBuffer(upBuffer_, kOutputTile * sizeof(float));
         pipe_->InitBuffer(sigmoidBuffer_, kOutputTile * sizeof(float));
@@ -378,7 +384,8 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::LocalTensor<bfloat16_t> output = outputBuffer_.Get<bfloat16_t>();
         AscendC::Cast(output, gate, AscendC::RoundMode::CAST_RINT, kOutputTile);
-        AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
         const uint64_t outputOffset = static_cast<uint64_t>(assignment) * sizeN_ + tile * kOutputTile;
         AscendC::DataCopy(outputGm_[outputOffset], output, kOutputTile);
     }
@@ -446,7 +453,7 @@ public:
         codebooksGm_.SetGlobalBuffer((__gm__ fp8_e4m3fn_t*)codebooks);
         codebookTileIdsGm_.SetGlobalBuffer((__gm__ uint8_t*)codebookTileIds);
         outputGm_.SetGlobalBuffer((__gm__ float*)output);
-        InitLookupBuffers(pipe, sizeK);
+        InitLookupBuffers(pipe_, sizeK);
         pipe_->InitBuffer(outputFloatBuffer_, kOutputTile * sizeof(float));
         pipe_->InitBuffer(outputBf16Buffer_, kOutputTile * sizeof(bfloat16_t));
     }
@@ -490,7 +497,8 @@ public:
         AscendC::Cast(output, outputBf16, AscendC::RoundMode::CAST_NONE, kOutputTile);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(output, output, routingWeight, kOutputTile);
-        AscendC::SyncFunc<AscendC::HardEvent::V_MTE3>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(0);
         const uint64_t outputOffset = static_cast<uint64_t>(token) * sizeN_ + tile * kOutputTile;
         AscendC::SetAtomicAdd<float>();
         AscendC::DataCopy(outputGm_[outputOffset], output, kOutputTile);
