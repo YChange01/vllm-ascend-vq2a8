@@ -964,6 +964,7 @@ void KvQuantSparseAttnSharedkvMetadataCpuKernel::SplitFD(SplitResult &splitRes)
     uint32_t curCoreIndex = 0;
     for (uint32_t i = 0; i < splitRes.numOfFdHead; i++) {
         uint32_t curFDVectorNum = splitRes.fdRes.fdS2SplitNum[i] * splitRes.fdRes.fdMSize[i] / averageLoad; // 计算当前归约任务所用核数，向下取整，避免使用核数超出总核数
+        curFDVectorNum = std::max(1U, curFDVectorNum);
         uint32_t curAveMSize = (splitRes.fdRes.fdMSize[i] + curFDVectorNum - 1U) / curFDVectorNum; // 计算当前归约任务每个核的行数，向上取整，避免行数为0
         curFDVectorNum = (splitRes.fdRes.fdMSize[i] + curAveMSize -1U)/ curAveMSize;
         for (uint32_t vid = 0; vid < curFDVectorNum; vid++) {
