@@ -63,7 +63,11 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
         AscendC::Cast(values, inputBf16, AscendC::RoundMode::CAST_NONE, rhtBlockSize_);
-        AscendC::PipeBarrier<PIPE_V>();
+        // The FWHT below reads the cast result through scalar GetValue calls.
+        // PIPE_V only orders vector instructions; it does not make vector
+        // writes visible to the scalar pipeline.
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
 
         for (uint32_t column = 0; column < rhtBlockSize_; ++column) {
             const float value = values.GetValue(column);
@@ -257,12 +261,18 @@ protected:
                 component;
             weightFp8.SetValue(column, codebooksGm_.GetValue(codebookOffset));
         }
+        // weightFp8 is populated by scalar SetValue calls and consumed by the
+        // vector Cast below.
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
         AscendC::Cast(weightFloat, weightFp8, AscendC::RoundMode::CAST_NONE, sizeK);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(product, activationFloat, weightFloat, sizeK);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::ReduceSum<float>(product, product, reduce, sizeK);
-        AscendC::PipeBarrier<PIPE_V>();
+        // The reduced value is returned through scalar GetValue.
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
         return product.GetValue(0);
     }
 
@@ -372,6 +382,8 @@ public:
 
         AscendC::LocalTensor<bfloat16_t> gateBf16 = gateBf16Buffer_.Get<bfloat16_t>();
         AscendC::LocalTensor<bfloat16_t> upBf16 = upBf16Buffer_.Get<bfloat16_t>();
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
         AscendC::Cast(gateBf16, gate, AscendC::RoundMode::CAST_RINT, kOutputTile);
         AscendC::Cast(upBf16, up, AscendC::RoundMode::CAST_RINT, kOutputTile);
         AscendC::PipeBarrier<PIPE_V>();
@@ -500,6 +512,8 @@ public:
                     bias);
         }
         AscendC::LocalTensor<bfloat16_t> outputBf16 = outputBf16Buffer_.Get<bfloat16_t>();
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(0);
         AscendC::Cast(outputBf16, output, AscendC::RoundMode::CAST_RINT, kOutputTile);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Cast(output, outputBf16, AscendC::RoundMode::CAST_NONE, kOutputTile);
