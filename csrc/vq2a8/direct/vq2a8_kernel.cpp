@@ -41,6 +41,7 @@ public:
         transformedGm_.SetGlobalBuffer((__gm__ float*)transformed);
         partialAmaxGm_.SetGlobalBuffer((__gm__ float*)partialAmax);
         partialBiasGm_.SetGlobalBuffer((__gm__ float*)partialBias);
+        pipe_->InitBuffer(inputBf16Buffer_, rhtBlockSize * sizeof(bfloat16_t));
         pipe_->InitBuffer(valuesBuffer_, rhtBlockSize * sizeof(float));
     }
 
@@ -56,10 +57,16 @@ public:
         const uint32_t columnStart = rhtBlock * rhtBlockSize_;
         const uint64_t xOffset = static_cast<uint64_t>(assignment) * sizeK_ + columnStart;
         const uint64_t expertOffset = static_cast<uint64_t>(expert) * sizeK_ + columnStart;
+        AscendC::LocalTensor<bfloat16_t> inputBf16 = inputBf16Buffer_.Get<bfloat16_t>();
         AscendC::LocalTensor<float> values = valuesBuffer_.Get<float>();
+        AscendC::DataCopy(inputBf16, xGm_[xOffset], rhtBlockSize_);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(0);
+        AscendC::Cast(values, inputBf16, AscendC::RoundMode::CAST_NONE, rhtBlockSize_);
+        AscendC::PipeBarrier<PIPE_V>();
 
         for (uint32_t column = 0; column < rhtBlockSize_; ++column) {
-            const float value = static_cast<float>(xGm_.GetValue(xOffset + column));
+            const float value = values.GetValue(column);
             const float sign = static_cast<float>(rhtSignGm_.GetValue(expertOffset + column));
             values.SetValue(column, value * sign);
         }
@@ -96,6 +103,7 @@ public:
 
 private:
     AscendC::TPipe* pipe_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> inputBf16Buffer_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> valuesBuffer_;
     AscendC::GlobalTensor<bfloat16_t> xGm_;
     AscendC::GlobalTensor<int32_t> expertIdsGm_;
