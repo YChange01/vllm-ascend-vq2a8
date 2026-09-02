@@ -8,6 +8,7 @@
 #include <c10/util/string_view.h>
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -206,7 +207,8 @@ at::Tensor vq2a8_gate_up(
     const at::Tensor& rht_sign,
     int64_t rht_block_size,
     int64_t row_group_size,
-    c10::string_view activation)
+    c10::string_view activation,
+    double swiglu_limit)
 {
     check_transform_payload(
         x, expert_ids, weight_scale, weight_bias, rht_sign, rht_block_size);
@@ -215,6 +217,8 @@ at::Tensor vq2a8_gate_up(
     const std::string activation_name(activation);
     TORCH_CHECK(activation_name == "silu" || activation_name == "swiglu",
                 "VQ2A8 gate_up supports only silu/swiglu, got ", activation_name);
+    TORCH_CHECK(std::isfinite(swiglu_limit) && swiglu_limit >= 0.0,
+                "VQ2A8 swiglu_limit must be finite and non-negative, got ", swiglu_limit);
     TORCH_CHECK(shape.output_size % 2 == 0,
                 "VQ2A8 gate/up projected width must be even.");
     const int64_t intermediate_size = shape.output_size / 2;
@@ -243,7 +247,8 @@ at::Tensor vq2a8_gate_up(
         checked_u32(shape.num_experts, "expert count"),
         checked_u32(shape.num_codebook_tiles, "codebook tile count"),
         checked_u32(shape.row_tiles, "row tile count"),
-        checked_u32(row_group_size, "row group size"));
+        checked_u32(row_group_size, "row group size"),
+        static_cast<float>(swiglu_limit));
     return output;
 }
 
@@ -325,7 +330,8 @@ at::Tensor vq2a8_gate_up_meta(
     const at::Tensor& rht_sign,
     int64_t rht_block_size,
     int64_t row_group_size,
-    c10::string_view activation)
+    c10::string_view activation,
+    double swiglu_limit)
 {
     (void)expert_ids;
     (void)codebooks;
@@ -336,6 +342,7 @@ at::Tensor vq2a8_gate_up_meta(
     (void)rht_block_size;
     (void)row_group_size;
     (void)activation;
+    (void)swiglu_limit;
     return at::empty_symint({x.sym_size(0), packed_indices.sym_size(1)}, x.options());
 }
 
@@ -378,7 +385,7 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
         "vq2a8_gate_up(Tensor x, Tensor expert_ids, Tensor packed_indices, "
         "Tensor codebooks, Tensor codebook_tile_ids, Tensor weight_scale, "
         "Tensor weight_bias, Tensor rht_sign, int rht_block_size, "
-        "int row_group_size, str activation) -> Tensor");
+        "int row_group_size, str activation, float swiglu_limit) -> Tensor");
     ops.impl("vq2a8_gate_up", torch::kPrivateUse1, &vllm_ascend::vq2a8_gate_up);
     ops.def(
         "vq2a8_down_reduce(Tensor x, Tensor expert_ids, Tensor token_ids, "

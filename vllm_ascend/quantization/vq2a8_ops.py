@@ -154,6 +154,7 @@ def reference_vq2a8_gate_up(
     rht_block_size: int,
     row_group_size: int,
     activation: str | Enum = "silu",
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     """Decode selected gate/up experts and apply SwiGLU for bring-up tests."""
     _validate_payload(
@@ -196,6 +197,9 @@ def reference_vq2a8_gate_up(
         values = x.index_select(0, rows) @ weight.transpose(0, 1)
         projected.index_copy_(0, rows, values)
     gate, up = projected.chunk(2, dim=-1)
+    if swiglu_limit is not None and swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
     return F.silu(gate) * up
 
 
@@ -268,6 +272,7 @@ def vq2a8_gate_up(
     row_group_size: int,
     activation: str | Enum,
     allow_reference_fallback: bool,
+    swiglu_limit: float | None = None,
 ) -> torch.Tensor:
     global _warned_reference_fallback
     activation_name = _normalize_activation_name(activation)
@@ -285,6 +290,7 @@ def vq2a8_gate_up(
             rht_block_size,
             row_group_size,
             activation_name,
+            float(swiglu_limit) if swiglu_limit is not None else 0.0,
         )
     if not allow_reference_fallback:
         raise RuntimeError("Ascend custom op _C_ascend.vq2a8_gate_up is unavailable.")
@@ -306,6 +312,7 @@ def vq2a8_gate_up(
         rht_block_size,
         row_group_size,
         activation_name,
+        swiglu_limit,
     )
 
 

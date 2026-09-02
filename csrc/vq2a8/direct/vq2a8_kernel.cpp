@@ -306,7 +306,8 @@ public:
         uint32_t sizeK,
         uint32_t numCodebookTiles,
         uint32_t rowTiles,
-        uint32_t rowGroupSize)
+        uint32_t rowGroupSize,
+        float swigluLimit)
     {
         sizeM_ = sizeM;
         sizeN_ = sizeN;
@@ -314,6 +315,7 @@ public:
         numCodebookTiles_ = numCodebookTiles;
         rowTiles_ = rowTiles;
         rowGroupSize_ = rowGroupSize;
+        swigluLimit_ = swigluLimit;
         packedRows_ = sizeN;
         packedWords_ = (sizeK + 7U) / 8U;
         quantizedGm_.SetGlobalBuffer((__gm__ fp8_e4m3fn_t*)quantized);
@@ -390,6 +392,13 @@ public:
         AscendC::Cast(gate, gateBf16, AscendC::RoundMode::CAST_NONE, kOutputTile);
         AscendC::Cast(up, upBf16, AscendC::RoundMode::CAST_NONE, kOutputTile);
         AscendC::PipeBarrier<PIPE_V>();
+        if (swigluLimit_ > 0.0F) {
+            AscendC::Mins(gate, gate, swigluLimit_, kOutputTile);
+            AscendC::Maxs(up, up, -swigluLimit_, kOutputTile);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Mins(up, up, swigluLimit_, kOutputTile);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         AscendC::LocalTensor<float> sigmoid = sigmoidBuffer_.Get<float>();
         AscendC::LocalTensor<uint8_t> sigmoidTmp = sigmoidTmpBuffer_.Get<uint8_t>();
         AscendC::Sigmoid(sigmoid, gate, sigmoidTmp, kOutputTile);
@@ -431,6 +440,7 @@ private:
     uint32_t numCodebookTiles_ = 0;
     uint32_t rowTiles_ = 0;
     uint32_t rowGroupSize_ = 0;
+    float swigluLimit_ = 0.0F;
 };
 
 class VQ2A8DownReduceKernel : public VQ2A8LookupMatmulBase {
@@ -617,7 +627,8 @@ extern "C" __global__ __aicore__ void vq2a8_gate_up_kernel(
     uint32_t sizeK,
     uint32_t numCodebookTiles,
     uint32_t rowTiles,
-    uint32_t rowGroupSize)
+    uint32_t rowGroupSize,
+    float swigluLimit)
 {
     AscendC::TPipe pipe;
     VQ2A8GateUpKernel kernel(&pipe);
@@ -635,7 +646,8 @@ extern "C" __global__ __aicore__ void vq2a8_gate_up_kernel(
         sizeK,
         numCodebookTiles,
         rowTiles,
-        rowGroupSize);
+        rowGroupSize,
+        swigluLimit);
     kernel.Process();
 }
 
@@ -741,7 +753,8 @@ void vq2a8_gate_up_impl(
     uint32_t numExperts,
     uint32_t numCodebookTiles,
     uint32_t rowTiles,
-    uint32_t rowGroupSize)
+    uint32_t rowGroupSize,
+    float swigluLimit)
 {
     (void)numExperts;
     const uint32_t blockDim = sizeM * (sizeN / kOutputTile);
@@ -759,7 +772,8 @@ void vq2a8_gate_up_impl(
         sizeK,
         numCodebookTiles,
         rowTiles,
-        rowGroupSize);
+        rowGroupSize,
+        swigluLimit);
 }
 
 void vq2a8_down_reduce_impl(

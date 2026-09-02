@@ -296,6 +296,7 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
             layer.vq_row_group_size,
             activation,
             self.allow_reference_fallback,
+            swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
         output = vq2a8_down_reduce(
             gate_up,

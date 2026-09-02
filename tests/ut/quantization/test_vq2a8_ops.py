@@ -112,6 +112,33 @@ def test_reference_gate_up_rejects_unsupported_activation() -> None:
         )
 
 
+def test_reference_gate_up_applies_swiglu_limit() -> None:
+    gate_payload = _payload(output_size=4, input_size=8, row_group_size=2)
+    x = torch.arange(8, dtype=torch.float32).reshape(1, 8)
+    expert_ids = torch.zeros(1, dtype=torch.int32)
+    limit = 0.25
+
+    actual = reference_vq2a8_gate_up(
+        x,
+        expert_ids,
+        *gate_payload,
+        rht_block_size=4,
+        row_group_size=2,
+        swiglu_limit=limit,
+    )
+    weight = decode_repacked_vq2_weight(
+        *[tensor[0] for tensor in gate_payload],
+        rht_block_size=4,
+        row_group_size=2,
+    ).float()
+    gate, up = (x @ weight.T).chunk(2, dim=-1)
+    expected = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
+        min=-limit, max=limit
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_reference_gate_up_casts_fp8_codebooks_before_lookup() -> None:
     gate_payload = list(_payload(output_size=4, input_size=8, row_group_size=2))
     gate_payload[1] = gate_payload[1].to(torch.float8_e4m3fn)
@@ -187,6 +214,7 @@ def test_gate_up_dispatch_forwards_the_native_schema(
         row_group_size=2,
         activation="silu",
         allow_reference_fallback=False,
+        swiglu_limit=10.0,
     )
 
     assert actual is sentinel
@@ -197,7 +225,7 @@ def test_gate_up_dispatch_forwards_the_native_schema(
         actual_arg is expected_arg
         for actual_arg, expected_arg in zip(calls[0][2:8], payload)
     )
-    assert calls[0][8:] == (4, 2, "silu")
+    assert calls[0][8:] == (4, 2, "silu", 10.0)
 
 
 def test_down_reduce_dispatch_forwards_the_native_schema(

@@ -40,7 +40,8 @@ void vq2a8_gate_up_impl(
     uint32_t num_experts,
     uint32_t num_codebook_tiles,
     uint32_t row_tiles,
-    uint32_t row_group_size);
+    uint32_t row_group_size,
+    float swiglu_limit);
 
 void vq2a8_down_reduce_impl(
     void* stream,
