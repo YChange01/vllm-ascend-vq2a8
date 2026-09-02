@@ -108,7 +108,10 @@ def select_experts(
             num_expert_group=num_expert_group,
             custom_routing_function=custom_routing_function,
             scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
+            # Apply the routed scale once, below. Passing it through here as
+            # well used to scale the native result twice for the normal and
+            # grouped top-k paths.
+            routed_scaling_factor=1.0,
             e_score_correction_bias=e_score_correction_bias,
             tid2eid=None,
             input_ids=None,
@@ -279,7 +282,10 @@ def _select_experts_with_fusion_ops(
             tid2eid=tid2eid_ones,
             k_group=topk_group,
             group_count=num_expert_group,
-            routed_scaling_factor=routed_scaling_factor,
+            # The DeepSeek V4 order is: select raw sqrt-softplus scores,
+            # normalize the selected scores, then apply the routed scale.
+            # Keep scaling outside this op because it rejects renorm != 0.
+            routed_scaling_factor=1.0,
             eps=1e-20,
             group_select_mode=1,
             # The hash custom op currently rejects renorm != 0. Apply
@@ -288,6 +294,8 @@ def _select_experts_with_fusion_ops(
             norm_type=2,
             out_flag=False,
         )
+        topk_weights = _renormalize_topk_weights(topk_weights, renormalize)
+        topk_weights = topk_weights * routed_scaling_factor
         return topk_weights, topk_ids
     norm_type = 0 if scoring_func == "softmax" else 1
     if e_score_correction_bias is not None and e_score_correction_bias.dtype != router_logits.dtype:

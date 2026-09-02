@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from safetensors import safe_open
 
 from vllm_ascend.quantization.vq2a8_method import load_repacked_layer
@@ -26,6 +27,43 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[min(int((len(ordered) - 1) * quantile), len(ordered) - 1)]
 
 
+def _comparison_stats(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, object]:
+    actual = actual.detach().float().cpu()
+    expected = expected.detach().float().cpu()
+    finite = torch.isfinite(actual)
+    finite_values = actual[finite]
+    diff = actual - expected
+    stats: dict[str, object] = {
+        "shape": list(actual.shape),
+        "finite": bool(finite.all()),
+        "nan_count": int(torch.isnan(actual).sum()),
+        "inf_count": int(torch.isinf(actual).sum()),
+        "first_values": actual.flatten()[:16].tolist(),
+    }
+    if finite_values.numel():
+        stats.update(
+            min=float(finite_values.min()),
+            max=float(finite_values.max()),
+            mean=float(finite_values.mean()),
+            checksum=float(finite_values.double().sum()),
+            l2=float(torch.linalg.vector_norm(finite_values.double())),
+        )
+    if bool(torch.isfinite(diff).all()):
+        stats.update(
+            mae=float(diff.abs().mean()),
+            max_abs_error=float(diff.abs().max()),
+            cosine=float(
+                F.cosine_similarity(
+                    actual.double().flatten(),
+                    expected.double().flatten(),
+                    dim=0,
+                    eps=1e-30,
+                )
+            ),
+        )
+    return stats
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, required=True)
@@ -36,6 +74,12 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--rtol", type=float, default=0.08)
     parser.add_argument("--atol", type=float, default=1.0)
+    parser.add_argument(
+        "--swiglu-limit",
+        type=float,
+        default=0.0,
+        help="Use the model clamp (10.0 for DeepSeek V4) or 0 for legacy fixture goldens.",
+    )
     parser.add_argument(
         "--stage",
         choices=("gate-up", "full"),
@@ -84,6 +128,7 @@ def main() -> None:
             metadata["row_group_size"],
             "silu",
             False,
+            swiglu_limit=args.swiglu_limit,
         )
         output = None
         if args.stage == "full":
@@ -106,17 +151,32 @@ def main() -> None:
         return gate_up, output
 
     for _ in range(args.warmup):
-        gate_up, output = run_once()
+        run_once()
+    gate_up, output = run_once()
     torch.npu.synchronize()
+    gate_up_cpu = gate_up.float().cpu()
+    validation = {
+        "gate_up": _comparison_stats(
+            gate_up_cpu,
+            golden["expected_gate_up_fp32"],
+        )
+    }
+    if output is not None:
+        output_cpu = output.float().cpu()
+        validation["down_reduce"] = _comparison_stats(
+            output_cpu,
+            golden["expected_output_fp32"],
+        )
+    print(json.dumps({"validation": validation}, indent=2), flush=True)
     torch.testing.assert_close(
-        gate_up.float().cpu(),
+        gate_up_cpu,
         golden["expected_gate_up_fp32"],
         rtol=args.rtol,
         atol=args.atol,
     )
     if output is not None:
         torch.testing.assert_close(
-            output.float().cpu(),
+            output_cpu,
             golden["expected_output_fp32"],
             rtol=args.rtol,
             atol=args.atol,
@@ -141,6 +201,7 @@ def main() -> None:
         "p95_ms": _percentile(latencies_ms, 0.95),
         "tokens_per_second": num_tokens / (statistics.mean(latencies_ms) / 1000),
         "correctness": "passed",
+        "validation": validation,
     }
     rendered = json.dumps(result, indent=2)
     print(rendered)

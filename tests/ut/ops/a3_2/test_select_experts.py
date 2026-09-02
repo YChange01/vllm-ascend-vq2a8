@@ -430,6 +430,78 @@ class TestExpertsSelector:
         torch.testing.assert_close(topk_weights, expected_weights.to(hidden_states.dtype))
         assert torch.equal(topk_ids, expected_ids.to(torch.int32))
 
+    @patch("vllm_ascend.ops.fused_moe.experts_selector.get_weight_prefetch_method", return_value=MagicMock())
+    @patch("vllm_ascend.ops.fused_moe.experts_selector.check_npu_moe_gating_top_k", return_value=True)
+    def test_select_experts_sqrtsoftplus_normalizes_then_scales(self, _, __, monkeypatch):
+        hidden_states = torch.randn(2, 4, dtype=torch.float32)
+        router_logits = torch.randn(2, 8, dtype=torch.float32)
+        raw_weights = torch.tensor(
+            [[2.0, 1.0, 1.0], [1.0, 3.0, 2.0]], dtype=torch.float32
+        )
+        topk_ids = torch.tensor([[0, 2, 4], [1, 3, 5]], dtype=torch.int32)
+        calls = {}
+
+        def fake_hash_topk(**kwargs):
+            calls.update(kwargs)
+            return raw_weights.clone(), topk_ids.clone(), None
+
+        monkeypatch.setattr(
+            torch.ops._C_ascend,
+            "moe_gating_top_k_hash",
+            fake_hash_topk,
+        )
+
+        actual_weights, actual_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=3,
+            use_grouped_topk=False,
+            renormalize=True,
+            topk_group=None,
+            num_expert_group=None,
+            custom_routing_function=None,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=1.5,
+            e_score_correction_bias=None,
+            num_experts=8,
+        )
+
+        expected = raw_weights / raw_weights.sum(dim=-1, keepdim=True) * 1.5
+        assert calls["renorm"] == 0
+        assert calls["routed_scaling_factor"] == 1.0
+        torch.testing.assert_close(actual_weights, expected)
+        torch.testing.assert_close(actual_weights.sum(dim=-1), torch.full((2,), 1.5))
+        assert torch.equal(actual_ids, topk_ids)
+
+    @patch("vllm_ascend.ops.fused_moe.experts_selector.get_weight_prefetch_method", return_value=MagicMock())
+    @patch("vllm_ascend.ops.fused_moe.experts_selector.check_npu_moe_gating_top_k", return_value=False)
+    def test_select_experts_native_applies_routed_scale_once(self, _, __):
+        hidden_states = torch.randn(2, 4, dtype=torch.float32)
+        router_logits = torch.tensor(
+            [[3.0, 1.0, 0.0, 2.0], [0.0, 4.0, 1.0, 2.0]],
+            dtype=torch.float32,
+        )
+
+        actual_weights, actual_ids = select_experts(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            top_k=2,
+            use_grouped_topk=False,
+            renormalize=True,
+            topk_group=None,
+            num_expert_group=None,
+            custom_routing_function=None,
+            scoring_func="softmax",
+            routed_scaling_factor=1.5,
+            e_score_correction_bias=None,
+            num_experts=4,
+        )
+
+        expected_weights, expected_ids = router_logits.softmax(dim=-1).topk(2, dim=-1)
+        expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True) * 1.5
+        torch.testing.assert_close(actual_weights, expected_weights)
+        assert torch.equal(actual_ids, expected_ids.to(torch.int32))
+
     def test_select_experts_grouped_topk_bias_uses_original_weights(self):
         _require_ascend_custom_op("moe_gating_top_k")
 
