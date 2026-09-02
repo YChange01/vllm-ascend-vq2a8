@@ -137,7 +137,11 @@ def log_vq2a8_tensor(
     if _enabled(VQ2A8_DEBUG_FAIL_FAST_ENV) and not summary.get("finite", True):
         raise RuntimeError(
             f"VQ2A8 produced a non-finite tensor at {scope}.{stage} "
-            f"(layer={layer_index}, call={call_index}, tp_rank={tp_rank})."
+            f"(layer={layer_index}, call={call_index}, tp_rank={tp_rank}, "
+            f"shape={summary['shape']}, dtype={summary['dtype']}, "
+            f"nan_count={summary.get('nan_count', 0)}, "
+            f"inf_count={summary.get('inf_count', 0)}, "
+            f"finite_absmax={summary.get('absmax')})."
         )
     return summary
 

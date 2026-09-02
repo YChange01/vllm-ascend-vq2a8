@@ -1,9 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import pytest
 import torch
 
-from vllm_ascend.quantization.vq2a8_debug import comparison_summary
+from vllm_ascend.quantization.vq2a8_debug import (
+    VQ2A8_DEBUG_FAIL_FAST_ENV,
+    comparison_summary,
+    log_vq2a8_tensor,
+)
 
 
 def test_comparison_summary_reports_exact_match() -> None:
@@ -33,3 +38,17 @@ def test_comparison_summary_reports_shape_mismatch_without_flattening() -> None:
 
     assert summary["shape_match"] is False
     assert "max_abs_error" not in summary
+
+
+def test_fail_fast_exception_includes_numerical_summary(monkeypatch) -> None:
+    monkeypatch.setenv(VQ2A8_DEBUG_FAIL_FAST_ENV, "1")
+
+    with pytest.raises(RuntimeError, match=r"nan_count=1, inf_count=1, finite_absmax=2.0"):
+        log_vq2a8_tensor(
+            scope="moe",
+            stage="output",
+            tensor=torch.tensor([float("nan"), float("inf"), -2.0]),
+            call_index=0,
+            layer_index=0,
+            tp_rank=3,
+        )
