@@ -14,7 +14,6 @@ from safetensors import safe_open
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
-    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase
 from vllm.model_executor.utils import set_weight_attrs
@@ -567,15 +566,21 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
                 layer_index=self.layer_index,
                 tp_rank=self.tp_rank,
             )
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
         if debug_call is not None:
-            log_vq2a8_tensor(
+            log_vq2a8_event(
                 scope="moe",
-                stage="down_after_tp",
-                tensor=output,
+                stage="tp_reduction_deferred",
                 call_index=debug_call,
                 layer_index=self.layer_index,
                 tp_rank=self.tp_rank,
+                values={
+                    "owner": "moe_runner",
+                    "tp_size": self.tp_size,
+                },
             )
+        # FusedMoE owns TP communication.  In the default AllGather path the
+        # upstream MoERunner reduces the final (routed + shared) output once;
+        # MC2/AllToAll finalize their output in their communication backend.
+        # Reducing this TP-local projection here as well double-counts it and
+        # compounds the hidden-state magnitude on every decoder layer.
         return _wrap_fused_experts_result(output)

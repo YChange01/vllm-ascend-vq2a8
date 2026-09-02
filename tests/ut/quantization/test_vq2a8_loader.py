@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 
+import inspect
 import json
 import sys
 import types
@@ -19,6 +20,7 @@ from vllm_ascend.quantization.vq2a8_method import (
     ASCEND_VQ2_FIELDS,
     ASCEND_VQ2_KINDS,
     ASCEND_VQ2_TP_FORMAT,
+    AscendVQ2A8MoEMethod,
     _validate_runtime_options,
     _wrap_fused_experts_result,
     create_compact_expert_parameters,
@@ -167,3 +169,10 @@ def test_vq2_output_uses_fused_experts_result_protocol(monkeypatch) -> None:
     result = _wrap_fused_experts_result(output)
 
     assert result.routed_out is output
+
+
+def test_vq2_quant_method_defers_tp_reduce_to_moe_runner() -> None:
+    source = inspect.getsource(AscendVQ2A8MoEMethod.apply)
+
+    assert "tensor_model_parallel_all_reduce" not in source
+    assert "tp_reduction_deferred" in source
