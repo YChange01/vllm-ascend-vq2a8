@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from enum import Enum
 
@@ -14,6 +15,7 @@ from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
 
 logger = logging.getLogger(__name__)
 _warned_reference_fallback = False
+_warned_extension_load_failure = False
 
 VQ2A8_CUSTOM_OPS = ("vq2a8_gate_up", "vq2a8_down_reduce")
 
@@ -28,11 +30,34 @@ def _normalize_activation_name(activation: str | Enum) -> str:
     return value
 
 
-def _custom_op(name: str):
+def _registered_custom_op(name: str):
     namespace = getattr(torch.ops, "_C_ascend", None)
     if namespace is None:
         return None
     return getattr(namespace, name, None)
+
+
+def _ensure_vq2a8_extension_loaded() -> bool:
+    """Lazily load the extension without enabling every A5 custom op."""
+    global _warned_extension_load_failure
+    if all(_registered_custom_op(name) is not None for name in VQ2A8_CUSTOM_OPS):
+        return True
+    try:
+        importlib.import_module("vllm_ascend.vllm_ascend_C")
+    except ImportError as exc:
+        if not _warned_extension_load_failure:
+            logger.warning("Failed to load the Ascend VQ2A8 extension: %s", exc)
+            _warned_extension_load_failure = True
+        return False
+    return all(_registered_custom_op(name) is not None for name in VQ2A8_CUSTOM_OPS)
+
+
+def _custom_op(name: str):
+    op = _registered_custom_op(name)
+    if op is not None:
+        return op
+    _ensure_vq2a8_extension_loaded()
+    return _registered_custom_op(name)
 
 
 def custom_vq2a8_ops_available() -> bool:

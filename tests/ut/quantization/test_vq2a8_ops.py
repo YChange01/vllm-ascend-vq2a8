@@ -137,6 +137,30 @@ def test_reference_gate_up_casts_fp8_codebooks_before_lookup() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_custom_op_lazily_loads_the_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    loaded = False
+    imports: list[str] = []
+
+    def fake_registered_op(name: str) -> object | None:
+        if loaded and name == "vq2a8_gate_up":
+            return sentinel
+        return None
+
+    def fake_import_module(name: str) -> None:
+        nonlocal loaded
+        imports.append(name)
+        loaded = True
+
+    monkeypatch.setattr(vq2a8_ops, "_registered_custom_op", fake_registered_op)
+    monkeypatch.setattr(vq2a8_ops.importlib, "import_module", fake_import_module)
+
+    assert vq2a8_ops._custom_op("vq2a8_gate_up") is sentinel
+    assert imports == ["vllm_ascend.vllm_ascend_C"]
+
+
 def test_gate_up_dispatch_forwards_the_native_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
