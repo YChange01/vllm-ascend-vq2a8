@@ -213,6 +213,9 @@ protected:
         pipe->InitBuffer(weightFloatBuffer_, sizeK * sizeof(float));
         pipe->InitBuffer(productBuffer_, sizeK * sizeof(float));
         pipe->InitBuffer(reduceBuffer_, sizeK * sizeof(float));
+        // Keep ReduceSum's destination disjoint from its source instead of
+        // relying on backend-specific alias handling in the CANN 9.1 path.
+        pipe->InitBuffer(sumBuffer_, kOutputTile * sizeof(float));
     }
 
     __aicore__ inline void LoadActivation(uint32_t assignment, uint32_t sizeK)
@@ -242,6 +245,7 @@ protected:
         AscendC::LocalTensor<float> activationFloat = activationFloatBuffer_.Get<float>();
         AscendC::LocalTensor<float> product = productBuffer_.Get<float>();
         AscendC::LocalTensor<float> reduce = reduceBuffer_.Get<float>();
+        AscendC::LocalTensor<float> sum = sumBuffer_.Get<float>();
         const uint32_t vectorRow = outputColumn >> 1;
         const uint32_t component = outputColumn & 1U;
         const uint32_t outputTile = outputColumn / rowGroupSize;
@@ -269,11 +273,11 @@ protected:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Mul(product, activationFloat, weightFloat, sizeK);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::ReduceSum<float>(product, product, reduce, sizeK);
+        AscendC::ReduceSum<float>(sum, product, reduce, sizeK);
         // The reduced value is returned through scalar GetValue.
         AscendC::SetFlag<AscendC::HardEvent::V_S>(0);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(0);
-        return product.GetValue(0);
+        return sum.GetValue(0);
     }
 
     AscendC::TBuf<AscendC::QuePosition::VECCALC> activationFp8Buffer_;
@@ -282,6 +286,7 @@ protected:
     AscendC::TBuf<AscendC::QuePosition::VECCALC> weightFloatBuffer_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> productBuffer_;
     AscendC::TBuf<AscendC::QuePosition::VECCALC> reduceBuffer_;
+    AscendC::TBuf<AscendC::QuePosition::VECCALC> sumBuffer_;
     AscendC::GlobalTensor<fp8_e4m3fn_t> quantizedGm_;
     AscendC::GlobalTensor<int32_t> packedIndicesGm_;
     AscendC::GlobalTensor<fp8_e4m3fn_t> codebooksGm_;

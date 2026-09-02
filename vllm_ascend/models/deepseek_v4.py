@@ -988,17 +988,68 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        from vllm_ascend.quantization.vq2a8_debug import (
+            log_vq2a8_tensor,
+            reserve_vq2a8_debug_call,
+        )
+
+        debug_call = reserve_vq2a8_debug_call("decoder", self.layer_idx)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="decoder",
+                stage="input",
+                tensor=hidden_states,
+                call_index=debug_call,
+                layer_index=self.layer_idx,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         hidden_states = self.input_layernorm(hidden_states)
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="decoder",
+                stage="after_attention",
+                tensor=hidden_states,
+                call_index=debug_call,
+                layer_index=self.layer_idx,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="decoder",
+                stage="moe_input",
+                tensor=hidden_states,
+                call_index=debug_call,
+                layer_index=self.layer_idx,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         hidden_states = self.mlp(hidden_states)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="decoder",
+                stage="moe_output",
+                tensor=hidden_states,
+                call_index=debug_call,
+                layer_index=self.layer_idx,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="decoder",
+                stage="output",
+                tensor=hidden_states,
+                call_index=debug_call,
+                layer_index=self.layer_idx,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
 
         return hidden_states, residual
 
@@ -1276,7 +1327,28 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor | None:
+        from vllm_ascend.quantization.vq2a8_debug import (
+            log_vq2a8_logits,
+            log_vq2a8_tensor,
+            reserve_vq2a8_debug_call,
+        )
+
+        debug_call = reserve_vq2a8_debug_call("logits")
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="model",
+                stage="final_hidden",
+                tensor=hidden_states,
+                call_index=debug_call,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         logits = self.logits_processor(self.lm_head, hidden_states)
+        if debug_call is not None and logits is not None:
+            log_vq2a8_logits(
+                logits,
+                call_index=debug_call,
+                tp_rank=get_tensor_model_parallel_rank(),
+            )
         return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

@@ -10,6 +10,7 @@ from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
 from vllm_ascend.quantization.vq2a8_ops import (
     reference_vq2a8_down_reduce,
     reference_vq2a8_gate_up,
+    reference_vq2a8_prepare,
 )
 from vllm_ascend.quantization.vq2a8_repack import pack_repacked_indices
 
@@ -21,15 +22,9 @@ def _payload(
 ) -> tuple[torch.Tensor, ...]:
     output_pairs = output_size // 2
     row_tiles = output_size // row_group_size
-    indices = torch.arange(output_pairs * input_size).reshape(
-        output_pairs, input_size
-    )
+    indices = torch.arange(output_pairs * input_size).reshape(output_pairs, input_size)
     packed_indices = pack_repacked_indices(indices.remainder(16)).unsqueeze(0)
-    codebooks = (
-        torch.arange(row_tiles * 16 * 2, dtype=torch.float32)
-        .reshape(1, 1, row_tiles, 16, 2)
-        .div(23)
-    )
+    codebooks = torch.arange(row_tiles * 16 * 2, dtype=torch.float32).reshape(1, 1, row_tiles, 16, 2).div(23)
     codebook_tile_ids = torch.zeros((1, input_size), dtype=torch.uint8)
     weight_scale = torch.linspace(0.5, 1.0, input_size).unsqueeze(0)
     weight_bias = torch.linspace(-0.1, 0.2, input_size).unsqueeze(0)
@@ -112,6 +107,71 @@ def test_reference_gate_up_rejects_unsupported_activation() -> None:
         )
 
 
+def test_reference_prepare_reconstructs_transformed_activation() -> None:
+    x = torch.arange(32, dtype=torch.bfloat16).reshape(2, 16).div(17)
+    expert_ids = torch.tensor([1, 0], dtype=torch.int32)
+    weight_scale = torch.linspace(0.25, 1.25, 32).reshape(2, 16)
+    weight_bias = torch.linspace(-0.1, 0.2, 32).reshape(2, 16)
+    rht_sign = torch.tensor(
+        [[1 if index % 3 else -1 for index in range(16)]] * 2,
+        dtype=torch.int8,
+    )
+
+    quantized, scale, bias = reference_vq2a8_prepare(
+        x,
+        expert_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        rht_block_size=8,
+    )
+
+    assert quantized.dtype == torch.float8_e4m3fn
+    assert scale.shape == (2,)
+    assert bias.shape == (2,)
+    assert torch.isfinite(quantized.float()).all()
+    assert torch.isfinite(scale).all()
+    assert torch.isfinite(bias).all()
+    assert torch.count_nonzero(quantized.float()) > 0
+
+
+def test_prepare_debug_dispatch_forwards_the_native_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x = torch.zeros((2, 8), dtype=torch.bfloat16)
+    expert_ids = torch.zeros(2, dtype=torch.int32)
+    weight_scale = torch.ones((1, 8), dtype=torch.float32)
+    weight_bias = torch.zeros((1, 8), dtype=torch.float32)
+    rht_sign = torch.ones((1, 8), dtype=torch.int8)
+    sentinel = (
+        torch.zeros((2, 8), dtype=torch.float8_e4m3fn),
+        torch.ones(2),
+        torch.zeros(2),
+    )
+    calls: list[tuple[object, ...]] = []
+
+    def fake_op(*args: object):
+        calls.append(args)
+        return sentinel
+
+    monkeypatch.setattr(
+        vq2a8_ops,
+        "_custom_op",
+        lambda name: fake_op if name == "vq2a8_prepare_debug" else None,
+    )
+    actual = vq2a8_ops.vq2a8_prepare_debug(
+        x,
+        expert_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        8,
+    )
+
+    assert actual is sentinel
+    assert calls == [(x, expert_ids, weight_scale, weight_bias, rht_sign, 8)]
+
+
 def test_reference_gate_up_applies_swiglu_limit() -> None:
     gate_payload = _payload(output_size=4, input_size=8, row_group_size=2)
     x = torch.arange(8, dtype=torch.float32).reshape(1, 8)
@@ -132,9 +192,7 @@ def test_reference_gate_up_applies_swiglu_limit() -> None:
         row_group_size=2,
     ).float()
     gate, up = (x @ weight.T).chunk(2, dim=-1)
-    expected = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(
-        min=-limit, max=limit
-    )
+    expected = torch.nn.functional.silu(gate.clamp(max=limit)) * up.clamp(min=-limit, max=limit)
 
     torch.testing.assert_close(actual, expected)
 
@@ -221,10 +279,7 @@ def test_gate_up_dispatch_forwards_the_native_schema(
     assert len(calls) == 1
     assert calls[0][0] is x
     assert calls[0][1] is expert_ids
-    assert all(
-        actual_arg is expected_arg
-        for actual_arg, expected_arg in zip(calls[0][2:8], payload)
-    )
+    assert all(actual_arg is expected_arg for actual_arg, expected_arg in zip(calls[0][2:8], payload))
     assert calls[0][8:] == (4, 2, "silu", 10.0)
 
 
@@ -266,8 +321,5 @@ def test_down_reduce_dispatch_forwards_the_native_schema(
     assert calls[0][1] is expert_ids
     assert calls[0][2] is token_ids
     assert calls[0][3] is routing_weights
-    assert all(
-        actual_arg is expected_arg
-        for actual_arg, expected_arg in zip(calls[0][4:10], payload)
-    )
+    assert all(actual_arg is expected_arg for actual_arg, expected_arg in zip(calls[0][4:10], payload))
     assert calls[0][10:] == (2, 2, 3)

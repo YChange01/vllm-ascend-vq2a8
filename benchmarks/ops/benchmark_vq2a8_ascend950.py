@@ -17,8 +17,11 @@ from vllm_ascend.quantization.vq2a8_method import load_repacked_layer
 from vllm_ascend.quantization.vq2a8_ops import (
     custom_vq2a8_down_reduce_available,
     custom_vq2a8_gate_up_available,
+    custom_vq2a8_prepare_debug_available,
+    reference_vq2a8_prepare,
     vq2a8_down_reduce,
     vq2a8_gate_up,
+    vq2a8_prepare_debug,
 )
 
 
@@ -82,7 +85,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--stage",
-        choices=("gate-up", "full"),
+        choices=("prepare", "gate-up", "full"),
         default="full",
         help="Validate gate/up alone first, then use full for gate/up plus down/reduce.",
     )
@@ -91,7 +94,9 @@ def main() -> None:
 
     import torch_npu  # noqa: F401
 
-    if not custom_vq2a8_gate_up_available():
+    if args.stage == "prepare" and not custom_vq2a8_prepare_debug_available():
+        raise RuntimeError("Missing _C_ascend.vq2a8_prepare_debug; rebuild vllm_ascend.")
+    if args.stage != "prepare" and not custom_vq2a8_gate_up_available():
         raise RuntimeError("Missing _C_ascend.vq2a8_gate_up.")
     if args.stage == "full" and not custom_vq2a8_down_reduce_available():
         raise RuntimeError("Missing _C_ascend.vq2a8_down_reduce.")
@@ -103,18 +108,41 @@ def main() -> None:
         args.tp_rank,
         expected_experts=1,
     )
-    payload = {name: tensor.to(device) for name, tensor in payload.items()}
+    payload_cpu = payload
+    payload = {name: tensor.to(device) for name, tensor in payload_cpu.items()}
     golden_path = args.fixture / "golden" / f"tp{args.tp_size}_rank{args.tp_rank}.safetensors"
     with safe_open(golden_path, framework="pt", device="cpu") as handle:
         tensor_names = handle.keys()
         golden = {name: handle.get_tensor(name) for name in tensor_names}
-    x = golden["input_bf16"].to(device)
-    expert_ids = golden["expert_ids"].to(device)
+    x_cpu = golden["input_bf16"]
+    expert_ids_cpu = golden["expert_ids"]
+    x = x_cpu.to(device)
+    expert_ids = expert_ids_cpu.to(device)
     token_ids = golden["token_ids"].to(device)
     routing_weights = golden["routing_weights"].to(device)
     num_tokens = int(token_ids.max().cpu()) + 1
 
-    def run_once() -> tuple[torch.Tensor, torch.Tensor | None]:
+    expected_prepare = None
+    if args.stage == "prepare":
+        expected_prepare = reference_vq2a8_prepare(
+            x_cpu,
+            expert_ids_cpu,
+            payload_cpu["gate_up_weight_scale"],
+            payload_cpu["gate_up_weight_bias"],
+            payload_cpu["gate_up_rht_sign"],
+            metadata["rht_block_size"],
+        )
+
+    def run_once():
+        if args.stage == "prepare":
+            return vq2a8_prepare_debug(
+                x,
+                expert_ids,
+                payload["gate_up_weight_scale"],
+                payload["gate_up_weight_bias"],
+                payload["gate_up_rht_sign"],
+                metadata["rht_block_size"],
+            )
         gate_up = vq2a8_gate_up(
             x,
             expert_ids,
@@ -152,41 +180,76 @@ def main() -> None:
 
     for _ in range(args.warmup):
         run_once()
-    gate_up, output = run_once()
+    result_tensors = run_once()
     torch.npu.synchronize()
-    gate_up_cpu = gate_up.float().cpu()
-    validation = {
-        "gate_up": _comparison_stats(
-            gate_up_cpu,
-            golden["expected_gate_up_fp32"],
-        )
-    }
-    if output is not None:
-        output_cpu = output.float().cpu()
-        validation["down_reduce"] = _comparison_stats(
-            output_cpu,
-            golden["expected_output_fp32"],
-        )
+    output = None
+    if args.stage == "prepare":
+        assert expected_prepare is not None
+        quantized, activation_scale, bias_correction = result_tensors
+        expected_quantized, expected_scale, expected_bias = expected_prepare
+        validation = {
+            "prepare_dequantized": _comparison_stats(
+                quantized.float().cpu() * activation_scale.float().cpu().unsqueeze(-1),
+                expected_quantized.float() * expected_scale.unsqueeze(-1),
+            ),
+            "prepare_scale": _comparison_stats(activation_scale, expected_scale),
+            "prepare_bias": _comparison_stats(bias_correction, expected_bias),
+        }
+    else:
+        gate_up, output = result_tensors
+        gate_up_cpu = gate_up.float().cpu()
+        validation = {
+            "gate_up": _comparison_stats(
+                gate_up_cpu,
+                golden["expected_gate_up_fp32"],
+            )
+        }
+        if output is not None:
+            output_cpu = output.float().cpu()
+            validation["down_reduce"] = _comparison_stats(
+                output_cpu,
+                golden["expected_output_fp32"],
+            )
     print(json.dumps({"validation": validation}, indent=2), flush=True)
-    torch.testing.assert_close(
-        gate_up_cpu,
-        golden["expected_gate_up_fp32"],
-        rtol=args.rtol,
-        atol=args.atol,
-    )
-    if output is not None:
+    if args.stage == "prepare":
         torch.testing.assert_close(
-            output_cpu,
-            golden["expected_output_fp32"],
+            quantized.float().cpu() * activation_scale.float().cpu().unsqueeze(-1),
+            expected_quantized.float() * expected_scale.unsqueeze(-1),
             rtol=args.rtol,
             atol=args.atol,
         )
+        torch.testing.assert_close(
+            activation_scale.float().cpu(),
+            expected_scale,
+            rtol=args.rtol,
+            atol=args.atol,
+        )
+        torch.testing.assert_close(
+            bias_correction.float().cpu(),
+            expected_bias,
+            rtol=args.rtol,
+            atol=args.atol,
+        )
+    else:
+        torch.testing.assert_close(
+            gate_up_cpu,
+            golden["expected_gate_up_fp32"],
+            rtol=args.rtol,
+            atol=args.atol,
+        )
+        if output is not None:
+            torch.testing.assert_close(
+                output_cpu,
+                golden["expected_output_fp32"],
+                rtol=args.rtol,
+                atol=args.atol,
+            )
 
     latencies_ms = []
     for _ in range(args.iterations):
         torch.npu.synchronize()
         start = time.perf_counter()
-        gate_up, output = run_once()
+        run_once()
         torch.npu.synchronize()
         latencies_ms.append((time.perf_counter() - start) * 1000)
     result = {

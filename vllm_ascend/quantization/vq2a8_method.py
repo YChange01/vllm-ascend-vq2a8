@@ -141,9 +141,7 @@ def _validate_runtime_options(
     # experts. It does not mean that EPLB or MC2 is enabled.
     del enable_force_load_balance
     if log2phy is not None or global_redundant_expert_num or mc2_mask is not None:
-        raise NotImplementedError(
-            "VQ2A8 bring-up supports tensor parallelism without EPLB or MC2."
-        )
+        raise NotImplementedError("VQ2A8 bring-up supports tensor parallelism without EPLB or MC2.")
 
 
 def _wrap_fused_experts_result(output: torch.Tensor) -> FusedExpertsResult:
@@ -151,6 +149,160 @@ def _wrap_fused_experts_result(output: torch.Tensor) -> FusedExpertsResult:
     from vllm_ascend.ops.fused_moe.moe_comm_method import FusedExpertsResult
 
     return FusedExpertsResult(routed_out=output)
+
+
+def _selected_expert_payload_on_cpu(
+    layer: torch.nn.Module,
+    kind: str,
+    expert_id: int,
+) -> tuple[torch.Tensor, ...]:
+    """Copy one real expert's compact payload for an opt-in CPU golden run."""
+    return tuple(
+        getattr(layer, f"vq_{kind}_{field}")[expert_id : expert_id + 1].detach().cpu() for field in ASCEND_VQ2_FIELDS
+    )
+
+
+def _compare_first_assignment_with_reference(
+    *,
+    layer: torch.nn.Module,
+    expanded_x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    routing_weights: torch.Tensor,
+    gate_up: torch.Tensor,
+    activation: str,
+    call_index: int,
+    layer_index: int,
+    tp_rank: int,
+) -> None:
+    """Compare one routed row with CPU golden math from the real payload."""
+    if expanded_x.shape[0] == 0:
+        return
+
+    from vllm_ascend.quantization.vq2a8_debug import (
+        log_vq2a8_comparison,
+        log_vq2a8_event,
+    )
+    from vllm_ascend.quantization.vq2a8_ops import (
+        custom_vq2a8_prepare_debug_available,
+        reference_vq2a8_down_reduce,
+        reference_vq2a8_gate_up,
+        reference_vq2a8_prepare,
+        vq2a8_down_reduce,
+        vq2a8_prepare_debug,
+    )
+
+    expert_id = int(expert_ids[0].detach().cpu())
+    cpu_expert_ids = torch.zeros(1, dtype=torch.int32)
+    cpu_token_ids = torch.zeros(1, dtype=torch.int64)
+    cpu_x = expanded_x[0:1].detach().cpu()
+    cpu_routing_weight = routing_weights[0:1].detach().float().cpu()
+    gate_payload = _selected_expert_payload_on_cpu(layer, "gate_up", expert_id)
+    down_payload = _selected_expert_payload_on_cpu(layer, "down", expert_id)
+    comparison_extra = {
+        "physical_expert": expert_id,
+        "probe_rows": 1,
+        "payload": "real_model",
+    }
+
+    if custom_vq2a8_prepare_debug_available():
+        native_quantized, native_scale, native_bias = vq2a8_prepare_debug(
+            expanded_x[0:1],
+            expert_ids[0:1],
+            layer.vq_gate_up_weight_scale,
+            layer.vq_gate_up_weight_bias,
+            layer.vq_gate_up_rht_sign,
+            layer.vq_rht_block_size,
+        )
+        reference_quantized, reference_scale, reference_bias = reference_vq2a8_prepare(
+            cpu_x,
+            cpu_expert_ids,
+            gate_payload[3],
+            gate_payload[4],
+            gate_payload[5],
+            layer.vq_rht_block_size,
+        )
+        for stage, actual, expected in (
+            ("prepare_quantized", native_quantized, reference_quantized),
+            ("prepare_scale", native_scale, reference_scale),
+            ("prepare_bias", native_bias, reference_bias),
+        ):
+            log_vq2a8_comparison(
+                scope="moe",
+                stage=stage,
+                actual=actual,
+                expected=expected,
+                call_index=call_index,
+                layer_index=layer_index,
+                tp_rank=tp_rank,
+                extra=comparison_extra,
+            )
+    else:
+        log_vq2a8_event(
+            scope="moe",
+            stage="prepare_comparison_unavailable",
+            call_index=call_index,
+            layer_index=layer_index,
+            tp_rank=tp_rank,
+            values=comparison_extra,
+        )
+
+    reference_gate_up = reference_vq2a8_gate_up(
+        cpu_x,
+        cpu_expert_ids,
+        *gate_payload,
+        rht_block_size=layer.vq_rht_block_size,
+        row_group_size=layer.vq_row_group_size,
+        activation=activation,
+        swiglu_limit=getattr(layer, "swiglu_limit", None),
+    )
+    log_vq2a8_comparison(
+        scope="moe",
+        stage="gate_up",
+        actual=gate_up[0:1],
+        expected=reference_gate_up,
+        call_index=call_index,
+        layer_index=layer_index,
+        tp_rank=tp_rank,
+        extra=comparison_extra,
+    )
+
+    probe_token_ids = torch.zeros(1, dtype=torch.int64, device=expanded_x.device)
+    native_down = vq2a8_down_reduce(
+        gate_up[0:1],
+        expert_ids[0:1],
+        probe_token_ids,
+        routing_weights[0:1],
+        layer.vq_down_packed_indices,
+        layer.vq_down_codebooks,
+        layer.vq_down_codebook_tile_ids,
+        layer.vq_down_weight_scale,
+        layer.vq_down_weight_bias,
+        layer.vq_down_rht_sign,
+        layer.vq_rht_block_size,
+        layer.vq_row_group_size,
+        1,
+        allow_reference_fallback=False,
+    )
+    reference_down = reference_vq2a8_down_reduce(
+        reference_gate_up,
+        cpu_expert_ids,
+        cpu_token_ids,
+        cpu_routing_weight,
+        *down_payload,
+        rht_block_size=layer.vq_rht_block_size,
+        row_group_size=layer.vq_row_group_size,
+        num_tokens=1,
+    )
+    log_vq2a8_comparison(
+        scope="moe",
+        stage="down_isolated",
+        actual=native_down,
+        expected=reference_down,
+        call_index=call_index,
+        layer_index=layer_index,
+        tp_rank=tp_rank,
+        extra=comparison_extra,
+    )
 
 
 class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
@@ -253,10 +405,35 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         )
 
         from vllm_ascend.ops.fused_moe.experts_selector import select_experts
+        from vllm_ascend.quantization.vq2a8_debug import (
+            log_vq2a8_event,
+            log_vq2a8_tensor,
+            reserve_vq2a8_debug_call,
+            vq2a8_debug_compare_reference_enabled,
+        )
         from vllm_ascend.quantization.vq2a8_ops import (
             vq2a8_down_reduce,
             vq2a8_gate_up,
         )
+
+        debug_call = reserve_vq2a8_debug_call("moe", self.layer_index)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="input",
+                tensor=x,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="router_logits",
+                tensor=router_logits,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
 
         topk_weights, topk_ids = select_experts(
             hidden_states=x,
@@ -279,6 +456,52 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
         expert_ids = topk_ids.reshape(-1).to(torch.int32)
         routing_weights = topk_weights.reshape(-1)
         expanded_x = x.index_select(0, token_ids)
+        if debug_call is not None:
+            expert_ids_cpu = expert_ids.detach().cpu()
+            packed_experts = int(layer.vq_gate_up_packed_indices.shape[0])
+            minimum_expert = int(expert_ids_cpu.min()) if expert_ids_cpu.numel() else 0
+            maximum_expert = int(expert_ids_cpu.max()) if expert_ids_cpu.numel() else -1
+            if minimum_expert < 0 or maximum_expert >= packed_experts:
+                raise RuntimeError(
+                    f"VQ2A8 layer {self.layer_index} selected expert IDs in "
+                    f"[{minimum_expert}, {maximum_expert}], but its packed artifact "
+                    f"contains {packed_experts} experts."
+                )
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="topk_ids",
+                tensor=expert_ids,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="topk_weights",
+                tensor=topk_weights,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+                extra={
+                    "row_sums": topk_weights.detach().float().sum(dim=-1).cpu().tolist(),
+                    "routed_scaling_factor": routed_scaling_factor,
+                },
+            )
+            log_vq2a8_event(
+                scope="moe",
+                stage="artifact",
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+                values={
+                    "packed_experts": packed_experts,
+                    "gate_up_input": list(expanded_x.shape),
+                    "gate_up_output": int(layer.vq_gate_up_packed_indices.shape[1]),
+                    "down_output": int(layer.vq_down_packed_indices.shape[1] * 2),
+                    "rht_block_size": int(layer.vq_rht_block_size),
+                    "row_group_size": int(layer.vq_row_group_size),
+                },
+            )
         if apply_router_weight_on_input:
             expanded_x = expanded_x * routing_weights.to(x.dtype).unsqueeze(-1)
             routing_weights = torch.ones_like(routing_weights)
@@ -298,6 +521,27 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
             self.allow_reference_fallback,
             swiglu_limit=getattr(layer, "swiglu_limit", None),
         )
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="gate_up",
+                tensor=gate_up,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
+            if vq2a8_debug_compare_reference_enabled(self.layer_index):
+                _compare_first_assignment_with_reference(
+                    layer=layer,
+                    expanded_x=expanded_x,
+                    expert_ids=expert_ids,
+                    routing_weights=routing_weights,
+                    gate_up=gate_up,
+                    activation=activation,
+                    call_index=debug_call,
+                    layer_index=self.layer_index,
+                    tp_rank=self.tp_rank,
+                )
         output = vq2a8_down_reduce(
             gate_up,
             expert_ids,
@@ -314,6 +558,24 @@ class AscendVQ2A8MoEMethod(FusedMoEMethodBase):
             x.shape[0],
             self.allow_reference_fallback,
         )
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="down_before_tp",
+                tensor=output,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
+        if debug_call is not None:
+            log_vq2a8_tensor(
+                scope="moe",
+                stage="down_after_tp",
+                tensor=output,
+                call_index=debug_call,
+                layer_index=self.layer_index,
+                tp_rank=self.tp_rank,
+            )
         return _wrap_fused_experts_result(output)

@@ -23,10 +23,7 @@ VQ2A8_CUSTOM_OPS = ("vq2a8_gate_up", "vq2a8_down_reduce")
 def _normalize_activation_name(activation: str | Enum) -> str:
     value = activation.value if isinstance(activation, Enum) else activation
     if not isinstance(value, str):
-        raise TypeError(
-            "VQ2A8 activation must be a string or string-valued enum, "
-            f"got {activation!r}."
-        )
+        raise TypeError(f"VQ2A8 activation must be a string or string-valued enum, got {activation!r}.")
     return value
 
 
@@ -75,6 +72,11 @@ def custom_vq2a8_down_reduce_available() -> bool:
     return _custom_op("vq2a8_down_reduce") is not None
 
 
+def custom_vq2a8_prepare_debug_available() -> bool:
+    """Return whether the optional native activation-preparation probe exists."""
+    return _custom_op("vq2a8_prepare_debug") is not None
+
+
 def _validate_payload(
     x: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -88,13 +90,9 @@ def _validate_payload(
     if x.ndim != 2:
         raise ValueError(f"VQ2A8 input must be 2D, got {tuple(x.shape)}.")
     if expert_ids.ndim != 1 or expert_ids.shape[0] != x.shape[0]:
-        raise ValueError(
-            "VQ2A8 expert_ids must be 1D with one ID per input row."
-        )
+        raise ValueError("VQ2A8 expert_ids must be 1D with one ID per input row.")
     if packed_indices.ndim != 3:
-        raise ValueError(
-            "VQ2A8 packed indices must have shape [experts, output_pairs, words]."
-        )
+        raise ValueError("VQ2A8 packed indices must have shape [experts, output_pairs, words].")
     num_experts = packed_indices.shape[0]
     payloads = {
         "codebooks": codebooks,
@@ -105,15 +103,10 @@ def _validate_payload(
     }
     for name, tensor in payloads.items():
         if tensor.shape[0] != num_experts:
-            raise ValueError(
-                f"VQ2A8 {name} has {tensor.shape[0]} experts, "
-                f"expected {num_experts}."
-            )
+            raise ValueError(f"VQ2A8 {name} has {tensor.shape[0]} experts, expected {num_experts}.")
     input_size = codebook_tile_ids.shape[1]
     if x.shape[1] != input_size:
-        raise ValueError(
-            f"VQ2A8 input width is {x.shape[1]}, expected {input_size}."
-        )
+        raise ValueError(f"VQ2A8 input width is {x.shape[1]}, expected {input_size}.")
     if packed_indices.shape[2] * 8 < input_size:
         raise ValueError("VQ2A8 packed indices do not cover the input width.")
 
@@ -140,6 +133,84 @@ def _decode_expert(
         rht_block_size,
         row_group_size,
     ).to(dtype=dtype)
+
+
+def _normalized_fwht(activation: torch.Tensor, block_size: int) -> torch.Tensor:
+    if block_size <= 0 or block_size & (block_size - 1):
+        raise ValueError(f"VQ2A8 RHT block size must be a power of two, got {block_size}.")
+    if activation.shape[-1] % block_size:
+        raise ValueError(f"VQ2A8 input width {activation.shape[-1]} is not divisible by RHT block size {block_size}.")
+    output = activation.reshape(*activation.shape[:-1], -1, block_size)
+    stride = 1
+    while stride < block_size:
+        shape = output.shape
+        pairs = output.reshape(*shape[:-1], -1, stride * 2)
+        low = pairs[..., :stride]
+        high = pairs[..., stride:]
+        output = torch.cat((low + high, low - high), dim=-1).reshape(shape)
+        stride *= 2
+    return output.reshape_as(activation) / (block_size**0.5)
+
+
+def reference_vq2a8_prepare(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference the activation transform and dynamic E4M3 quantization."""
+    if x.ndim != 2:
+        raise ValueError(f"VQ2A8 input must be 2D, got {tuple(x.shape)}.")
+    if expert_ids.ndim != 1 or expert_ids.shape[0] != x.shape[0]:
+        raise ValueError("VQ2A8 expert_ids must contain one ID per input row.")
+    if weight_scale.ndim != 2 or weight_scale.shape[1] != x.shape[1]:
+        raise ValueError("VQ2A8 weight_scale must have shape [experts, input].")
+    if weight_bias.shape != weight_scale.shape or rht_sign.shape != weight_scale.shape:
+        raise ValueError("VQ2A8 transform payload shapes must agree.")
+    selected_experts = expert_ids.long()
+    if selected_experts.numel():
+        minimum = int(selected_experts.min().cpu())
+        maximum = int(selected_experts.max().cpu())
+        if minimum < 0 or maximum >= weight_scale.shape[0]:
+            raise ValueError(
+                f"VQ2A8 expert IDs [{minimum}, {maximum}] are out of range for {weight_scale.shape[0]} experts."
+            )
+    selected_sign = rht_sign.index_select(0, selected_experts).to(torch.float32)
+    rotated = _normalized_fwht(x.float() * selected_sign, rht_block_size)
+    selected_scale = weight_scale.index_select(0, selected_experts).float()
+    selected_bias = weight_bias.index_select(0, selected_experts).float()
+    transformed = rotated * selected_scale
+    activation_scale = transformed.abs().amax(dim=-1).div(448.0).clamp_min(1.0e-12)
+    bias_correction = (rotated * selected_bias).sum(dim=-1)
+    quantized = transformed.div(activation_scale.unsqueeze(-1)).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    return quantized, activation_scale, bias_correction
+
+
+def vq2a8_prepare_debug(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expose native preparation outputs for stage-by-stage NPU diagnosis."""
+    op = _custom_op("vq2a8_prepare_debug")
+    if op is None:
+        raise RuntimeError(
+            "Ascend custom op _C_ascend.vq2a8_prepare_debug is unavailable; "
+            "rebuild the extension before using the prepare-stage probe."
+        )
+    return op(
+        x,
+        expert_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        rht_block_size,
+    )
 
 
 def reference_vq2a8_gate_up(
@@ -169,15 +240,11 @@ def reference_vq2a8_gate_up(
     )
     activation_name = _normalize_activation_name(activation)
     if activation_name not in ("silu", "swiglu"):
-        raise NotImplementedError(
-            f"VQ2A8 reference fallback only supports SwiGLU, got {activation!r}."
-        )
+        raise NotImplementedError(f"VQ2A8 reference fallback only supports SwiGLU, got {activation!r}.")
     output_size = packed_indices.shape[1] * 2
     if output_size % 2:
         raise ValueError(f"gate_up output width must be even, got {output_size}.")
-    projected = torch.empty(
-        (x.shape[0], output_size), device=x.device, dtype=x.dtype
-    )
+    projected = torch.empty((x.shape[0], output_size), device=x.device, dtype=x.dtype)
     for expert_index in torch.unique(expert_ids).cpu().tolist():
         if not 0 <= expert_index < packed_indices.shape[0]:
             raise ValueError(f"VQ2A8 expert ID {expert_index} is out of range.")
@@ -234,9 +301,7 @@ def reference_vq2a8_down_reduce(
     if num_tokens < 0:
         raise ValueError(f"num_tokens must be non-negative, got {num_tokens}.")
     output_size = packed_indices.shape[1] * 2
-    output = torch.zeros(
-        (num_tokens, output_size), device=x.device, dtype=x.dtype
-    )
+    output = torch.zeros((num_tokens, output_size), device=x.device, dtype=x.dtype)
     for expert_index in torch.unique(expert_ids).cpu().tolist():
         if not 0 <= expert_index < packed_indices.shape[0]:
             raise ValueError(f"VQ2A8 expert ID {expert_index} is out of range.")
@@ -350,9 +415,7 @@ def vq2a8_down_reduce(
             num_tokens,
         )
     if not allow_reference_fallback:
-        raise RuntimeError(
-            "Ascend custom op _C_ascend.vq2a8_down_reduce is unavailable."
-        )
+        raise RuntimeError("Ascend custom op _C_ascend.vq2a8_down_reduce is unavailable.")
     return reference_vq2a8_down_reduce(
         x,
         expert_ids,

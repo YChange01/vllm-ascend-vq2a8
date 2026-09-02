@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <limits>
 #include <string>
+#include <tuple>
 
 #include "vq2a8/direct/vq2a8_kernel.h"
 
@@ -196,6 +197,21 @@ PreparedActivation prepare_activation(
 
 }  // namespace
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> vq2a8_prepare_debug(
+    const at::Tensor& x,
+    const at::Tensor& expert_ids,
+    const at::Tensor& weight_scale,
+    const at::Tensor& weight_bias,
+    const at::Tensor& rht_sign,
+    int64_t rht_block_size)
+{
+    check_transform_payload(
+        x, expert_ids, weight_scale, weight_bias, rht_sign, rht_block_size);
+    const PreparedActivation prepared = prepare_activation(
+        x, expert_ids, weight_scale, weight_bias, rht_sign, rht_block_size);
+    return {prepared.quantized, prepared.scale, prepared.bias};
+}
+
 at::Tensor vq2a8_gate_up(
     const at::Tensor& x,
     const at::Tensor& expert_ids,
@@ -319,6 +335,29 @@ at::Tensor vq2a8_down_reduce(
 
 namespace meta {
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> vq2a8_prepare_debug_meta(
+    const at::Tensor& x,
+    const at::Tensor& expert_ids,
+    const at::Tensor& weight_scale,
+    const at::Tensor& weight_bias,
+    const at::Tensor& rht_sign,
+    int64_t rht_block_size)
+{
+    (void)expert_ids;
+    (void)weight_scale;
+    (void)weight_bias;
+    (void)rht_sign;
+    (void)rht_block_size;
+    auto quantized = at::empty_symint(
+        {x.sym_size(0), x.sym_size(1)},
+        x.options().dtype(at::ScalarType::Float8_e4m3fn));
+    auto scale = at::empty_symint(
+        {x.sym_size(0)}, x.options().dtype(at::kFloat));
+    auto bias = at::empty_symint(
+        {x.sym_size(0)}, x.options().dtype(at::kFloat));
+    return {quantized, scale, bias};
+}
+
 at::Tensor vq2a8_gate_up_meta(
     const at::Tensor& x,
     const at::Tensor& expert_ids,
@@ -382,6 +421,14 @@ at::Tensor vq2a8_down_reduce_meta(
 TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
 {
     ops.def(
+        "vq2a8_prepare_debug(Tensor x, Tensor expert_ids, Tensor weight_scale, "
+        "Tensor weight_bias, Tensor rht_sign, int rht_block_size) "
+        "-> (Tensor, Tensor, Tensor)");
+    ops.impl(
+        "vq2a8_prepare_debug",
+        torch::kPrivateUse1,
+        &vllm_ascend::vq2a8_prepare_debug);
+    ops.def(
         "vq2a8_gate_up(Tensor x, Tensor expert_ids, Tensor packed_indices, "
         "Tensor codebooks, Tensor codebook_tile_ids, Tensor weight_scale, "
         "Tensor weight_bias, Tensor rht_sign, int rht_block_size, "
@@ -398,6 +445,7 @@ TORCH_LIBRARY_FRAGMENT(_C_ascend, ops)
 
 TORCH_LIBRARY_IMPL(_C_ascend, Meta, ops)
 {
+    ops.impl("vq2a8_prepare_debug", &vllm_ascend::meta::vq2a8_prepare_debug_meta);
     ops.impl("vq2a8_gate_up", &vllm_ascend::meta::vq2a8_gate_up_meta);
     ops.impl("vq2a8_down_reduce", &vllm_ascend::meta::vq2a8_down_reduce_meta);
 }
