@@ -11,7 +11,10 @@ from enum import Enum
 import torch
 import torch.nn.functional as F
 
-from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
+from vllm_ascend.quantization.vq2a8_format import (
+    decode_repacked_vq2_weight,
+    unpack_repacked_indices,
+)
 
 logger = logging.getLogger(__name__)
 _warned_reference_fallback = False
@@ -211,6 +214,162 @@ def vq2a8_prepare_debug(
         rht_sign,
         rht_block_size,
     )
+
+
+def _decode_repacked_codebook_weight(
+    packed_indices: torch.Tensor,
+    codebooks: torch.Tensor,
+    codebook_tile_ids: torch.Tensor,
+    row_group_size: int,
+) -> torch.Tensor:
+    """Decode only the codebook lookup used by the direct NPU kernels."""
+    input_size = codebook_tile_ids.numel()
+    indices = unpack_repacked_indices(packed_indices, input_size)
+    output_size = indices.shape[0] * 2
+    if output_size % row_group_size:
+        raise ValueError(f"Output size {output_size} is not divisible by row group size {row_group_size}.")
+    output_rows = torch.arange(output_size, device=indices.device)
+    vector_rows = torch.div(output_rows, 2, rounding_mode="floor")
+    row_tiles = torch.div(output_rows, row_group_size, rounding_mode="floor")
+    components = output_rows.remainder(2)
+    source_tiles = codebook_tile_ids.to(torch.int64)
+    return codebooks[
+        source_tiles.unsqueeze(0),
+        row_tiles.unsqueeze(1),
+        indices[vector_rows],
+        components.unsqueeze(1),
+    ].float()
+
+
+def _reference_vq2a8_direct_projection(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    packed_indices: torch.Tensor,
+    codebooks: torch.Tensor,
+    codebook_tile_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+    row_group_size: int,
+) -> torch.Tensor:
+    """Reproduce prepare + codebook dot without decoding dense weights."""
+    _validate_payload(
+        x,
+        expert_ids,
+        packed_indices,
+        codebooks,
+        codebook_tile_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+    )
+    quantized, activation_scale, bias_correction = reference_vq2a8_prepare(
+        x,
+        expert_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        rht_block_size,
+    )
+    output_size = packed_indices.shape[1] * 2
+    projected = torch.empty((x.shape[0], output_size), device=x.device, dtype=torch.float32)
+    for expert_index in torch.unique(expert_ids).cpu().tolist():
+        rows = torch.where(expert_ids == expert_index)[0]
+        lookup_weight = _decode_repacked_codebook_weight(
+            packed_indices[expert_index],
+            codebooks[expert_index],
+            codebook_tile_ids[expert_index],
+            row_group_size,
+        )
+        values = quantized.index_select(0, rows).float() @ lookup_weight.T
+        values *= activation_scale.index_select(0, rows).unsqueeze(-1)
+        values += bias_correction.index_select(0, rows).unsqueeze(-1)
+        projected.index_copy_(0, rows, values)
+    return projected
+
+
+def reference_vq2a8_direct_gate_up(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    packed_indices: torch.Tensor,
+    codebooks: torch.Tensor,
+    codebook_tile_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+    row_group_size: int,
+    activation: str | Enum = "silu",
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
+    """CPU golden that follows the direct gate/up kernel's FP8 boundaries."""
+    activation_name = _normalize_activation_name(activation)
+    if activation_name not in ("silu", "swiglu"):
+        raise NotImplementedError(f"VQ2A8 direct reference supports only SwiGLU, got {activation!r}.")
+    projected = _reference_vq2a8_direct_projection(
+        x,
+        expert_ids,
+        packed_indices,
+        codebooks,
+        codebook_tile_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        rht_block_size,
+        row_group_size,
+    )
+    gate, up = projected.chunk(2, dim=-1)
+    gate = gate.to(torch.bfloat16).float()
+    up = up.to(torch.bfloat16).float()
+    if swiglu_limit is not None and swiglu_limit > 0:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
+    gate = F.silu(gate).to(torch.bfloat16).float()
+    return (gate * up).to(x.dtype)
+
+
+def reference_vq2a8_direct_down_reduce(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    token_ids: torch.Tensor,
+    routing_weights: torch.Tensor,
+    packed_indices: torch.Tensor,
+    codebooks: torch.Tensor,
+    codebook_tile_ids: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    rht_block_size: int,
+    row_group_size: int,
+    num_tokens: int,
+) -> torch.Tensor:
+    """CPU golden that follows the direct down/reduce kernel boundaries."""
+    if token_ids.shape != expert_ids.shape or routing_weights.shape != expert_ids.shape:
+        raise ValueError("token_ids and routing_weights must match expert_ids.")
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}.")
+    projected = _reference_vq2a8_direct_projection(
+        x,
+        expert_ids,
+        packed_indices,
+        codebooks,
+        codebook_tile_ids,
+        weight_scale,
+        weight_bias,
+        rht_sign,
+        rht_block_size,
+        row_group_size,
+    )
+    routed = projected.to(torch.bfloat16).float()
+    routed *= routing_weights.float().unsqueeze(-1)
+    output = torch.zeros(
+        (num_tokens, projected.shape[1]),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    output.index_add_(0, token_ids.long(), routed)
+    return output.to(x.dtype)
 
 
 def reference_vq2a8_gate_up(

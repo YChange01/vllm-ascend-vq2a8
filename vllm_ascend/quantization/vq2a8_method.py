@@ -184,8 +184,8 @@ def _compare_first_assignment_with_reference(
     )
     from vllm_ascend.quantization.vq2a8_ops import (
         custom_vq2a8_prepare_debug_available,
-        reference_vq2a8_down_reduce,
-        reference_vq2a8_gate_up,
+        reference_vq2a8_direct_down_reduce,
+        reference_vq2a8_direct_gate_up,
         reference_vq2a8_prepare,
         vq2a8_down_reduce,
         vq2a8_prepare_debug,
@@ -246,7 +246,7 @@ def _compare_first_assignment_with_reference(
             values=comparison_extra,
         )
 
-    reference_gate_up = reference_vq2a8_gate_up(
+    reference_gate_up = reference_vq2a8_direct_gate_up(
         cpu_x,
         cpu_expert_ids,
         *gate_payload,
@@ -283,8 +283,8 @@ def _compare_first_assignment_with_reference(
         1,
         allow_reference_fallback=False,
     )
-    reference_down = reference_vq2a8_down_reduce(
-        reference_gate_up,
+    reference_down = reference_vq2a8_direct_down_reduce(
+        gate_up[0:1].detach().cpu(),
         cpu_expert_ids,
         cpu_token_ids,
         cpu_routing_weight,

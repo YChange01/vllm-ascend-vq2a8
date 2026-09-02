@@ -8,6 +8,8 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm_ascend.quantization import vq2a8_ops
 from vllm_ascend.quantization.vq2a8_format import decode_repacked_vq2_weight
 from vllm_ascend.quantization.vq2a8_ops import (
+    reference_vq2a8_direct_down_reduce,
+    reference_vq2a8_direct_gate_up,
     reference_vq2a8_down_reduce,
     reference_vq2a8_gate_up,
     reference_vq2a8_prepare,
@@ -89,6 +91,61 @@ def test_reference_two_stage_moe_matches_decoded_dense_weights(
     expected = (torch.nn.functional.silu(gate) * up) @ down_weight.T
     expected *= routing_weights.unsqueeze(-1)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_direct_reference_two_stage_moe_is_finite_and_routed() -> None:
+    gate_payload = _payload(output_size=4, input_size=8, row_group_size=2)
+    down_payload = _payload(output_size=8, input_size=2, row_group_size=2)
+    x = torch.arange(16, dtype=torch.bfloat16).reshape(2, 8).div(17)
+    expert_ids = torch.zeros(2, dtype=torch.int32)
+    token_ids = torch.zeros(2, dtype=torch.int64)
+    routing_weights = torch.tensor([0.25, 0.75])
+
+    gate_up = reference_vq2a8_direct_gate_up(
+        x,
+        expert_ids,
+        *gate_payload,
+        rht_block_size=4,
+        row_group_size=2,
+        swiglu_limit=10.0,
+    )
+    actual = reference_vq2a8_direct_down_reduce(
+        gate_up,
+        expert_ids,
+        token_ids,
+        routing_weights,
+        *down_payload,
+        rht_block_size=2,
+        row_group_size=2,
+        num_tokens=1,
+    )
+    first = reference_vq2a8_direct_down_reduce(
+        gate_up[0:1],
+        expert_ids[0:1],
+        torch.zeros(1, dtype=torch.int64),
+        routing_weights[0:1],
+        *down_payload,
+        rht_block_size=2,
+        row_group_size=2,
+        num_tokens=1,
+    )
+    second = reference_vq2a8_direct_down_reduce(
+        gate_up[1:2],
+        expert_ids[1:2],
+        torch.zeros(1, dtype=torch.int64),
+        routing_weights[1:2],
+        *down_payload,
+        rht_block_size=2,
+        row_group_size=2,
+        num_tokens=1,
+    )
+
+    assert gate_up.dtype == torch.bfloat16
+    assert actual.dtype == torch.bfloat16
+    assert torch.isfinite(gate_up.float()).all()
+    assert torch.isfinite(actual.float()).all()
+    assert torch.count_nonzero(actual) > 0
+    torch.testing.assert_close(actual.float(), first.float() + second.float(), atol=0.02, rtol=0.02)
 
 
 def test_reference_gate_up_rejects_unsupported_activation() -> None:

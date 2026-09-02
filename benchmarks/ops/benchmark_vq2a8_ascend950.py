@@ -18,6 +18,8 @@ from vllm_ascend.quantization.vq2a8_ops import (
     custom_vq2a8_down_reduce_available,
     custom_vq2a8_gate_up_available,
     custom_vq2a8_prepare_debug_available,
+    reference_vq2a8_direct_down_reduce,
+    reference_vq2a8_direct_gate_up,
     reference_vq2a8_prepare,
     vq2a8_down_reduce,
     vq2a8_gate_up,
@@ -123,6 +125,8 @@ def main() -> None:
     num_tokens = int(token_ids.max().cpu()) + 1
 
     expected_prepare = None
+    expected_gate_up = None
+    expected_output = None
     if args.stage == "prepare":
         expected_prepare = reference_vq2a8_prepare(
             x_cpu,
@@ -132,6 +136,36 @@ def main() -> None:
             payload_cpu["gate_up_rht_sign"],
             metadata["rht_block_size"],
         )
+    else:
+        expected_gate_up = reference_vq2a8_direct_gate_up(
+            x_cpu,
+            expert_ids_cpu,
+            payload_cpu["gate_up_packed_indices"],
+            payload_cpu["gate_up_codebooks"],
+            payload_cpu["gate_up_codebook_tile_ids"],
+            payload_cpu["gate_up_weight_scale"],
+            payload_cpu["gate_up_weight_bias"],
+            payload_cpu["gate_up_rht_sign"],
+            metadata["rht_block_size"],
+            metadata["row_group_size"],
+            swiglu_limit=args.swiglu_limit,
+        )
+        if args.stage == "full":
+            expected_output = reference_vq2a8_direct_down_reduce(
+                expected_gate_up,
+                expert_ids_cpu,
+                golden["token_ids"],
+                golden["routing_weights"],
+                payload_cpu["down_packed_indices"],
+                payload_cpu["down_codebooks"],
+                payload_cpu["down_codebook_tile_ids"],
+                payload_cpu["down_weight_scale"],
+                payload_cpu["down_weight_bias"],
+                payload_cpu["down_rht_sign"],
+                metadata["rht_block_size"],
+                metadata["row_group_size"],
+                num_tokens,
+            )
 
     def run_once():
         if args.stage == "prepare":
@@ -196,19 +230,21 @@ def main() -> None:
             "prepare_bias": _comparison_stats(bias_correction, expected_bias),
         }
     else:
+        assert expected_gate_up is not None
         gate_up, output = result_tensors
         gate_up_cpu = gate_up.float().cpu()
         validation = {
             "gate_up": _comparison_stats(
                 gate_up_cpu,
-                golden["expected_gate_up_fp32"],
+                expected_gate_up,
             )
         }
         if output is not None:
+            assert expected_output is not None
             output_cpu = output.float().cpu()
             validation["down_reduce"] = _comparison_stats(
                 output_cpu,
-                golden["expected_output_fp32"],
+                expected_output,
             )
     print(json.dumps({"validation": validation}, indent=2), flush=True)
     if args.stage == "prepare":
@@ -233,14 +269,15 @@ def main() -> None:
     else:
         torch.testing.assert_close(
             gate_up_cpu,
-            golden["expected_gate_up_fp32"],
+            expected_gate_up,
             rtol=args.rtol,
             atol=args.atol,
         )
         if output is not None:
+            assert expected_output is not None
             torch.testing.assert_close(
                 output_cpu,
-                golden["expected_output_fp32"],
+                expected_output,
                 rtol=args.rtol,
                 atol=args.atol,
             )
