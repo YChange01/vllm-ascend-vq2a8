@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Native E4M3 Triton kernel for the frozen TP1 VQ2A8 artifact.
+"""Packed E4M3 Triton kernels for the frozen TP1 VQ2A8 artifact.
 
 The kernel consumes one prepared activation row and one expert matrix.  It
-performs packed-index lookup on the device and feeds decoded tiles directly
-to an FP8 ``tl.dot`` without materializing a dense weight.
+performs packed-index lookup on the device without materializing a dense
+expert weight.
 
-The activation and codebooks remain E4M3 from artifact load through Cube
-execution.  Packed words and complete 32-byte codebook rows are loaded at
-aligned addresses; nibble and codebook selection happens on chip before the
-raw E4M3 bytes enter ``tl.dot`` with FP32 accumulation.  This avoids the
-unaligned dynamic one-byte gathers that Ascend's MTE cannot execute.
+The portable accelerator path feeds decoded E4M3 tiles to ``tl.dot``.  The
+Ascend 950 correctness path instead converts each decoded tile to FP32 and
+uses Vector multiply/reduction.  CANN 9.1's plain E4M3 ``tl.dot`` lowering
+currently aborts at runtime in the generated Vector-to-Cube/fixpipe bridge.
+Keeping the Ascend baseline on AIV establishes packed-artifact correctness
+without relying on that compiler path; a supported Cube implementation is a
+separate performance milestone.
 """
 
 from __future__ import annotations
@@ -166,7 +168,7 @@ if ascend_language is not None:
     ):
         output_block = tl.program_id(0)
         offsets_n = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
-        accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_N,), dtype=tl.float32)
         pair_offsets = tl.arange(0, BLOCK_N // VECTOR_LENGTH)
         packed_word_offsets = tl.arange(0, BLOCK_K // INDICES_PER_WORD)
         nibble_offsets = tl.arange(0, INDICES_PER_WORD)
@@ -176,10 +178,6 @@ if ascend_language is not None:
         for start_k in range(0, SIZE_K, BLOCK_K):
             offsets_k = start_k + tl.arange(0, BLOCK_K)
             activation_vector = tl.load(activation_ptr + offsets_k * stride_ak)
-            activation_e4m3 = tl.broadcast_to(
-                activation_vector[None, :],
-                (BLOCK_M, BLOCK_K),
-            )
 
             packed_words = tl.load(
                 packed_indices_ptr
@@ -218,25 +216,20 @@ if ascend_language is not None:
                     selected = (source_tiles[None, :] == source_tile) & (codes == code)
                     weights = tl.where(selected, codebook_value[:, None], weights)
 
-            # These are plain E4M3 values, so use a regular FP8 matmul rather
-            # than MatMulMx. CANN 9.1 recognizes tl.dot as linalg.matmul and
-            # can assign its Vector/Cube transfer buffers through the dynamic
-            # CV pipeline. Explicit scope.scope is intentionally absent
-            # because it is an SSBuffer blacklist operation.
+            # CANN 9.1 can lower E4M3 -> FP32 on Vector, while its ordinary
+            # E4M3 tl.dot path creates an invalid Vector-to-Cube/fixpipe
+            # address on Ascend 950. Keep this correctness baseline entirely
+            # on AIV and accumulate one [N] partial per K tile.
             weights_e4m3 = weights.to(tl.float8e4nv, bitcast=True)
-            accumulator = tl.dot(
-                activation_e4m3,
-                tl.trans(weights_e4m3),
-                acc=accumulator,
-                out_dtype=tl.float32,
+            partial = tl.sum(
+                weights_e4m3.to(tl.float32) * activation_vector[None, :].to(tl.float32),
+                axis=1,
             )
+            accumulator += partial
 
-        first_row_mask = tl.arange(0, BLOCK_M)[:, None] == 0
-        first_row = tl.sum(accumulator * first_row_mask, axis=0)
-        first_row = tl.reshape(first_row, (BLOCK_N,))
         scale = tl.load(activation_scale_ptr)
         bias = tl.load(bias_correction_ptr)
-        output = first_row * scale + bias
+        output = accumulator * scale + bias
         tl.store(output_ptr + offsets_n * stride_on, output)
 
 else:
@@ -244,7 +237,7 @@ else:
 
 
 def _vq2a8_ascend_launch_options() -> dict[str, bool | int]:
-    """Keep CANN's dynamic CV and memory-planning defaults enabled."""
+    """Launch the packed correctness kernel as a pure Vector workload."""
     return {"num_warps": 4}
 
 

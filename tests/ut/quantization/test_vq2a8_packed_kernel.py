@@ -53,7 +53,7 @@ def test_native_e4m3_transfers_preserve_a5_alignment() -> None:
     assert VQ2_CODEBOOK_SIZE * VQ2_VECTOR_LENGTH * fp8_bytes == 32
 
 
-def test_ascend_kernel_preserves_dynamic_cv_compile_defaults() -> None:
+def test_ascend_vector_kernel_launch_options() -> None:
     assert _vq2a8_ascend_launch_options() == {"num_warps": 4}
 
 

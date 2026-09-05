@@ -43,16 +43,16 @@ if [[ ! "$warmups" =~ ^[0-9]+$ || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-echo "========== VQ2A8 TP1 M=1 NATIVE E4M3 PACKED KERNEL GATE =========="
+echo "========== VQ2A8 TP1 M=1 PACKED VECTOR CORRECTNESS GATE =========="
 echo "repo:       $repo_path"
 echo "git:        $(git -C "$repo_path" rev-parse HEAD)"
 echo "model:      $model_path"
 echo "artifact:   $artifact_path"
 echo "python:     $python_bin"
 echo "device map: physical $physical_npu -> logical npu:0"
-echo "compute:    E4M3 x E4M3, FP32 accumulate (tl.dot)"
-echo "CV profile: CANN dynamic Vector -> Cube -> Vector pipeline"
-echo "memory:     SSBuffer defaults; no explicit scope blacklist"
+echo "storage:    packed indices + native E4M3 activation/codebooks"
+echo "compute:    E4M3 -> FP32 Vector MAC/reduce"
+echo "profile:    pure AIV; no Cube/fixpipe bridge"
 echo "probes:     $probes"
 echo "warmups:    $warmups"
 echo "repeats:    $repeats"
