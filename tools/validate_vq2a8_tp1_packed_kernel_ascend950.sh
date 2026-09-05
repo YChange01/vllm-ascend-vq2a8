@@ -43,13 +43,14 @@ if [[ ! "$warmups" =~ ^[0-9]+$ || ! "$repeats" =~ ^[1-9][0-9]*$ ]]; then
     exit 2
 fi
 
-echo "========== VQ2A8 TP1 M=1 PACKED KERNEL GATE =========="
+echo "========== VQ2A8 TP1 M=1 NATIVE E4M3 PACKED KERNEL GATE =========="
 echo "repo:       $repo_path"
 echo "git:        $(git -C "$repo_path" rev-parse HEAD)"
 echo "model:      $model_path"
 echo "artifact:   $artifact_path"
 echo "python:     $python_bin"
 echo "device map: physical $physical_npu -> logical npu:0"
+echo "compute:    E4M3 x E4M3, FP32 accumulate (tl.dot_scaled)"
 echo "probes:     $probes"
 echo "warmups:    $warmups"
 echo "repeats:    $repeats"

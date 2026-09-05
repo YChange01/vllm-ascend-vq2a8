@@ -191,12 +191,9 @@ def _run_projection(
         rht_sign,
         spec.rht_block_size,
     )
-    # FP8 values are mirrored into BF16 for this first cross-backend tl.dot
-    # gate.  This is lossless because BF16 has a wider significand/exponent
-    # range than E4M3FN.
-    prepared_activation = quantized.to(torch.bfloat16).contiguous()
+    prepared_activation = quantized.contiguous()
     packed_indices = payload_cpu["packed_indices"].to(device=device).contiguous()
-    codebooks = payload_cpu["codebooks"].to(device=device, dtype=torch.bfloat16).contiguous()
+    codebooks = payload_cpu["codebooks"].to(device=device).contiguous()
     codebook_tile_ids = payload_cpu["codebook_tile_ids"].to(device=device).contiguous()
 
     actual = vq2a8_tp1_m1_packed_gemm(
@@ -241,7 +238,10 @@ def _run_projection(
         "projection": f"{probe.layer_index}:{probe.expert_id}:{kind}",
         "shape": {"m": 1, "n": spec.rows, "k": spec.columns},
         "activation_prepare_backend": "validated_eager_dynamic_a8",
-        "packed_projection_backend": "triton_bf16_cube_aligned_table_v2",
+        "activation_storage_dtype": str(prepared_activation.dtype),
+        "codebook_storage_dtype": str(codebooks.dtype),
+        "packed_projection_backend": "triton_native_e4m3_cube_aligned_table_v3",
+        "native_fp8_dot": True,
         "device_dense_weight_materialized": False,
         "comparison": comparison,
         "determinism": determinism,
@@ -388,9 +388,12 @@ def main() -> None:
         + json.dumps(
             {
                 "artifact": str(artifact.root),
+                "activation_dtype": "torch.float8_e4m3fn",
+                "codebook_dtype": "torch.float8_e4m3fn",
                 "device": str(device),
                 "projections": [result["projection"] for result in results],
                 "dense_weight_on_device": False,
+                "native_fp8_dot": True,
             },
             sort_keys=True,
         ),

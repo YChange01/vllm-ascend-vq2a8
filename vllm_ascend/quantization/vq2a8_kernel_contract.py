@@ -13,11 +13,11 @@ VQ2_VECTOR_LENGTH = 2
 VQ2_INDICES_PER_WORD = 8
 VQ2_INDEX_BITS = 4
 VQ2_ROW_GROUP_SIZE = 32
-VQ2_BLOCK_M = 16
+VQ2_BLOCK_M = 32
 VQ2_BLOCK_N = 32
-# Ascend CV kernels require a 512-byte-aligned tail axis.  BF16 K=256 is
-# exactly 512 bytes and also leaves every packed-word block 128-byte aligned.
-VQ2_BLOCK_K = 256
+# A5 FP8 Cube kernels use a 32x32 output tile.  E4M3 K=512 is a 512-byte
+# activation transfer and leaves every packed-word block 256-byte aligned.
+VQ2_BLOCK_K = 512
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,7 @@ def validate_vq2a8_tp1_m1_inputs(
     _require_tensor(
         activation,
         "activation",
-        dtype=torch.bfloat16,
+        dtype=torch.float8_e4m3fn,
         ndim=2,
         device=device,
     )
@@ -93,7 +93,7 @@ def validate_vq2a8_tp1_m1_inputs(
     _require_tensor(
         codebooks,
         "codebooks",
-        dtype=torch.bfloat16,
+        dtype=torch.float8_e4m3fn,
         ndim=4,
         device=device,
     )

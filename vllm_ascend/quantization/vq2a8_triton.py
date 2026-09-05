@@ -1,18 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton bring-up kernel for the frozen TP1 VQ2A8 artifact.
+"""Native E4M3 Triton kernel for the frozen TP1 VQ2A8 artifact.
 
 The kernel consumes one prepared activation row and one expert matrix.  It
 performs packed-index lookup on the device and feeds decoded tiles directly
-to ``tl.dot`` without materializing a dense weight.
+to ``tl.dot_scaled`` without materializing a dense weight.
 
-The FP8 activation and codebook values are supplied as BF16 mirrors during
-bring-up.  Every FP8 value is exactly representable in BF16, while this avoids
-making the first packed-lookup gate depend on backend-specific FP8 ``tl.dot``
-lowering.  The kernel loads packed words and complete 64-byte codebook rows at
-aligned addresses, then performs nibble and codebook selection in registers.
-This is required because Ascend's MTE cannot execute CUDA-style elementwise
-gathers from dynamically computed two-byte codebook addresses.
+The activation and codebooks remain E4M3 from artifact load through Cube
+execution.  Packed words and complete 32-byte codebook rows are loaded at
+aligned addresses; nibble and codebook selection happens on chip before the
+raw E4M3 bytes enter ``tl.dot_scaled`` with FP32 accumulation.  This avoids the
+unaligned dynamic one-byte gathers that Ascend's MTE cannot execute.
 """
 
 from __future__ import annotations
@@ -70,14 +68,15 @@ def _vq2a8_tp1_m1_packed_gemm_kernel(
     for start_k in range(0, SIZE_K, BLOCK_K):
         offsets_k = start_k + tl.arange(0, BLOCK_K)
         activation_vector = tl.load(activation_ptr + offsets_k * stride_ak)
-        activation = tl.broadcast_to(
-            activation_vector[None, :],
+        activation_bytes = activation_vector.to(tl.uint8, bitcast=True)
+        activation_e4m3 = tl.broadcast_to(
+            activation_bytes[None, :],
             (BLOCK_M, BLOCK_K),
         )
 
         # Load one contiguous packed-word run for every output pair.  Unlike
         # expanding k//8 in the pointer expression, this is an affine 2-D
-        # transfer whose tail is 128 bytes and whose row starts are aligned.
+        # transfer whose tail is 256 bytes and whose row starts are aligned.
         packed_words = tl.load(
             packed_indices_ptr
             + (output_block * (BLOCK_N // VECTOR_LENGTH) + pair_offsets[:, None]) * stride_pn
@@ -92,25 +91,42 @@ def _vq2a8_tp1_m1_packed_gemm_kernel(
         codes = tl.reshape(codes, (BLOCK_N, BLOCK_K))
         source_tiles = tl.load(codebook_tile_ids_ptr + offsets_k).to(tl.int32)
 
-        # Each table load starts at a 64-byte boundary and transfers all
-        # 16x2 BF16 entries.  Selection happens in registers, so no MTE load
+        # Each table load starts at a 32-byte boundary and transfers all
+        # 16x2 E4M3 entries.  Selection happens in registers, so no MTE load
         # uses the unaligned address ``table + code * 2 + component``.
-        weights = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.bfloat16)
+        weights = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.uint8)
         for source_tile in range(0, COLUMN_TILES):
-            table = tl.load(codebooks_ptr + source_tile * stride_cbt + output_block * stride_cbr + table_offsets)
+            table = tl.load(codebooks_ptr + source_tile * stride_cbt + output_block * stride_cbr + table_offsets).to(
+                tl.uint8, bitcast=True
+            )
             for code in range(0, CODEBOOK_SIZE):
                 even_value = tl.sum(
-                    tl.where(table_offsets == code * VECTOR_LENGTH, table, 0.0),
+                    tl.where(table_offsets == code * VECTOR_LENGTH, table, 0),
                     axis=0,
-                ).to(tl.bfloat16)
+                ).to(tl.uint8)
                 odd_value = tl.sum(
-                    tl.where(table_offsets == code * VECTOR_LENGTH + 1, table, 0.0),
+                    tl.where(table_offsets == code * VECTOR_LENGTH + 1, table, 0),
                     axis=0,
-                ).to(tl.bfloat16)
+                ).to(tl.uint8)
                 codebook_value = tl.where(components == 0, even_value, odd_value)
                 selected = (source_tiles[None, :] == source_tile) & (codes == code)
                 weights = tl.where(selected, codebook_value[:, None], weights)
-        accumulator += tl.dot(activation, tl.trans(weights))
+        # Both operands already contain their plain E4M3 values.  E8M0 value
+        # 127 is exactly 1.0, so these per-32-element scales leave the dot
+        # product unchanged; the model's dynamic activation scale is applied
+        # once, after accumulation, by the Python wrapper below.
+        lhs_unit_scale = tl.full((BLOCK_M, BLOCK_K // 32), 127, dtype=tl.uint8)
+        rhs_unit_scale = tl.full((BLOCK_N, BLOCK_K // 32), 127, dtype=tl.uint8)
+        accumulator = tl.dot_scaled(
+            activation_e4m3,
+            lhs_unit_scale,
+            "e4m3",
+            tl.trans(weights),
+            rhs_unit_scale,
+            "e4m3",
+            acc=accumulator,
+            out_dtype=tl.float32,
+        )
 
     first_row_mask = tl.arange(0, BLOCK_M)[:, None] == 0
     first_row = tl.sum(accumulator * first_row_mask, axis=0)
@@ -131,9 +147,8 @@ def vq2a8_tp1_m1_packed_gemm(
 ) -> torch.Tensor:
     """Run one TP1 expert projection directly from packed VQ2 tensors.
 
-    ``activation`` and ``codebooks`` are BF16 mirrors of already-quantized
-    FP8 values.  No dense ``[N, K]`` weight is created on either host or
-    device by this function.
+    ``activation`` and ``codebooks`` stay ``torch.float8_e4m3fn``.  No dense
+    ``[N, K]`` weight is created on either host or device by this function.
     """
     shape = validate_vq2a8_tp1_m1_inputs(
         activation,
