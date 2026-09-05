@@ -32,12 +32,14 @@ _SAFETENSORS_DTYPES = {
     "F32": 4,
     "I8": 1,
     "I32": 4,
+    "U8": 1,
 }
 _TORCH_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
     "F32": torch.float32,
     "I8": torch.int8,
     "I32": torch.int32,
+    "U8": torch.uint8,
 }
 _MATRIX_METADATA_FIELDS = {
     "rows",

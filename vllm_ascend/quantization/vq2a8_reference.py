@@ -31,6 +31,32 @@ _REPACKED_VQ2A8_FIELDS = frozenset(
 )
 
 
+def deepseek_v4_swiglu_reference(
+    gate_up: torch.Tensor,
+    swiglu_limit: float | None,
+) -> torch.Tensor:
+    """Apply the DeepSeek V4 routed-expert SwiGLU contract.
+
+    The clamp order mirrors ``SiluAndMulWithClamp``: clamp the gate only on
+    its positive side, clamp the up branch symmetrically, then evaluate SiLU
+    and multiply.  Operations intentionally retain the input dtype so an NPU
+    eager run exercises the same BF16 boundaries as the model path.
+    """
+    if not isinstance(gate_up, torch.Tensor):
+        raise TypeError(f"gate_up must be a torch.Tensor, got {type(gate_up).__name__}.")
+    if gate_up.ndim < 1 or gate_up.shape[-1] <= 0 or gate_up.shape[-1] % 2:
+        raise ValueError(f"gate_up last dimension must be positive and even, got shape={tuple(gate_up.shape)}.")
+    if swiglu_limit is not None and (
+        isinstance(swiglu_limit, bool) or not isinstance(swiglu_limit, int | float) or swiglu_limit < 0
+    ):
+        raise ValueError(f"swiglu_limit must be non-negative or None, got {swiglu_limit!r}.")
+    gate, up = gate_up.chunk(2, dim=-1)
+    if swiglu_limit is not None and swiglu_limit > 0:
+        gate = torch.clamp(gate, max=swiglu_limit)
+        up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
+    return torch.nn.functional.silu(gate) * up
+
+
 def unpack_vq2_indices(
     packed: torch.Tensor,
     num_vectors: int,
