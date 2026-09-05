@@ -19,6 +19,16 @@ from vllm_ascend.quantization.vq2a8_artifact import (
 
 LITERAL_ORACLE_MAX_ELEMENTS = 1_000_000
 VQ2_FP8_MIN_SCALE = 1e-12
+_REPACKED_VQ2A8_FIELDS = frozenset(
+    {
+        "codebook_tile_ids",
+        "codebooks",
+        "packed_indices",
+        "rht_sign",
+        "weight_bias",
+        "weight_scale",
+    }
+)
 
 
 def unpack_vq2_indices(
@@ -291,6 +301,254 @@ def prepare_repacked_vq2a8_activation_reference(
         fp8_max,
     ).to(fp8_dtype)
     return quantized, activation_scale, bias_correction
+
+
+def _validate_repacked_vq2a8_inputs(
+    tensors: dict[str, torch.Tensor],
+    spec: VQ2MatrixSpec,
+) -> None:
+    if not isinstance(spec, VQ2MatrixSpec):
+        raise TypeError(f"spec must be a VQ2MatrixSpec, got {type(spec).__name__}.")
+    if not isinstance(tensors, dict):
+        raise TypeError(f"tensors must be a dict, got {type(tensors).__name__}.")
+    actual_fields = set(tensors)
+    if actual_fields != _REPACKED_VQ2A8_FIELDS:
+        raise ValueError(
+            f"Repacked VQ2A8 fields differ; "
+            f"missing={sorted(_REPACKED_VQ2A8_FIELDS - actual_fields)}, "
+            f"extra={sorted(actual_fields - _REPACKED_VQ2A8_FIELDS)}."
+        )
+    if not (spec.enable_permutation and spec.enable_normalization and spec.enable_rht):
+        raise ValueError("The repacked VQ2A8 direct format requires permutation, normalization, and RHT metadata.")
+    if spec.rows % VQ2_VECTOR_LENGTH:
+        raise ValueError(f"Repacked VQ2A8 rows must be divisible by {VQ2_VECTOR_LENGTH}, got {spec.rows}.")
+    if spec.column_tiles > torch.iinfo(torch.uint8).max + 1:
+        raise ValueError(
+            f"Repacked VQ2A8 has {spec.column_tiles} column tiles, which cannot "
+            "be represented by uint8 codebook_tile_ids."
+        )
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Repacked {name} must be a torch.Tensor, got {type(tensor).__name__}.")
+        if not tensor.is_contiguous():
+            raise ValueError(f"Repacked {name} must be contiguous.")
+
+    output_pairs = spec.rows // VQ2_VECTOR_LENGTH
+    words_per_pair = math.ceil(spec.columns / VQ2_INDICES_PER_WORD)
+    packed = tensors["packed_indices"]
+    expected_packed_shape = (output_pairs, words_per_pair)
+    if packed.dtype != torch.int32 or tuple(packed.shape) != expected_packed_shape:
+        raise ValueError(
+            f"Repacked packed_indices must be int32 with shape "
+            f"{expected_packed_shape}, got dtype={packed.dtype}, "
+            f"shape={tuple(packed.shape)}."
+        )
+    remainder = spec.columns % VQ2_INDICES_PER_WORD
+    if remainder:
+        last_words = packed[:, -1].to(torch.int64) & 0xFFFFFFFF
+        padding = last_words >> (remainder * VQ2_INDEX_BITS)
+        if bool((padding != 0).any()):
+            raise ValueError("Repacked packed_indices unused high padding nibbles must be zero.")
+
+    codebooks = tensors["codebooks"]
+    expected_codebook_shape = (
+        spec.column_tiles,
+        spec.row_tiles,
+        VQ2_CODEBOOK_SIZE,
+        VQ2_VECTOR_LENGTH,
+    )
+    if codebooks.dtype != torch.float8_e4m3fn or tuple(codebooks.shape) != expected_codebook_shape:
+        raise ValueError(
+            f"Repacked codebooks must be float8_e4m3fn with shape "
+            f"{expected_codebook_shape}, got dtype={codebooks.dtype}, "
+            f"shape={tuple(codebooks.shape)}."
+        )
+    if not bool(torch.isfinite(codebooks.float()).all()):
+        raise ValueError("Repacked codebooks contain non-finite values.")
+
+    tile_ids = tensors["codebook_tile_ids"]
+    if tile_ids.dtype != torch.uint8 or tuple(tile_ids.shape) != (spec.columns,):
+        raise ValueError(
+            f"Repacked codebook_tile_ids must be uint8[{spec.columns}], got "
+            f"dtype={tile_ids.dtype}, shape={tuple(tile_ids.shape)}."
+        )
+    tile_ids_int = tile_ids.to(torch.int64)
+    if not bool((tile_ids_int < spec.column_tiles).all()):
+        raise ValueError(f"Repacked codebook_tile_ids contains an index outside [0, {spec.column_tiles}).")
+    expected_tile_counts = torch.full(
+        (spec.column_tiles,),
+        spec.group_size,
+        dtype=torch.int64,
+        device=tile_ids.device,
+    )
+    expected_tile_counts[-1] = spec.columns - (spec.column_tiles - 1) * spec.group_size
+    actual_tile_counts = torch.bincount(tile_ids_int, minlength=spec.column_tiles)
+    if not torch.equal(actual_tile_counts, expected_tile_counts):
+        raise ValueError("Repacked codebook_tile_ids does not preserve the canonical column-tile population.")
+
+    for name in ("weight_scale", "weight_bias"):
+        tensor = tensors[name]
+        if tensor.dtype != torch.float32 or tuple(tensor.shape) != (spec.columns,):
+            raise ValueError(
+                f"Repacked {name} must be float32[{spec.columns}], got "
+                f"dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
+            )
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"Repacked {name} contains non-finite values.")
+
+    signs = tensors["rht_sign"]
+    if signs.dtype != torch.int8 or tuple(signs.shape) != (spec.columns,):
+        raise ValueError(
+            f"Repacked rht_sign must be int8[{spec.columns}], got dtype={signs.dtype}, shape={tuple(signs.shape)}."
+        )
+    signs_int = signs.to(torch.int16)
+    if not bool(((signs_int == -1) | (signs_int == 1)).all()):
+        raise ValueError("Repacked rht_sign contains values other than -1 and 1.")
+
+
+def _unpack_repacked_vq2a8_indices(
+    packed: torch.Tensor,
+    input_size: int,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Unpack the direct format independently along each output pair's K axis."""
+    words = packed.to(device=device, dtype=torch.int64) & 0xFFFFFFFF
+    shifts = torch.arange(VQ2_INDICES_PER_WORD, device=device, dtype=torch.int64) * VQ2_INDEX_BITS
+    indices = (words.unsqueeze(-1) >> shifts) & (VQ2_CODEBOOK_SIZE - 1)
+    return indices.reshape(packed.shape[0], -1)[:, :input_size]
+
+
+def _decode_repacked_vq2a8_codebook_weight(
+    tensors: dict[str, torch.Tensor],
+    spec: VQ2MatrixSpec,
+    device: torch.device | str,
+    compute_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Decode the repacked codebook matrix before normalization and inverse RHT."""
+    if compute_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    ):
+        raise ValueError(f"compute_dtype must be a floating compute type, got {compute_dtype}.")
+    _validate_repacked_vq2a8_inputs(tensors, spec)
+    indices = _unpack_repacked_vq2a8_indices(
+        tensors["packed_indices"],
+        spec.columns,
+        device,
+    )
+    codebooks = tensors["codebooks"].to(device=device, dtype=compute_dtype)
+    tile_ids = tensors["codebook_tile_ids"].to(device=device, dtype=torch.int64)
+
+    output_pairs = spec.rows // VQ2_VECTOR_LENGTH
+    pair_ids = torch.arange(output_pairs, device=device, dtype=torch.int64)
+    row_tile_ids = torch.div(
+        pair_ids,
+        spec.vectors_per_row_group,
+        rounding_mode="floor",
+    )
+    vectors = codebooks[
+        tile_ids.unsqueeze(0),
+        row_tile_ids.unsqueeze(1),
+        indices,
+    ]
+    return vectors.permute(0, 2, 1).reshape(spec.rows, spec.columns)
+
+
+def decode_repacked_vq2a8_weight(
+    tensors: dict[str, torch.Tensor],
+    spec: VQ2MatrixSpec,
+    compute_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Decode a TP1 direct-format matrix as the original ``W[out, in]``.
+
+    The offline repack has already absorbed the canonical permutation into the
+    K-major index stream and ``codebook_tile_ids``. Normalization and inverse
+    RHT are restored here to materialize the original dense weight.
+    """
+    device: torch.device | str = "cpu"
+    if isinstance(tensors, dict):
+        packed = tensors.get("packed_indices")
+        if isinstance(packed, torch.Tensor):
+            device = packed.device
+    codebook_weight = _decode_repacked_vq2a8_codebook_weight(
+        tensors,
+        spec,
+        device,
+        compute_dtype,
+    )
+    scale = tensors["weight_scale"].to(device=device, dtype=compute_dtype)
+    bias = tensors["weight_bias"].to(device=device, dtype=compute_dtype)
+    normalized = codebook_weight * scale.unsqueeze(0) + bias.unsqueeze(0)
+    weight = _inverse_rht(
+        normalized,
+        spec.rht_block_size,
+        tensors["rht_sign"],
+    )
+    return weight[..., : spec.rht_true_columns].reshape(spec.original_shape)
+
+
+def vq2a8_repacked_matmul_reference(
+    activation: torch.Tensor,
+    tensors: dict[str, torch.Tensor],
+    spec: VQ2MatrixSpec,
+    compute_dtype: torch.dtype = torch.float32,
+    dynamic_a8: bool = False,
+) -> torch.Tensor:
+    """Evaluate ``activation @ W.T`` from a TP1 direct-format artifact."""
+    if not isinstance(activation, torch.Tensor):
+        raise TypeError(f"activation must be a torch.Tensor, got {type(activation).__name__}.")
+    if not isinstance(spec, VQ2MatrixSpec):
+        raise TypeError(f"spec must be a VQ2MatrixSpec, got {type(spec).__name__}.")
+    if activation.ndim != 2:
+        raise ValueError(f"Repacked VQ2A8 activation must be two-dimensional, got shape={tuple(activation.shape)}.")
+    if activation.shape[1] != spec.rht_true_columns:
+        raise ValueError(f"Repacked VQ2A8 activation width is {activation.shape[1]}, expected {spec.rht_true_columns}.")
+    if not isinstance(dynamic_a8, bool):
+        raise ValueError(f"dynamic_a8 must be bool, got {dynamic_a8!r}.")
+    if not bool(torch.isfinite(activation.float()).all()):
+        raise ValueError("Repacked VQ2A8 activation contains non-finite values.")
+
+    codebook_weight = _decode_repacked_vq2a8_codebook_weight(
+        tensors,
+        spec,
+        activation.device,
+        compute_dtype,
+    )
+    padded_activation = activation
+    if spec.rht_true_columns < spec.columns:
+        padded_activation = torch.nn.functional.pad(
+            padded_activation,
+            (0, spec.columns - spec.rht_true_columns),
+        )
+
+    weight_scale = tensors["weight_scale"].to(activation.device)
+    weight_bias = tensors["weight_bias"].to(activation.device)
+    rht_sign = tensors["rht_sign"].to(activation.device)
+    if dynamic_a8:
+        quantized, activation_scale, bias_correction = prepare_repacked_vq2a8_activation_reference(
+            padded_activation,
+            weight_scale,
+            weight_bias,
+            rht_sign,
+            spec.rht_block_size,
+        )
+        output = quantized.to(compute_dtype) @ codebook_weight.transpose(0, 1)
+        output *= activation_scale.to(compute_dtype).unsqueeze(-1)
+        output += bias_correction.to(compute_dtype).unsqueeze(-1)
+        return output
+
+    rotated = _forward_rht_activation(
+        padded_activation.to(compute_dtype),
+        spec.rht_block_size,
+        rht_sign,
+    )
+    bias_correction = rotated @ weight_bias.to(compute_dtype)
+    transformed = rotated * weight_scale.to(compute_dtype).unsqueeze(0)
+    output = transformed @ codebook_weight.transpose(0, 1)
+    output += bias_correction.unsqueeze(-1)
+    return output
 
 
 def decode_expert_weight_literal(
