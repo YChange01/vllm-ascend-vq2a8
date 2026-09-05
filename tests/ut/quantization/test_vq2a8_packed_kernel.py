@@ -16,6 +16,7 @@ from vllm_ascend.quantization.vq2a8_kernel_contract import (
     VQ2A8M1Shape,
     validate_vq2a8_tp1_m1_inputs,
 )
+from vllm_ascend.quantization.vq2a8_triton import _vq2a8_ascend_launch_options
 
 
 def _inputs() -> tuple[torch.Tensor, ...]:
@@ -50,6 +51,14 @@ def test_native_e4m3_transfers_preserve_a5_alignment() -> None:
     assert VQ2_BLOCK_K * fp8_bytes == 512
     assert VQ2_BLOCK_K // VQ2_INDICES_PER_WORD * int32_bytes == 256
     assert VQ2_CODEBOOK_SIZE * VQ2_VECTOR_LENGTH * fp8_bytes == 32
+
+
+def test_ascend_kernel_uses_explicit_cv_compile_profile() -> None:
+    assert _vq2a8_ascend_launch_options() == {
+        "multibuffer": False,
+        "enable_auto_bind_sub_block": False,
+        "num_warps": 4,
+    }
 
 
 def test_validate_tp1_m1_rejects_multiple_rows() -> None:
