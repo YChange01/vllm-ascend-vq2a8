@@ -240,10 +240,8 @@ def _run_projection(
         "activation_prepare_backend": "validated_eager_dynamic_a8",
         "activation_storage_dtype": str(prepared_activation.dtype),
         "codebook_storage_dtype": str(codebooks.dtype),
-        "packed_projection_backend": "triton_native_e4m3_explicit_cv_scope_v5",
-        "ascend_compile_profile": (
-            "external_index_setup_explicit_vector_cube_scopes_no_multibuffer" if device.type == "npu" else None
-        ),
+        "packed_projection_backend": "triton_native_e4m3_auto_cv_dot_v6",
+        "ascend_compile_profile": ("standard_fp8_matmul_dynamic_cv_defaults" if device.type == "npu" else None),
         "native_fp8_dot": True,
         "device_dense_weight_materialized": False,
         "comparison": comparison,
