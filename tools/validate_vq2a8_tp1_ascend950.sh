@@ -7,10 +7,14 @@ set -euo pipefail
 repo_path="${REPO:-/home/g00872988/vllm-ascend-vq2a8}"
 model_path="${MODEL:-/home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256}"
 artifact_path="${ARTIFACT:-${model_path}/experts_vq_ascend_v2}"
-python_bin="${PYTHON_BIN:-/usr/local/python3.11.10/bin/python3}"
+python_bin="${PYTHON_BIN:-}"
 physical_npu="${PHYSICAL_NPU:-4}"
 probes="${PROBES:-0:0,3:0,3:127,3:255,42:255}"
 verify_tensor_hashes="${VERIFY_TENSOR_HASHES:-0}"
+
+if [[ -z "$python_bin" ]]; then
+    python_bin="$(command -v python3 || true)"
+fi
 
 repo_path="$(readlink -f -- "$repo_path")"
 model_path="$(readlink -f -- "$model_path")"
@@ -28,8 +32,8 @@ if [[ ! -f "$artifact_path/manifest.json" ]]; then
     echo "Missing TP1 artifact manifest: $artifact_path/manifest.json" >&2
     exit 2
 fi
-if [[ ! -x "$python_bin" ]]; then
-    echo "Python is not executable: $python_bin" >&2
+if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
+    echo "Cannot find an executable Python. Set PYTHON_BIN to the Python that provides torch_npu." >&2
     exit 2
 fi
 if [[ ! "$physical_npu" =~ ^[0-9]+$ ]]; then
@@ -42,6 +46,7 @@ echo "repo:       $repo_path"
 echo "git:        $(git -C "$repo_path" rev-parse HEAD)"
 echo "model:      $model_path"
 echo "artifact:   $artifact_path"
+echo "python:     $python_bin"
 echo "device map: physical $physical_npu -> logical npu:0"
 echo "probes:     $probes"
 echo "hash scan:  $verify_tensor_hashes"
