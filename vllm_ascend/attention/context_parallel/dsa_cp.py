@@ -13,11 +13,6 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention.abstract import DSAAttentionImpl
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.attention.dsa_o_proj import (
-    apply_unquantized_grouped_o_proj,
-    can_all_gather_dsa_cp_o_proj,
-    has_o_proj_weight_scale,
-)
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
     maybe_save_kv_layer_to_connector,
@@ -29,6 +24,7 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.utils import all_gather_async
 from vllm_ascend.memcache_comm_fence import record_attention_compute_start
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import (
@@ -66,15 +62,6 @@ def _has_prefill(attn_state: AscendAttentionState) -> bool:
         AscendAttentionState.DecodeOnly,
         AscendAttentionState.SpecDecoding,
     }
-
-
-def _is_w8a8_dynamic(linear) -> bool:
-    """Return whether a linear layer uses the dynamic W8A8 adapter."""
-    quant_method = getattr(linear, "quant_method", None)
-    inner_method = getattr(quant_method, "quant_method", None)
-    return isinstance(quant_method, AscendW8A8DynamicLinearMethod) or isinstance(
-        inner_method, AscendW8A8DynamicLinearMethod
-    )
 
 
 @dataclass
@@ -1075,15 +1062,12 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 "DSA-CP expects full-head attn_sink loaded on every TP rank, "
                 f"got {self.attn_sink.numel()} heads, expected {self.num_heads}."
             )
-        self.enable_dsa_cp_with_o_proj_tp = self.enable_dsa_cp_with_o_proj_tp and can_all_gather_dsa_cp_o_proj(
-            self.wo_a, self.wo_b
-        )
         if self.enable_dsa_cp_with_o_proj_tp:
             self._maybe_init_o_proj_tp_full_params()
 
     @staticmethod
     def _check_dynamic_quant(layer: torch.nn.Module) -> bool:
-        return get_ascend_device_type() in {AscendDeviceType.A5} and has_o_proj_weight_scale(layer)
+        return get_ascend_device_type() in {AscendDeviceType.A5} and hasattr(layer, "weight_scale")
 
     def _maybe_init_o_proj_tp_full_params(self) -> None:
         self._wo_a_dynamic_quant = type(self)._check_dynamic_quant(self.wo_a)
@@ -1251,9 +1235,7 @@ class AscendDSACPImpl(DSAAttentionImpl):
             self._switch_o_proj_to_full_weight(o_proj_full_handles)
         o_proj_groups = self.n_group if full_gather_wo_a_enabled else self.n_local_groups
         try:
-            # VQ2A8 leaves attention projections in BF16, so A5 alone is not
-            # sufficient to select the MXFP8 path: wo_a must carry its scale.
-            if type(self)._check_dynamic_quant(self.wo_a):
+            if get_ascend_device_type() in {AscendDeviceType.A5}:
                 o = o_proj_input.view(num_tokens, o_proj_groups, -1)
                 o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
                 o = torch_npu.npu_transpose_quant_batchmatmul(
@@ -1275,12 +1257,17 @@ class AscendDSACPImpl(DSAAttentionImpl):
                 if olora_tp_enable():
                     o_proj_input = self.wo_a(o_proj_input)
                 else:
-                    o_proj_input = apply_unquantized_grouped_o_proj(
+                    # wo_a = self.wo_a.weight.view(o_proj_groups, self.o_lora_rank, -1)
+                    # o = torch.einsum("tgd,grd->tgr", o, wo_a)
+                    o_proj_input = torch_npu.npu_transpose_batchmatmul(
                         o_proj_input,
                         self.wo_a.weight,
-                        o_proj_groups,
-                        self.o_lora_rank,
-                        torch_npu.npu_transpose_batchmatmul,
+                        bias=None,
+                        scale=None,
+                        perm_x1=(1, 0, 2),
+                        perm_x2=(0, 1, 2),
+                        perm_y=(1, 0, 2),
+                        batch_split_factor=1,
                     )
                 o_proj_input = o_proj_input.reshape(num_tokens, -1)
                 output[...] = self._apply_wo_b(o_proj_input, full_gather_wo_a_enabled)
@@ -1329,7 +1316,9 @@ class AscendDSACPImpl(DSAAttentionImpl):
         has_prefill = _has_prefill(common_attn_metadata.attn_state)
         hidden_states_cache = hidden_states[: common_attn_metadata.num_actual_tokens]
 
-        if _is_w8a8_dynamic(self.wq_b):
+        if (not isinstance(self.wq_b.quant_method, AscendUnquantizedLinearMethod)) and isinstance(
+            self.wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod
+        ):
             q_a = self.wq_a(hidden_states_local)
             qr_local, qr_pertoken_scale_local = torch.ops._C_ascend.npu_rms_norm_dynamic_quant(
                 q_a, self.q_norm.weight, epsilon=self.eps
@@ -1624,7 +1613,8 @@ class AscendDSACPImpl(DSAAttentionImpl):
         assert indexer_kv_scale_metadata is not None
 
         if (
-            _is_w8a8_dynamic(self.inderxer_wq_b)
+            (not isinstance(self.inderxer_wq_b.quant_method, AscendUnquantizedLinearMethod))
+            and isinstance(self.inderxer_wq_b.quant_method.quant_method, AscendW8A8DynamicLinearMethod)
             and qr_pertoken_scale is not None
             and get_ascend_device_type() not in {AscendDeviceType.A5}
         ):

@@ -296,7 +296,6 @@ private:
     uint32_t s2BaseSize_ = 0;
     bool isS1G_ = true;
     bool isActQBatchPlus = false;
-    uint32_t maxS2Size_ = 0;
 
 private:
     enum class ParamId : uint32_t {

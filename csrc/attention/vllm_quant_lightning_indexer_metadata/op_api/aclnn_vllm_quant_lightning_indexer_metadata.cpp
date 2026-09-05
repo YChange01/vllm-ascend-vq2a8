@@ -109,7 +109,7 @@ aclnnStatus aclnnVllmQuantLightningIndexerMetadataGetWorkspaceSize(
     preTokensOptional, nextTokensOptional, cmpRatioOptional, metaData, uniqueExecutor.get());
   CHECK_RET(output != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
-  *workspaceSize = uniqueExecutor->GetWorkspaceSize();
+  *workspaceSize = 0;
   uniqueExecutor.ReleaseTo(executor);
   return ACLNN_SUCCESS;
 }
