@@ -15,7 +15,9 @@ VQ2_INDEX_BITS = 4
 VQ2_ROW_GROUP_SIZE = 32
 VQ2_BLOCK_M = 16
 VQ2_BLOCK_N = 32
-VQ2_BLOCK_K = 64
+# Ascend CV kernels require a 512-byte-aligned tail axis.  BF16 K=256 is
+# exactly 512 bytes and also leaves every packed-word block 128-byte aligned.
+VQ2_BLOCK_K = 256
 
 
 @dataclass(frozen=True)

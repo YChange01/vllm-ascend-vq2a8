@@ -241,7 +241,7 @@ def _run_projection(
         "projection": f"{probe.layer_index}:{probe.expert_id}:{kind}",
         "shape": {"m": 1, "n": spec.rows, "k": spec.columns},
         "activation_prepare_backend": "validated_eager_dynamic_a8",
-        "packed_projection_backend": "triton_bf16_cube",
+        "packed_projection_backend": "triton_bf16_cube_aligned_table_v2",
         "device_dense_weight_materialized": False,
         "comparison": comparison,
         "determinism": determinism,

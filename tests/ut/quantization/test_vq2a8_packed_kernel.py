@@ -14,7 +14,7 @@ from vllm_ascend.quantization.vq2a8_kernel_contract import (
 
 def _inputs() -> tuple[torch.Tensor, ...]:
     size_n = 64
-    size_k = 128
+    size_k = 256
     return (
         torch.zeros((1, size_k), dtype=torch.bfloat16),
         torch.ones(1, dtype=torch.float32),
@@ -30,7 +30,7 @@ def test_validate_tp1_m1_packed_kernel_contract() -> None:
 
     assert shape == VQ2A8M1Shape(
         size_n=64,
-        size_k=128,
+        size_k=256,
         column_tiles=2,
         row_tiles=2,
     )
