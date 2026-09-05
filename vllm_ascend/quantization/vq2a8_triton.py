@@ -172,17 +172,21 @@ if ascend_language is not None:
     ):
         output_block = tl.program_id(0)
 
+        # Keep pure index tensors outside explicit scopes.  Triton-Ascend
+        # 3.2.2 cannot materialize an integer ``tl.arange`` tensor returned by
+        # a scope while lowering TTIR to Linalg.  These address calculations
+        # do not need a core owner; the data movement and arithmetic below do.
+        offsets_n = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
+        pair_offsets = tl.arange(0, BLOCK_N // VECTOR_LENGTH)
+        packed_word_offsets = tl.arange(0, BLOCK_K // INDICES_PER_WORD)
+        nibble_offsets = tl.arange(0, INDICES_PER_WORD)
+        table_offsets = tl.arange(0, CODEBOOK_SIZE * VECTOR_LENGTH)
+        components = offsets_n % VECTOR_LENGTH
+
         # Triton-Ascend 3.2.2 otherwise has to infer the owner of every
         # destination-style op in this mixed CV kernel.  Explicit scopes keep
         # packed lookup on Vector and MatMulMx on Cube, avoiding an ambiguous
         # CUBE_OR_VECTOR node in GraphSyncSolver.
-        with ascend_language.scope(core_mode="vector"):
-            offsets_n = output_block * BLOCK_N + tl.arange(0, BLOCK_N)
-            pair_offsets = tl.arange(0, BLOCK_N // VECTOR_LENGTH)
-            packed_word_offsets = tl.arange(0, BLOCK_K // INDICES_PER_WORD)
-            nibble_offsets = tl.arange(0, INDICES_PER_WORD)
-            table_offsets = tl.arange(0, CODEBOOK_SIZE * VECTOR_LENGTH)
-            components = offsets_n % VECTOR_LENGTH
 
         with ascend_language.scope(core_mode="cube"):
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
