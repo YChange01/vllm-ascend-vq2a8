@@ -22,9 +22,11 @@ import vllm_ascend.quantization.vq2a8_repack as vq2a8_repack_module
 from vllm_ascend.quantization.vq2a8_artifact import VQ2MatrixSpec
 from vllm_ascend.quantization.vq2a8_reference import (
     decode_expert_weight,
+    decode_repacked_vq2a8_codebook_weight,
     decode_repacked_vq2a8_weight,
     prepare_repacked_vq2a8_activation_reference,
     vq2_matmul_reference,
+    vq2a8_predecoded_matmul_reference,
     vq2a8_repacked_matmul_reference,
 )
 from vllm_ascend.quantization.vq2a8_repack import (
@@ -432,9 +434,25 @@ def test_canonical_and_repacked_dense_weight_and_projection_are_equivalent() -> 
         compute_dtype=torch.float64,
         dynamic_a8=False,
     )
+    codebook_weight = decode_repacked_vq2a8_codebook_weight(
+        repacked,
+        spec,
+        compute_dtype=torch.float64,
+    )
+    predecoded_output = vq2a8_predecoded_matmul_reference(
+        activation,
+        codebook_weight,
+        repacked["weight_scale"],
+        repacked["weight_bias"],
+        repacked["rht_sign"],
+        spec,
+        compute_dtype=torch.float64,
+        dynamic_a8=False,
+    )
 
     torch.testing.assert_close(repacked_weight, canonical_weight, rtol=0, atol=0)
     torch.testing.assert_close(repacked_output, canonical_output, rtol=0, atol=0)
+    torch.testing.assert_close(predecoded_output, repacked_output, rtol=0, atol=0)
     torch.testing.assert_close(repacked_output, activation @ canonical_weight.T, rtol=0, atol=0)
 
 
@@ -450,6 +468,21 @@ def test_dynamic_a8_repacked_projection_covers_small_k_and_batch_boundaries(colu
     actual = vq2a8_repacked_matmul_reference(
         activation,
         repacked,
+        spec,
+        compute_dtype=torch.float64,
+        dynamic_a8=True,
+    )
+    codebook_weight = decode_repacked_vq2a8_codebook_weight(
+        repacked,
+        spec,
+        compute_dtype=torch.float64,
+    )
+    predecoded = vq2a8_predecoded_matmul_reference(
+        activation,
+        codebook_weight,
+        repacked["weight_scale"],
+        repacked["weight_bias"],
+        repacked["rht_sign"],
         spec,
         compute_dtype=torch.float64,
         dynamic_a8=True,
@@ -470,6 +503,7 @@ def test_dynamic_a8_repacked_projection_covers_small_k_and_batch_boundaries(colu
     assert actual.shape == (tokens, spec.rows)
     assert bool(torch.isfinite(actual).all())
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(predecoded, actual, rtol=0, atol=0)
 
 
 def _repack_tool_path() -> Path:

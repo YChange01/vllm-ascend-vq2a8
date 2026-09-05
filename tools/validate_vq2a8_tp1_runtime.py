@@ -16,8 +16,9 @@ from typing import Any
 import torch
 
 from vllm_ascend.quantization.vq2a8_reference import (
+    decode_repacked_vq2a8_codebook_weight,
     deepseek_v4_swiglu_reference,
-    vq2a8_repacked_matmul_reference,
+    vq2a8_predecoded_matmul_reference,
 )
 from vllm_ascend.quantization.vq2a8_runtime import (
     VQ2TP1Artifact,
@@ -117,19 +118,37 @@ def _projection_pair(
     payload_cpu: dict[str, torch.Tensor],
     spec,
     device: torch.device,
+    *,
+    activation_npu: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    cpu = vq2a8_repacked_matmul_reference(
-        activation_cpu,
+    # Static packed-index and codebook lookup is validated and decoded on CPU.
+    # The Ascend eager path deliberately begins at the activation-side
+    # RHT/dynamic-A8 boundary: CANN 9.1's generic RightShift implementation on
+    # Ascend 950 cannot broadcast [..., 1] with [8], while the eventual native
+    # VQ2A8 kernel performs nibble extraction internally rather than via ACLNN.
+    codebook_weight_cpu = decode_repacked_vq2a8_codebook_weight(
         payload_cpu,
+        spec,
+        compute_dtype=torch.float32,
+    )
+    cpu = vq2a8_predecoded_matmul_reference(
+        activation_cpu,
+        codebook_weight_cpu,
+        payload_cpu["weight_scale"],
+        payload_cpu["weight_bias"],
+        payload_cpu["rht_sign"],
         spec,
         compute_dtype=torch.float32,
         dynamic_a8=True,
     ).to(torch.bfloat16)
-    payload_npu = {name: tensor.to(device=device) for name, tensor in payload_cpu.items()}
-    activation_npu = activation_cpu.to(device=device)
-    npu = vq2a8_repacked_matmul_reference(
+    if activation_npu is None:
+        activation_npu = activation_cpu.to(device=device)
+    npu = vq2a8_predecoded_matmul_reference(
         activation_npu,
-        payload_npu,
+        codebook_weight_cpu.to(device=device),
+        payload_cpu["weight_scale"].to(device=device),
+        payload_cpu["weight_bias"].to(device=device),
+        payload_cpu["rht_sign"].to(device=device),
         spec,
         compute_dtype=torch.float32,
         dynamic_a8=True,
@@ -170,33 +189,25 @@ def run_probe(
     activation_comparison = comparison_summary(activated_cpu, activated_npu, rtol=rtol, atol=atol)
 
     print(f"PROBE {probe.layer_index}:{probe.expert_id} stage=down", flush=True)
-    down_cpu = vq2a8_repacked_matmul_reference(
+    down_cpu, down_npu = _projection_pair(
         activated_cpu,
         down_payload,
         down_spec,
-        compute_dtype=torch.float32,
-        dynamic_a8=True,
-    ).to(torch.bfloat16)
-    down_payload_npu = {name: tensor.to(device=device) for name, tensor in down_payload.items()}
-    down_npu = vq2a8_repacked_matmul_reference(
-        activated_npu,
-        down_payload_npu,
-        down_spec,
-        compute_dtype=torch.float32,
-        dynamic_a8=True,
-    ).to(torch.bfloat16)
-    torch.npu.synchronize()
+        device,
+        activation_npu=activated_npu,
+    )
     down_comparison = comparison_summary(down_cpu, down_npu, rtol=rtol, atol=atol)
 
     result = {
         "probe": f"{probe.layer_index}:{probe.expert_id}",
+        "static_decode_backend": "cpu",
+        "device_compute_boundary": "rht_dynamic_a8_matmul",
         "gate_up": gate_comparison,
         "swiglu": activation_comparison,
         "down": down_comparison,
         "elapsed_seconds": time.perf_counter() - started,
     }
     del gate_payload, down_payload, gate_cpu, gate_npu, activated_cpu, activated_npu, down_cpu, down_npu
-    del down_payload_npu
     gc.collect()
     torch.npu.empty_cache()
     print("PROBE_RESULT " + json.dumps(result, sort_keys=True), flush=True)

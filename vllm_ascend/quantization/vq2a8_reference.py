@@ -438,10 +438,17 @@ def _unpack_repacked_vq2a8_indices(
     device: torch.device | str,
 ) -> torch.Tensor:
     """Unpack the direct format independently along each output pair's K axis."""
-    words = packed.to(device=device, dtype=torch.int64) & 0xFFFFFFFF
-    shifts = torch.arange(VQ2_INDICES_PER_WORD, device=device, dtype=torch.int64) * VQ2_INDEX_BITS
-    indices = (words.unsqueeze(-1) >> shifts) & (VQ2_CODEBOOK_SIZE - 1)
-    return indices.reshape(packed.shape[0], -1)[:, :input_size]
+    words = packed.to(device=device, dtype=torch.int32)
+    # Ascend 950's aclnnRightShift path does not broadcast [..., 1] with
+    # [indices_per_word].  Scalar shifts preserve the exact signed-int32 nibble
+    # semantics after masking and avoid materializing broadcast operands.
+    indices = torch.stack(
+        tuple(
+            (words >> (position * VQ2_INDEX_BITS)) & (VQ2_CODEBOOK_SIZE - 1) for position in range(VQ2_INDICES_PER_WORD)
+        ),
+        dim=-1,
+    )
+    return indices.reshape(packed.shape[0], -1)[:, :input_size].to(torch.int64)
 
 
 def _decode_repacked_vq2a8_codebook_weight(
@@ -482,6 +489,113 @@ def _decode_repacked_vq2a8_codebook_weight(
     return vectors.permute(0, 2, 1).reshape(spec.rows, spec.columns)
 
 
+def decode_repacked_vq2a8_codebook_weight(
+    tensors: dict[str, torch.Tensor],
+    spec: VQ2MatrixSpec,
+    compute_dtype: torch.dtype = torch.float32,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Decode only the static codebook matrix of a repacked expert.
+
+    This is the boundary between offline/static VQ lookup and activation-side
+    RHT plus dynamic A8.  A correctness gate can decode this matrix on CPU and
+    move it to a device without depending on backend-specific integer
+    broadcasting or advanced-indexing implementations.
+    """
+    if device is None and isinstance(tensors, dict):
+        packed = tensors.get("packed_indices")
+        if isinstance(packed, torch.Tensor):
+            device = packed.device
+    if device is None:
+        device = "cpu"
+    return _decode_repacked_vq2a8_codebook_weight(
+        tensors,
+        spec,
+        device,
+        compute_dtype,
+    )
+
+
+def vq2a8_predecoded_matmul_reference(
+    activation: torch.Tensor,
+    codebook_weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_bias: torch.Tensor,
+    rht_sign: torch.Tensor,
+    spec: VQ2MatrixSpec,
+    compute_dtype: torch.dtype = torch.float32,
+    dynamic_a8: bool = False,
+) -> torch.Tensor:
+    """Evaluate a repacked projection after static codebook lookup.
+
+    ``codebook_weight`` is the canonical ``[rows, columns]`` matrix returned
+    by :func:`decode_repacked_vq2a8_codebook_weight`; normalization and RHT
+    remain on the activation side.  Keeping this boundary explicit lets the
+    Ascend 950 eager oracle validate device arithmetic independently from
+    unsupported eager index-unpacking primitives.
+    """
+    if not isinstance(activation, torch.Tensor):
+        raise TypeError(f"activation must be a torch.Tensor, got {type(activation).__name__}.")
+    if not isinstance(codebook_weight, torch.Tensor):
+        raise TypeError(f"codebook_weight must be a torch.Tensor, got {type(codebook_weight).__name__}.")
+    if not isinstance(spec, VQ2MatrixSpec):
+        raise TypeError(f"spec must be a VQ2MatrixSpec, got {type(spec).__name__}.")
+    if activation.ndim != 2:
+        raise ValueError(f"Repacked VQ2A8 activation must be two-dimensional, got shape={tuple(activation.shape)}.")
+    if activation.shape[1] != spec.rht_true_columns:
+        raise ValueError(f"Repacked VQ2A8 activation width is {activation.shape[1]}, expected {spec.rht_true_columns}.")
+    if tuple(codebook_weight.shape) != (spec.rows, spec.columns):
+        raise ValueError(
+            f"Decoded codebook weight has shape {tuple(codebook_weight.shape)}, expected {(spec.rows, spec.columns)}."
+        )
+    if codebook_weight.device != activation.device:
+        raise ValueError(
+            f"Activation and decoded codebook weight must share a device, got "
+            f"{activation.device} and {codebook_weight.device}."
+        )
+    if compute_dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    ):
+        raise ValueError(f"compute_dtype must be a floating compute type, got {compute_dtype}.")
+    if not isinstance(dynamic_a8, bool):
+        raise ValueError(f"dynamic_a8 must be bool, got {dynamic_a8!r}.")
+    if not bool(torch.isfinite(activation.float()).all()):
+        raise ValueError("Repacked VQ2A8 activation contains non-finite values.")
+
+    padded_activation = activation
+    if spec.rht_true_columns < spec.columns:
+        padded_activation = torch.nn.functional.pad(
+            padded_activation,
+            (0, spec.columns - spec.rht_true_columns),
+        )
+    if dynamic_a8:
+        quantized, activation_scale, bias_correction = prepare_repacked_vq2a8_activation_reference(
+            padded_activation,
+            weight_scale,
+            weight_bias,
+            rht_sign,
+            spec.rht_block_size,
+        )
+        output = quantized.to(compute_dtype) @ codebook_weight.to(compute_dtype).transpose(0, 1)
+        output *= activation_scale.to(compute_dtype).unsqueeze(-1)
+        output += bias_correction.to(compute_dtype).unsqueeze(-1)
+        return output
+
+    rotated = _forward_rht_activation(
+        padded_activation.to(compute_dtype),
+        spec.rht_block_size,
+        rht_sign,
+    )
+    bias_correction = rotated @ weight_bias.to(compute_dtype)
+    transformed = rotated * weight_scale.to(compute_dtype).unsqueeze(0)
+    output = transformed @ codebook_weight.to(compute_dtype).transpose(0, 1)
+    output += bias_correction.unsqueeze(-1)
+    return output
+
+
 def decode_repacked_vq2a8_weight(
     tensors: dict[str, torch.Tensor],
     spec: VQ2MatrixSpec,
@@ -493,17 +607,12 @@ def decode_repacked_vq2a8_weight(
     K-major index stream and ``codebook_tile_ids``. Normalization and inverse
     RHT are restored here to materialize the original dense weight.
     """
-    device: torch.device | str = "cpu"
-    if isinstance(tensors, dict):
-        packed = tensors.get("packed_indices")
-        if isinstance(packed, torch.Tensor):
-            device = packed.device
-    codebook_weight = _decode_repacked_vq2a8_codebook_weight(
+    codebook_weight = decode_repacked_vq2a8_codebook_weight(
         tensors,
         spec,
-        device,
         compute_dtype,
     )
+    device = codebook_weight.device
     scale = tensors["weight_scale"].to(device=device, dtype=compute_dtype)
     bias = tensors["weight_bias"].to(device=device, dtype=compute_dtype)
     normalized = codebook_weight * scale.unsqueeze(0) + bias.unsqueeze(0)
@@ -525,56 +634,22 @@ def vq2a8_repacked_matmul_reference(
     """Evaluate ``activation @ W.T`` from a TP1 direct-format artifact."""
     if not isinstance(activation, torch.Tensor):
         raise TypeError(f"activation must be a torch.Tensor, got {type(activation).__name__}.")
-    if not isinstance(spec, VQ2MatrixSpec):
-        raise TypeError(f"spec must be a VQ2MatrixSpec, got {type(spec).__name__}.")
-    if activation.ndim != 2:
-        raise ValueError(f"Repacked VQ2A8 activation must be two-dimensional, got shape={tuple(activation.shape)}.")
-    if activation.shape[1] != spec.rht_true_columns:
-        raise ValueError(f"Repacked VQ2A8 activation width is {activation.shape[1]}, expected {spec.rht_true_columns}.")
-    if not isinstance(dynamic_a8, bool):
-        raise ValueError(f"dynamic_a8 must be bool, got {dynamic_a8!r}.")
-    if not bool(torch.isfinite(activation.float()).all()):
-        raise ValueError("Repacked VQ2A8 activation contains non-finite values.")
-
-    codebook_weight = _decode_repacked_vq2a8_codebook_weight(
+    codebook_weight = decode_repacked_vq2a8_codebook_weight(
         tensors,
         spec,
-        activation.device,
         compute_dtype,
+        device=activation.device,
     )
-    padded_activation = activation
-    if spec.rht_true_columns < spec.columns:
-        padded_activation = torch.nn.functional.pad(
-            padded_activation,
-            (0, spec.columns - spec.rht_true_columns),
-        )
-
-    weight_scale = tensors["weight_scale"].to(activation.device)
-    weight_bias = tensors["weight_bias"].to(activation.device)
-    rht_sign = tensors["rht_sign"].to(activation.device)
-    if dynamic_a8:
-        quantized, activation_scale, bias_correction = prepare_repacked_vq2a8_activation_reference(
-            padded_activation,
-            weight_scale,
-            weight_bias,
-            rht_sign,
-            spec.rht_block_size,
-        )
-        output = quantized.to(compute_dtype) @ codebook_weight.transpose(0, 1)
-        output *= activation_scale.to(compute_dtype).unsqueeze(-1)
-        output += bias_correction.to(compute_dtype).unsqueeze(-1)
-        return output
-
-    rotated = _forward_rht_activation(
-        padded_activation.to(compute_dtype),
-        spec.rht_block_size,
-        rht_sign,
+    return vq2a8_predecoded_matmul_reference(
+        activation,
+        codebook_weight,
+        tensors["weight_scale"].to(activation.device),
+        tensors["weight_bias"].to(activation.device),
+        tensors["rht_sign"].to(activation.device),
+        spec,
+        compute_dtype,
+        dynamic_a8,
     )
-    bias_correction = rotated @ weight_bias.to(compute_dtype)
-    transformed = rotated * weight_scale.to(compute_dtype).unsqueeze(0)
-    output = transformed @ codebook_weight.transpose(0, 1)
-    output += bias_correction.unsqueeze(-1)
-    return output
 
 
 def decode_expert_weight_literal(
