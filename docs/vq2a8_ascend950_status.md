@@ -1321,3 +1321,59 @@ fail-closed supervisor regressions. Ruff check/format, Markdown lint and
 `git diff --check` pass. Required `bash format.sh ci` was attempted but
 remains blocked by missing local `pre-commit`. No A5 compilation or
 runtime PASS is claimed for this revision before the user's rerun.
+
+## Phase 4: reduce the gather kernel's UB workset
+
+The user's `50ef51ee` run at `/tmp/vq2a8-phase4-w3qzncdy` passed
+the previously failing memory-scope inference and stopped at
+`PlanMemory (hivm-plan-memory)`. The compiler now reports a definite
+on-chip UB capacity error: 2,170,880 bits (265 KiB) required versus
+1,769,472 bits (216 KiB) available, a 49 KiB excess. This is not a
+device-global-memory allocation failure. The excerpt does not identify
+which lookup shape failed; the driver now prints each shape before its
+first launch as `PHASE4 stage=lookup_start`.
+
+Reduce the source-level workset without changing K reduction geometry:
+
+- Retain one flat FP32 byte-carrier table instead of broadcasting it
+  across output channels. Its maximum logical size is 1,024 FP32 values
+  (4 KiB), down from the old `[32,1024]` (128 KiB). Flatten the indices
+  for a one-dimensional `tl.gather`, then reshape its result for MAC.
+- Process 16 output channels per program, with two programs sharing
+  each original 32-channel codebook group. Index/weight tiles shrink
+  from `[32,512]` to `[16,512]`. Packed pairs, output addresses and the
+  codebook group are derived from the new program index.
+- Keep full aligned 32-byte FP8 table rows, FP8 typed loads followed
+  by byte bitcasts, the FP32 gather source, and 32-byte BF16 output
+  stores. No scalar byte GM lookup, dense expert allocation, split-K
+  reduction, atomics or new launch/compiler flags are introduced.
+
+This follows the general workset/blocking approach in the official
+[UB overflow guide](https://triton-ascend.readthedocs.io/en/latest/debug_guide/ub_overflow.html).
+Neither logical tensor sizes nor CUDA compilation establish the actual
+A5 buffer plan: temporaries and compiler-inserted buffers still count.
+The number of programs doubles and table loads are repeated per half,
+so performance must be measured rather than inferred from smaller UB use.
+The accepted model backend and all phase-4 acceptance criteria remain
+unchanged; no Ascend compilation or performance PASS is claimed yet.
+
+Developer regressions inspect the actual candidate IR for a shared 1-D
+FP32 source, bounded indices, retained `[16,512]` FP32 reductions and no
+pointer reinterpret. The workset assertion fails against the old source.
+Coverage includes 1/3/16/32 column tiles, both halves of single/multiple
+codebook groups, poisoned outputs and canaries, K=4096, row chunking and
+deterministic repeats. These run on the NVIDIA/host developer system,
+not an Ascend simulator. The user's hardware gate remains required.
+
+For the existing installation, pull the Python/Triton update and run
+the same phase-4 command. No C++ rebuild, reinstall, repack, NPU reset
+or cache clearing is needed. A failed child still stops the remaining
+steps and retains its full log and diagnostic excerpt.
+
+All 677 VQ2A8 development tests pass on the existing NVIDIA/host system,
+including 71 phase-4 tests. The full CUDA `--micro-only` driver also
+passes lookup (12 cases) and native micro at
+`/tmp/vq2a8-phase4-f93m63k8`; this is explicitly `DEVICE=cuda:0`, not
+950 acceptance or phase-4 completion. Ruff check/format, Markdown lint
+and `git diff --check` pass. Required `bash format.sh ci` was attempted
+but remains blocked by missing local `pre-commit`.

@@ -365,6 +365,7 @@ def main():
         if args.stage == "lookup":
             for tiles in (1, 3, 16, 32):
                 for rows in (1, 3, 32):
+                    print(f"PHASE4 stage=lookup_start m={rows} n=64 k=512 column_tiles={tiles}", flush=True)
                     inputs = synthetic_inputs(rows, tiles=tiles)
                     dense = synthetic_dense_oracle(*inputs[3:])
                     result, _ = check_projection(

@@ -4,6 +4,7 @@
 import argparse
 import copy
 import json
+import re
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -29,6 +30,7 @@ from tools.validate_vq2a8_tp1_phase4 import (
     short_report,
 )
 from vllm_ascend.quantization.vq2a8_vector_gather import (
+    OUTPUTS_PER_PROGRAM,
     _packed_vector_gather_kernel,
     validate_vector_gather_inputs,
     vq2a8_packed_vector_gather,
@@ -46,24 +48,33 @@ def test_float32_lookup_carrier_preserves_all_fp8_byte_encodings():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer IR check only; not Ascend compilation")
-def test_candidate_gather_ir_uses_float32_source_not_int32():
+@pytest.mark.parametrize("tiles", [1, 3, 16, 32])
+def test_candidate_gather_ir_uses_float32_source_not_int32(tiles):
     # Inspect actual candidate IR, not a separately reimplemented microkernel.
     # The user's Ascend frontend rejects int32 sources; int32 indices are OK.
-    host = synthetic_inputs(1, size_n=32, tiles=3)
+    host = synthetic_inputs(1, size_n=32, tiles=tiles)
+    table_tiles = 1 << (tiles - 1).bit_length()
     inputs = tuple(t.cuda() for t in host)
     output = torch.empty((1, 32), dtype=torch.bfloat16, device="cuda")
-    compiled = _packed_vector_gather_kernel[(1, 1)](
+    compiled = _packed_vector_gather_kernel[(32 // OUTPUTS_PER_PROGRAM, 1)](
         *inputs,
         output,
         N=32,
         K=512,
-        COLUMN_TILES=3,
-        TABLE_TILES=4,
+        COLUMN_TILES=tiles,
+        TABLE_TILES=table_tiles,
+        BLOCK_N=OUTPUTS_PER_PROGRAM,
         num_warps=4,
         enable_fp_fusion=False,
     )
     gathers = [line for line in compiled.asm["ttir"].splitlines() if "tt.gather " in line]
     assert gathers and all("xf32>" in line and "xi32>" in line for line in gathers), gathers
+    # The lookup table must be shared, not broadcast across output rows.
+    # These are source-level workset bounds, NOT an A5 UB allocation proof.
+    assert OUTPUTS_PER_PROGRAM == 16
+    assert all(f"tensor<{table_tiles * 32}xf32>" in line and "tensor<8192xi32>" in line for line in gathers), gathers
+    reductions = re.findall(r'"tt.reduce"\(.*?\}\)\s*:\s*\(tensor<([^>]+)>\)', compiled.asm["ttir"], re.DOTALL)
+    assert reductions and all(shape == "16x512xf32" for shape in reductions), reductions
     # Keep FP8 GM pointers typed, as in the accepted Ascend kernel. Reinterpret
     # the loaded VALUES instead of emitting a pointer conversion for the A5
     # memory-scope pass. CUDA IR coverage does not prove A5 backend support.
@@ -126,7 +137,9 @@ def test_bitwise_evidence_distinguishes_signed_zero_and_dtype():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA only; not NPU acceptance")
-@pytest.mark.parametrize("rows,n,k,tiles", [(1, 32, 512, 1), (3, 64, 512, 3), (10, 96, 1024, 7), (32, 64, 1024, 32)])
+@pytest.mark.parametrize(
+    "rows,n,k,tiles", [(1, 32, 512, 1), (3, 64, 512, 3), (10, 96, 1024, 7), (32, 64, 1024, 32), (3, 96, 4096, 32)]
+)
 def test_gather_device_oracle_batch_invariance_and_determinism(rows, n, k, tiles):
     host = synthetic_inputs(rows, n, k, tiles)
     dense = synthetic_dense_oracle(*host[3:])
@@ -144,6 +157,32 @@ def test_gather_device_oracle_batch_invariance_and_determinism(rows, n, k, tiles
     assert bitwise_equal(actual, vq2a8_packed_vector_gather(*inputs))
     with pytest.raises(ValueError, match="CPU-only"):
         synthetic_dense_oracle(*inputs[3:])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA only; not A5 store validation")
+@pytest.mark.parametrize("n,tiles", [(32, 3), (32, 32), (96, 3), (96, 32)])
+def test_split_output_tiles_cover_both_halves_and_preserve_guards(n, tiles):
+    host = synthetic_inputs(2, size_n=n, size_k=1024, tiles=tiles)
+    inputs = tuple(t.cuda() for t in host)
+    # Guards and every program's 16 BF16 outputs start on a 32-byte boundary.
+    storage = torch.full((2 * n + 32,), -123.0, dtype=torch.bfloat16, device="cuda")
+    output = storage[16:-16].reshape(2, n)
+    output.fill_(float("nan"))
+    assert output.data_ptr() % 32 == 0 and OUTPUTS_PER_PROGRAM * output.element_size() == 32
+    _packed_vector_gather_kernel[(n // OUTPUTS_PER_PROGRAM, 2)](
+        *inputs,
+        output,
+        N=n,
+        K=1024,
+        COLUMN_TILES=tiles,
+        TABLE_TILES=1 << (tiles - 1).bit_length(),
+        BLOCK_N=OUTPUTS_PER_PROGRAM,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    expected = same_fp8_oracle(host[:3], synthetic_dense_oracle(*host[3:]))
+    assert torch.isfinite(output).all() and compare(expected, output)["allclose"]
+    assert torch.all(storage[:16] == -123.0) and torch.all(storage[-16:] == -123.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA only; not A5 Cube/CV acceptance")
@@ -392,9 +431,16 @@ def test_probe_arguments_cannot_be_empty_duplicated_or_paths(value):
         probe_list(value)
 
 
-def test_phase4_heartbeat_recognizes_live_stage(tmp_path):
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("PHASE4 stage=projection probe=3:127 kind=down m=32 case=small\n", "kind=down"),
+        ("PHASE4 stage=lookup_start m=1 n=64 k=512 column_tiles=32\n", "column_tiles=32"),
+    ],
+)
+def test_phase4_heartbeat_recognizes_live_stage(tmp_path, message, expected):
     from tools.vq2a8_live_log import LiveChildLog
 
     logger = LiveChildLog(tmp_path / "test.log", "phase4")
-    logger._record_stage("PHASE4 stage=projection probe=3:127 kind=down m=32 case=small\n")
-    assert "kind=down" in logger._last_stage
+    logger._record_stage(message)
+    assert expected in logger._last_stage
