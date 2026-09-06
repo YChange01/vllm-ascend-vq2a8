@@ -57,7 +57,7 @@ class LiveChildLog:
     def _record_stage(self, text: str):
         lines = (self._pending_line + text).split("\n")
         for line in lines[:-1]:
-            if line.startswith(("MODEL ", "MOE ", "KERNEL ", "CHAIN ", "ROOT_FP8 ")):
+            if line.startswith(("MODEL ", "MOE ", "KERNEL ", "CHAIN ", "ROOT_FP8 ", "PHASE4 ")):
                 self._last_stage = line.strip()[:240]
         self._pending_line = lines[-1][-1024:]
 

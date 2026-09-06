@@ -8,6 +8,14 @@ Expert weights stay packed; activation and codebook storage stay E4M3FN.
 Full-model logits/token quality, peak HBM and throughput are acceptance
 criteria. An HTTP 200 or one passing expert is not full-model acceptance.
 
+**Latest milestone (2026-09-06):** phase 1 has an actual NPU bit-exact
+offline regression PASS. Phase 3 now has actual NPU smoke/root-operator
+PASS (1061 real-root checks), but its FP8-root full-model run is still
+waiting for the machine. At the user's request, phase-4 standalone kernel
+development proceeds during this wait; it is not NPU performance or model
+integration acceptance. Phase 2 stays skipped and phase 5 stays deferred.
+The following sections preserve the earlier milestones as history.
+
 Commit `533a906b8bb67735a3cca0a35a01313c05cfdfbb` passed a user-run hardware
 smoke for layer 0, expert 0, separate gate_up and down projections. Both
 matched the CPU oracle within tolerance and the one repeated result matched
@@ -894,3 +902,135 @@ has sufficient available HBM, the normal command without `--operators-only`
 runs all three steps. No phase-3 completion is claimed before the actual
 root-FP8 offline model passes. Phase 2 remains skipped; phases 4/5 remain
 deferred. The Ascend950 is still not directly accessible from this workspace.
+
+### Phase-3 operator acceptance received; model still queued (2026-09-06)
+
+The user's report `/tmp/vq2a8-phase3-wyjoj_yc` passes smoke and all 1061
+root checks on the Ascend950. The last shown layer-42 `wo_a`, M=32, small
+case has relative L2 error `1.7344302472137305e-5` and exact repeats.
+This supersedes the pending **operator** status above, not the pending
+full-model status: `PHASE3=INCOMPLETE completed=2/3`, `MODEL=NOT_RUN`,
+`ROOT_FP8_OPERATORS_VERIFIED=True`, `ROOT_FP8_EXECUTION_VERIFIED=False`.
+The agent still cannot connect to this NPU. No inference about currently
+available HBM is made from the earlier memory snapshot.
+
+### Phase 4: isolated packed-kernel development while the NPU is queued
+
+The user activated this stage before phase 3's model run became available.
+Its purpose is to reduce the remaining expert-compute cost, not repeat the
+already accepted host-loading optimization. Phase-1 timing showed almost
+unchanged packed-projection totals and approximately 8.9 s warm decode.
+Those measurements motivate optimization; they do not predict a speedup.
+
+The implementation adds an experimental `vq2a8_vector_gather.py` kernel:
+
+- Affine, contiguous-tail loads fetch E4M3 codebook bytes once per output
+  group. Lookup uses `tl.gather` on an on-chip tensor instead of the old
+  nested codebook-entry selection loops. This is not a dynamic one-byte
+  gather from GM. Hardware/compiler acceptance is still required.
+- Packed int32 words, four-bit indices, two-component codebook vectors,
+  arbitrary validated column-tile IDs and FP8 storage are unchanged.
+  Arithmetic remains **Vector FP32 MAC/reduce, not native FP8 dot**.
+  The candidate does not allocate a dense expert weight matrix in GM.
+- M=1 through 32 uses one host kernel launch with separate row programs.
+  Each row retains K=512 reduction geometry and the accepted per-row
+  RHT/dynamic-A8 preparation. It does not batch the quantization arithmetic
+  or assume different reduction trees give identical FP8 encodings.
+- The candidate explicitly bounds column tiles to 32. The largest logical
+  lookup table is 128 KiB of int32, before indices and other temporaries;
+  this is not proof of the A5 compiler's UB allocation. Invalid shape,
+  dtype, stride, device or required base alignment is rejected. Tensor
+  values must come from the existing validated artifact/preparer.
+- The accepted `vq2a8_triton.py`, cache/execution policy, offline adapter
+  and model default backend are unchanged. No repack, environment upgrade,
+  new serving registration or runtime fallback selection is introduced.
+
+`validate_vq2a8_tp1_phase4.py` runs bounded, separate child processes:
+
+1. `lookup`: twelve synthetic configurations cover M=1/3/32 and 1/3/16/32
+   column tiles, signed packed words, every nibble/component, output groups
+   and scrambled tile IDs. Compare with a literal CPU FP64 decode oracle
+   and the existing kernel on identical prepared FP8 inputs.
+2. `native`: a small CANN FP8 matmul capability check with **synthetic**
+   32x512 operands, independent of packed expert decode.
+3. `packed`: by default all seven expert probes at M=1/3/10/32, four input
+   cases, both projections. Check the same-prepared-FP8 CPU FP64 oracle,
+   existing per-row kernel, and complete candidate/accepted SwiGLU chains.
+   Candidate row splitting and at least three repeats must be bit-exact.
+   Existing prepared-input and chain error limits are retained.
+4. `benchmark`: all requested experts and row counts, deterministic case,
+   resident packed tensors. Each backend gets two measurement rounds in
+   reversed order, at least three warmups and ten samples per round.
+   JIT/first-call and activation preparation times are reported separately.
+
+Benchmark JSON separates device-event span and synchronized wall time,
+with min/median/p95. These are not a full-model tokens/s measurement.
+Event spans can include gaps between host-submitted launches; wall times
+also include wrapper allocation/validation, dispatch and synchronization.
+The accepted baseline launches once per row, the candidate once per batch.
+Reports identify the baseline backend: on CUDA it is the portable FP8-dot
+kernel, **not the accepted A5 Vector body**. CUDA speedup cannot be used as
+an Ascend speedup. Allocator peak deltas and input layouts are retained;
+allocator counters do not establish on-chip buffer layout or compiler
+spill behavior. Native expert dot remains false even if a microtest passes.
+
+Optional `--include-cv` adds two isolated synthetic Triton tests, direct
+FP8 dot followed by a Vector byte-sign-transform feeding FP8 dot. They
+target the earlier Cube/CV/MTE failures without decoding real experts.
+They are off by default because those compiler paths have previously
+aborted. A direct or bridge micro PASS is not proof that the fused packed
+kernel works. No generated IR patch, speculative synchronization switch,
+device reset or other-process termination is attempted.
+
+Each child has a default 1800-second timeout. A nonzero exit, abort,
+timeout, missing/partial evidence, wrong backend/device or missing test
+coverage stops remaining steps. Logs stream to the terminal and disk;
+`summary.txt` shows steps and boundary-row timing ratios, while
+`phase4.json` and per-child JSON preserve all row sizes, metrics, source
+hashes, package versions and failure details. Even a complete standalone
+PASS reports `PHASE4_KERNEL_GATES=PASS PHASE4=INCOMPLETE`:
+`performance_verified=False`, `model_integration_verified=False`.
+Passing numerical gates or measuring timings alone does not promote a
+candidate or certify a performance improvement.
+
+Developer evidence in `/tmp/vq2a8-phase4-dev-PoQQMZ` on the NVIDIA L20X
+(torch 2.13/CUDA 12.9, Triton 3.7.1; **not** the user's Ascend wheel):
+
+- All 452 VQ2A8 unit tests pass, including candidate CUDA numerics and
+  repeat/chunk invariance, malformed evidence, coverage, timeout/abort
+  handling, benchmark validation and compact reporting.
+- The four synthetic driver steps pass. Direct/CV micro results establish
+  only the CUDA path; CANN and A5 code generation are not executed here.
+- Real experts `0:0`, `3:127` and `42:255` pass 96 projection records
+  (four row counts, four input cases, both projections) with prepared-input
+  CPU FP64 and accepted-chain comparisons. Development uses existing
+  partial per-layer artifacts; that bypass is forbidden for NPU acceptance.
+- A separate, non-overlapping benchmark session passes eight layer-0
+  projection/row configurations. Ratios compare against the **CUDA**
+  portable baseline and cannot predict NPU speed. The measured candidate
+  allocator increment at M=32/N=4096 is 262144 bytes, the BF16 output size;
+  this does not measure UB/shared memory or establish A5 spill behavior.
+- Ruff format/check, Markdown lint and `git diff --check` pass.
+  Required `bash format.sh ci` was attempted but local `pre-commit`
+  remains absent; full repository CI and NPU tests are not claimed.
+
+When the assigned NPU becomes available, the normal bounded command is:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_phase4.py --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 4
+```
+
+For a weight-free first test use `--micro-only`; only add `--include-cv`
+when specifically testing the experimental compiler path. This does not
+require launching the full model. Only standalone benchmark children
+set `ASCEND_LAUNCH_BLOCKING=0`; correctness children retain the existing
+blocking diagnostics. All remain on physical 4 / logical `npu:0`.
+
+The remaining hardware sequence is: accept the candidate's NPU lowering
+and numerics, review actual steady-state timings/layouts, then integrate
+only an accepted optimization and rerun MoE and full-model regressions
+after phase 3's root-FP8 model acceptance. Phase 4 is not complete until
+those integration/performance gates pass. Phase 2 remains skipped and
+quality is explicitly unverified; phase 5 serving work stays deferred.
