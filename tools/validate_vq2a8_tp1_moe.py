@@ -18,13 +18,22 @@ from tools.validate_vq2a8_tp1_packed_kernel import (
     activation_case,
     environment_report,
 )
+from vllm_ascend.quantization.vq2a8_execution import CachedVQ2TP1MoE, device_cache_budget, packed_cache_plan
 from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
 from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
 from vllm_ascend.quantization.vq2a8_validation import audit_model_storage
 
 
 @torch.inference_mode()
-def run_case(cpu: VQ2TP1MoE, runtime: VQ2TP1MoE, count: int, case: str, warmups: int, repeats: int) -> dict:
+def run_case(
+    cpu: VQ2TP1MoE,
+    runtime: VQ2TP1MoE,
+    count: int,
+    case: str,
+    warmups: int,
+    repeats: int,
+    baseline: VQ2TP1MoE | None = None,
+) -> dict:
     label = f"layer{runtime.layer_index} case={case}:m={count}"
     # Keep the same amplitude as the accepted expert cases; do not weaken
     # the MoE gate by silently shrinking inputs at the integration boundary.
@@ -58,6 +67,12 @@ def run_case(cpu: VQ2TP1MoE, runtime: VQ2TP1MoE, count: int, case: str, warmups:
     actual = runtime.forward(device_hidden, device_tokens)
     _synchronize(runtime.device)
     comparison = _comparison_summary(expected, actual, rtol=0.03, atol=0.05)
+    baseline_comparison = None
+    if baseline is not None:
+        print(f"MOE {label} stage=accepted_m1_policy_comparison", flush=True)
+        baseline_output = baseline.forward(device_hidden, device_tokens)
+        _synchronize(runtime.device)
+        baseline_comparison = _comparison_summary(baseline_output, actual, rtol=0, atol=0)
     print(f"MOE {label} stage=token_chunk_invariance", flush=True)
     singles = torch.cat(
         [runtime.forward(device_hidden[row : row + 1], device_tokens[row : row + 1]) for row in range(count)]
@@ -86,6 +101,8 @@ def run_case(cpu: VQ2TP1MoE, runtime: VQ2TP1MoE, count: int, case: str, warmups:
         "cache": runtime.cache_stats(),
         "cache_expert_limit": runtime.cache_experts,
         "token_chunk_limit": runtime.token_chunk,
+        "execution_policy": "cached" if isinstance(runtime, CachedVQ2TP1MoE) else "baseline",
+        "accepted_policy_comparison": baseline_comparison,
         "device_dense_expert_weight_materialized": False,
         "peak_device_allocated_bytes": backend.max_memory_allocated(),
         "peak_device_reserved_bytes": backend.max_memory_reserved(),
@@ -114,6 +131,7 @@ def main() -> None:
     parser.add_argument("--allow-partial-artifact", action="store_true")
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
+    parser.add_argument("--execution-policy", choices=["baseline", "cached"], default="baseline")
     args = parser.parse_args()
     if args.layer < 0 or args.warmups < 0 or args.repeats < 1 or any(count < 1 for count in args.token_counts):
         parser.error("Invalid layer, token count, warmup or repeat count.")
@@ -143,15 +161,25 @@ def main() -> None:
     if args.audit_model:
         print("MODEL_AUDIT " + json.dumps(audit_model_storage(artifact)), flush=True)
     cpu = VQ2TP1MoE(artifact, args.layer, "cpu", cache_experts=2, token_chunk=2)
-    runtime = VQ2TP1MoE(artifact, args.layer, device, cache_experts=2, token_chunk=2)
+    baseline = None
+    if args.execution_policy == "cached":
+        runtime = CachedVQ2TP1MoE(artifact, args.layer, device, cache_experts=1, token_chunk=2, progress=True)
+        baseline = VQ2TP1MoE(artifact, args.layer, device, cache_experts=2, token_chunk=2)
+        budget = device_cache_budget(device)
+        plan = packed_cache_plan([runtime.layer], budget["budget_bytes"])
+        runtime.cache_experts = plan["layer_limits"][args.layer]
+        print("MODEL_CACHE_PLAN " + json.dumps({**budget, **plan}), flush=True)
+    else:
+        runtime = VQ2TP1MoE(artifact, args.layer, device, cache_experts=2, token_chunk=2)
     for case in args.cases:
         for count in args.token_counts:
-            run_case(cpu, runtime, count, case, args.warmups, args.repeats)
+            run_case(cpu, runtime, count, case, args.warmups, args.repeats, baseline)
     print(
         "VQ2A8_TP1_MOE_GATE=PASS "
         + json.dumps(
             {
                 "layer": args.layer,
+                "execution_policy": args.execution_policy,
                 "cases": args.cases,
                 "token_counts": args.token_counts,
                 "native_fp8_dot": device.type == "cuda",

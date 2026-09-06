@@ -7,6 +7,7 @@ is inherited; MoE allocation, token routing and root loading are explicit.
 """
 
 import json
+import time
 from pathlib import Path
 
 import torch
@@ -82,6 +83,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_logits = []
         self._offline_steps = []
         self._offline_load_report = {}
+        self._offline_memory_fraction = vllm_config.cache_config.gpu_memory_utilization
 
     def set_moe_parameters(self):
         # No FusedMoE allocation, expert extraction, EPLB or TP reduction.
@@ -102,6 +104,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             dict(self.named_parameters()), weights, default_weight_loader
         )
         self._offline_load_report = report
+        self.model.offline_owner.configure_cache(self._offline_memory_fraction)
         self._offline_loaded = True
         print("MODEL_LOAD_RESULT " + json.dumps(report), flush=True)
         return loaded
@@ -127,6 +130,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             f"MODEL stage=forward_start phase={phase} step={len(self._offline_steps)} tokens={input_ids.numel()}",
             flush=True,
         )
+        started = time.perf_counter()
         result = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
         if not bool(torch.isfinite(result).all()):
             raise ValueError("Non-finite final decoder hidden states.")
@@ -134,11 +138,25 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             if len(self._offline_steps) >= 128:
                 raise ValueError("Offline step trace exceeded the bounded gate budget.")
             self._offline_steps.append({"tokens": input_ids.numel(), "positions": positions.cpu().tolist()})
-        print(f"MODEL stage=forward_done phase={phase}", flush=True)
+        elapsed = time.perf_counter() - started
+        print(f"MODEL stage=forward_done phase={phase} elapsed_s={elapsed:.3f}", flush=True)
+        print(
+            "MODEL_FORWARD_TIMING "
+            + json.dumps(
+                {
+                    "phase": phase,
+                    "tokens": input_ids.numel(),
+                    "elapsed_s": elapsed,
+                    "cache": self.model.offline_owner.cache_report(),
+                }
+            ),
+            flush=True,
+        )
         return result
 
     def compute_logits(self, hidden_states):
         print(f"MODEL stage=logits_start rows={hidden_states.shape[0]}", flush=True)
+        started = time.perf_counter()
         logits = super().compute_logits(hidden_states)
         if logits is None or not bool(torch.isfinite(logits).all()):
             raise ValueError("Non-finite or missing model logits.")
@@ -146,7 +164,10 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             if sum(value.shape[0] for value in self._offline_logits) + logits.shape[0] > 128:
                 raise ValueError("Offline logits exceeded the bounded gate budget.")
             self._offline_logits.append(logits.float().cpu())
-        print(f"MODEL stage=logits_done rows={logits.shape[0]} finite=True", flush=True)
+        print(
+            f"MODEL stage=logits_done rows={logits.shape[0]} finite=True elapsed_s={time.perf_counter() - started:.3f}",
+            flush=True,
+        )
         return logits
 
     def offline_evidence(self):

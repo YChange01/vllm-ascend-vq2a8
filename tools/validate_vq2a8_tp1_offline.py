@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import json
 import os
+import time
 from pathlib import Path
 
 
@@ -40,6 +41,11 @@ def main() -> None:
     parser.add_argument("--device", choices=["npu:0"], default="npu:0")
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
+    parser.add_argument("--execution-policy", choices=["baseline", "cached"], default="cached")
+    parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="0: auto budget after root loading.")
+    parser.add_argument(
+        "--cache-reserve-gib", type=float, default=16.0, help="Reserve for KV, workspace and allocator."
+    )
     args = parser.parse_args()
     model_root, artifact_root = args.model.resolve(strict=True), args.artifact.resolve(strict=True)
     output = args.output_dir.resolve()
@@ -49,6 +55,7 @@ def main() -> None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     # Lazy device imports: --help is usable on a host without torch/NPU.
+    startup_start = time.perf_counter()
     print("MODEL stage=import_runtime_start", flush=True)
     import torch
     import torch_npu  # noqa: F401
@@ -103,14 +110,36 @@ def main() -> None:
         prompt.insert(0, bos)
     if not 2 <= len(prompt) <= OFFLINE_CONTEXT_LIMIT - OFFLINE_NEW_TOKENS:
         raise ValueError(f"Prompt does not fit the short execution gate: {len(prompt)} tokens.")
-    options = offline_engine_options(model_root, artifact_root)
+    options = offline_engine_options(
+        model_root,
+        artifact_root,
+        execution_policy=args.execution_policy,
+        cache_budget_gib=args.cache_budget_gib,
+        cache_reserve_gib=args.cache_reserve_gib,
+    )
     missing = set(options) - set(inspect.signature(EngineArgs).parameters)
     if missing or not hasattr(LLM, "collective_rpc"):
         raise RuntimeError(f"Installed vLLM lacks required offline gate APIs/options: {sorted(missing)}.")
     print("MODEL_PLAN " + json.dumps(options), flush=True)
     print("MODEL stage=construct_load_profile_kv_cache", flush=True)
+    engine_start = time.perf_counter()
     llm = LLM(**options)
     print("MODEL stage=engine_ready", flush=True)
+    print(
+        "MODEL_STARTUP_TIMING "
+        + json.dumps(
+            {
+                "startup_s": time.perf_counter() - startup_start,
+                "construct_load_profile_kv_s": time.perf_counter() - engine_start,
+                "execution_policy": args.execution_policy,
+                "expert_device": args.device,
+                "expert_load_path": "cpu_validate_then_device_cache",
+                "root_linear_execution": "bf16_diagnostic_not_original_online_fp8",
+                "native_fp8_dot": False,
+            }
+        ),
+        flush=True,
+    )
     samples = SamplingParams(temperature=0, max_tokens=OFFLINE_NEW_TOKENS, ignore_eos=True, detokenize=False)
     baseline_logits, baseline_tokens = None, None
     for run in range(OFFLINE_RUNS):
@@ -118,7 +147,9 @@ def main() -> None:
         if pid != os.getpid():
             raise RuntimeError("Worker isolation contract failed: worker is outside the supervised process.")
         print(f"MODEL run={run} stage=prefill_decode", flush=True)
+        run_start = time.perf_counter()
         generated = llm.generate([{"prompt_token_ids": prompt}], samples, use_tqdm=False)
+        generation_s = time.perf_counter() - run_start
         print(f"MODEL run={run} stage=collect_validate_evidence", flush=True)
         if len(generated) != 1 or not generated[0].finished or len(generated[0].outputs) != 1:
             raise ValueError("The short offline request did not finish normally.")
@@ -131,6 +162,8 @@ def main() -> None:
         result.update(
             {
                 "run": run,
+                "generation_s": generation_s,
+                "execution_policy": args.execution_policy,
                 "logits_file": str(path),
                 "logits_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                 "prompt_text": prompt_text,

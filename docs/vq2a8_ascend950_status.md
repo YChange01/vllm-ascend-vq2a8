@@ -422,3 +422,105 @@ profile/prefill/decode forwards, decoder/MoE boundaries, logits and evidence
 collection have explicit flushed progress lines in the offline adapter.
 These diagnostics add no extra device-to-host tensor transfers. The compact
 `summary.txt` and full `summary.json` remain available after success/failure.
+
+### Timeout diagnosis and bounded cached execution
+
+The user run at `0e5900b05f65b1f5bd5a80c95f16939660c96dc6`
+(dirty worktree, `/tmp/vq2a8-acceptance-nupgtezj`) completed the 32-token
+profiling forward and finite profiling logits. Its first real 10-token
+prefill reached layer 38 before the **whole child** hit its 3600-second
+timeout. There is no evidence that decode started, or that generation
+logits were non-finite. Incomplete finite/repetition checks now read
+`unknown`; completed profile/prefill/decode counts are reported separately.
+
+The previous policy retains only two packed experts per layer and groups
+two tokens at a time. Normal routing selects six experts per token. LRU
+eviction can cause repeated CPU slice validation and synchronous H2D copies,
+including between profiling and the first prefill. Each projection also
+prepares activation separately for every row. These are source-confirmed
+overheads, not a measured explanation for every second of the NPU timeout.
+
+The new `cached` policy changes residency, not the accepted M=1 math:
+
+- After strict root loading, measure free/allocated/reserved HBM and plan a
+  lazy, packed-only cache across all layers. Reserve 16 GiB by default for
+  KV, temporary allocations and allocator overhead. The plan also respects
+  the engine's 0.9 memory fraction; explicit budgets larger than the safe
+  current budget fail before expert loading. A budget too small for even
+  one expert per layer also fails. No full-model dense expert weights are
+  allocated and no artifact repack is needed.
+- Retain up to 256 experts per layer **only if the budget fits**. Single-
+  expert hash layers consume one slot, not 256. A smaller budget selects a
+  bounded common cap; `MODEL_CACHE_PLAN` shows the actual result. Allocation
+  remains lazy, and profiling caches survive into prefill and decode.
+- Keep the accepted two-token grouping and per-row RHT/dynamic-A8
+  preparation and M=1 kernel calls. Router slot order, duplicate hash
+  routes, shared-expert addition, routed scaling and finite-value checks
+  are preserved. Batch preparation is not enabled by this policy.
+- Time CPU load/validation, completed H2D transfer, activation preparation
+  and completed packed projections separately. These synchronized wall
+  times include Python/launch/validation overhead; they are not device-
+  event kernel benchmarks. File-backed page faults may also occur during
+  H2D. Expert start/load/done progress is streamed live and saved to disk.
+  Compact totals cover completed MoE calls only, including profiling;
+  unfinished calls remain visible in the detailed log.
+
+The byte plan rounds each tensor allocation to 512 bytes but is not a
+fragmentation guarantee. Another process can consume memory after planning.
+Do not shrink the reserve to force a full cache on a busy card. Optional
+`--cache-budget-gib` sets a stricter model cache bound (`0` means automatic);
+`--cache-reserve-gib` changes the reserved headroom. `--execution-policy
+baseline` preserves the old two-expert/two-token policy for comparison.
+The one-hour timeout, eager mode and launch-blocking diagnostics stay in
+place; merely increasing the timeout is not the optimization.
+
+There is also an important dtype distinction: the root checkpoint stores
+attention linears in BF16, but the original NVIDIA `VQ2A8Config` chooses
+online FP8 linear methods (`wo_a`: per-block; other linears: per-tensor).
+The offline Ascend adapter deliberately runs unquantized BF16 root linears.
+That is a diagnostic execution fallback relative to the original online
+FP8 path, not evidence that original attention inference was BF16. Routed
+expert codebooks/activations remain E4M3; the NPU M=1 kernel still uses FP32
+Vector MAC/reduce, with `NATIVE_FP8_DOT=False`. Restoring equivalent online
+FP8 root execution is a separate, hardware-validated milestone.
+
+Batch preparation/chunk=32 was explored locally but withdrawn before
+delivery: real CUDA layer-0 M=32 deterministic inputs exceeded the existing
+CPU-oracle tolerance, and new/old execution did not agree. The old policy
+also exceeded the CPU oracle on that expanded case. Separately, layer-3
+`small:m=10` showed CPU/CUDA router ordering differences in **both** policies.
+These are retained validation limits, not passes or evidence about NPU
+behavior. No comparison threshold was relaxed. The delivered cache policy
+instead requires **exact** agreement with the old same-device policy,
+in addition to the existing CPU-oracle and chunk-invariance checks.
+
+The delivered policy passes 299 CPU/unit tests. On the remote NVIDIA L20X,
+real layer 0 and layer 3 weights passed 12 cases (deterministic/zero inputs,
+M=1/3/10), with exact old-policy agreement and three exact repeats. Layer 3
+retained 56 distinct experts across those checks, with 56 loads, 636 hits
+and zero evictions. These are cache observations, not NPU throughput data.
+Ruff and Markdown lint pass. The repository-wide `format.sh ci` could not
+run because the test environment lacks `pre-commit`.
+
+The Ascend host is not directly accessible from the development workspace.
+Run the new policy first through the independent layer gate. Only then run
+the full model (which still performs its original 32-token profiling pass):
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_acceptance.py \
+  --stage moe --execution-policy cached \
+  --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --physical-npu 4 --layers 0,3 --token-counts 1 3 10 \
+  --cases deterministic zero --warmups 0 --repeats 3 \
+&& python3 tools/validate_vq2a8_tp1_acceptance.py \
+  --stage model --execution-policy cached \
+  --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --physical-npu 4 --timeout 3600
+```
+
+A standalone or full offline PASS still does not certify independent
+full-model logits, original quantization equivalence, generation quality,
+native FP8 Cube compute, or HTTP serving. In particular, no NPU speedup is
+claimed without the new stage timings from the actual Ascend950 run.

@@ -119,6 +119,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_runtime.py",
         "vq2a8_moe.py",
         "vq2a8_offline.py",
+        "vq2a8_execution.py",
     ):
         source = repo / "vllm_ascend/quantization" / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -128,6 +129,7 @@ def environment_report() -> dict[str, Any]:
         "vllm_ascend/ops/linear.py",
         "vllm_ascend/patch/worker/vq2a8_offline_model.py",
         "tools/validate_vq2a8_tp1_offline.py",
+        "tools/validate_vq2a8_tp1_moe.py",
         "tools/validate_vq2a8_tp1_acceptance.py",
         "tools/vq2a8_live_log.py",
     ):

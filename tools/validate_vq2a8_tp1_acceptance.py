@@ -41,6 +41,10 @@ _RESULT_PREFIXES = (
     "MODEL_LOAD_RESULT ",
     "MODEL_RESULT ",
     "MODEL_REPEAT_FAILURE ",
+    "MODEL_CACHE_PLAN ",
+    "MODEL_MOE_TIMING ",
+    "MODEL_FORWARD_TIMING ",
+    "MODEL_STARTUP_TIMING ",
     "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS ",
     "VQ2A8_TP1_MOE_GATE=PASS ",
     "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS ",
@@ -93,7 +97,7 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                 f"PROBE={result.get('probe', '?')} {'PASS' if result.get('passed') is True else 'FAIL'} "
                 f"runs={len(runs)} layers={latest.get('layers_executed', '?')} "
                 f"prefill={latest.get('prefill_tokens', '?')} decode={latest.get('decode_steps', '?')} "
-                f"finite={latest.get('finite_logits', False)} repeat_exact={gate.get('repeat_exact', False)}"
+                f"finite={latest.get('finite_logits', 'unknown')} repeat_exact={gate.get('repeat_exact', 'unknown')}"
             )
             if runs:
                 lines.append("TOKENS=" + ",".join(map(str, latest["generated_token_ids"])))
@@ -107,6 +111,46 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                     f"stage={result.get('last_stage', '?')}"
                 )
                 lines.extend("  " + e[:240] for e in result.get("error_excerpt", [])[:2])
+            run_records = result.get("records", [])
+            startups = [r["data"] for r in run_records if r["type"] == "MODEL_STARTUP_TIMING"]
+            if startups:
+                startup = startups[-1]
+                lines.append(
+                    f"STARTUP_S={startup['startup_s']:.3f} "
+                    f"ENGINE_INIT_PROFILE_KV_S={startup['construct_load_profile_kv_s']:.3f} "
+                    f"POLICY={startup['execution_policy']}"
+                )
+            for phase in ("profile", "prefill", "decode"):
+                if not any(r["type"] == "MODEL_FORWARD_TIMING" for r in run_records):
+                    # Legacy summaries have no timing records. Absence of
+                    # instrumentation cannot establish zero executed steps.
+                    break
+                completed = [
+                    r["data"]
+                    for r in run_records
+                    if r["type"] == "MODEL_FORWARD_TIMING" and r["data"].get("phase") == phase
+                ]
+                seconds = sum(r["elapsed_s"] for r in completed)
+                lines.append(f"FORWARD={phase} completed={len(completed)} total_s={seconds:.3f}")
+            timings = [r["data"] for r in run_records if r["type"] == "MODEL_MOE_TIMING"]
+            if timings:
+                fields = ("host_load_validate_s", "h2d_s", "prepare_s", "packed_projection_s")
+                lines.append(
+                    "MOE_COMPLETED_TOTAL " + " ".join(f"{key}={sum(t[key] for t in timings):.3f}" for key in fields)
+                )
+                lines.append(
+                    "CACHE_COMPLETED_TOTAL "
+                    + " ".join(
+                        f"{key}={sum(t[key] for t in timings)}" for key in ("cache_loads", "cache_hits", "evictions")
+                    )
+                )
+            plans = [r["data"] for r in run_records if r["type"] == "MODEL_CACHE_PLAN"]
+            if plans:
+                plan = plans[-1]
+                lines.append(
+                    f"CACHE_PLAN_GIB={plan['planned_bytes'] / 1024**3:.3f} "
+                    f"ALL_EXPERTS_FIT={plan['all_experts_fit']} CAP={plan['per_layer_cache_limit']}"
+                )
             continue
         comparisons, prepared, kernels, chains, moe_cases = [], [], [], set(), set()
         for record in result.get("records", []):
@@ -133,6 +177,13 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                 k.get("token_chunk_comparison", {}).get("allclose") is True for k in kernels
             )
             extra = f"router={'PASS' if route_ok else '?'} chunks={'PASS' if chunk_ok else '?'} "
+            if any(k.get("execution_policy") == "cached" for k in kernels):
+                exact = all(
+                    (k.get("accepted_policy_comparison") or {}).get("allclose") is True
+                    and (k.get("accepted_policy_comparison") or {}).get("max_abs_error") == 0
+                    for k in kernels
+                )
+                extra += f"baseline_exact={'PASS' if exact else 'UNKNOWN_OR_FAIL'} "
         else:
             extra = f"same_fp8_abs={max_metric(prepared, 'max_abs_error')} "
         lines.append(
@@ -245,6 +296,14 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, help="New directory; existing paths are refused.")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument(
+        "--execution-policy",
+        choices=["baseline", "cached"],
+        default=None,
+        help="MoE/model only; defaults to baseline for MoE, cached for model.",
+    )
+    parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="Model packed cache: 0 = auto.")
+    parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
+    parser.add_argument(
         "--allow-partial-artifact", action="store_true", help="Developer checks only; never serving readiness."
     )
     args = parser.parse_args()
@@ -254,6 +313,16 @@ def main() -> int:
         return 0
     if args.model is None:
         parser.error("--model is required unless --summarize is used.")
+    if args.stage == "expert" and args.execution_policy is not None:
+        parser.error("--execution-policy applies to --stage moe/model only.")
+    if (
+        not math.isfinite(args.cache_budget_gib)
+        or args.cache_budget_gib < 0
+        or not math.isfinite(args.cache_reserve_gib)
+        or args.cache_reserve_gib < 1
+    ):
+        parser.error("Cache budget must be finite and >= 0; reserve must be finite and >= 1 GiB.")
+    args.execution_policy = args.execution_policy or ("cached" if args.stage == "model" else "baseline")
     if args.cases is None:
         args.cases = ["deterministic", "zero"] if args.stage == "moe" else ["deterministic", "zero", "impulse", "small"]
     if args.timeout is None:
@@ -352,6 +421,8 @@ def main() -> int:
                 str(args.warmups),
                 "--repeats",
                 str(args.repeats),
+                "--execution-policy",
+                args.execution_policy,
             ]
         elif args.stage == "model":
             command = [
@@ -365,6 +436,12 @@ def main() -> int:
                 args.device,
                 "--output-dir",
                 str(output / "model-evidence"),
+                "--execution-policy",
+                args.execution_policy,
+                "--cache-budget-gib",
+                str(args.cache_budget_gib),
+                "--cache-reserve-gib",
+                str(args.cache_reserve_gib),
             ]
         if index == 0:
             command.append("--audit-model")

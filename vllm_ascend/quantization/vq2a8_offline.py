@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import json
+import math
 import re
 from pathlib import Path
 
 import torch
 from safetensors import safe_open
 
+from vllm_ascend.quantization.vq2a8_execution import CachedVQ2TP1MoE, device_cache_budget, packed_cache_plan
 from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
 from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
 
@@ -18,7 +21,9 @@ OFFLINE_NEW_TOKENS = 4
 OFFLINE_RUNS = 2
 
 
-def offline_engine_options(model_root: Path, artifact: Path) -> dict:
+def offline_engine_options(
+    model_root: Path, artifact: Path, *, execution_policy="cached", cache_budget_gib=0.0, cache_reserve_gib=16.0
+) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     return {
         "model": str(model_root),
@@ -39,7 +44,7 @@ def offline_engine_options(model_root: Path, artifact: Path) -> dict:
         "max_model_len": OFFLINE_CONTEXT_LIMIT,
         "max_num_batched_tokens": OFFLINE_CONTEXT_LIMIT,
         "block_size": 128,
-        "gpu_memory_utilization": 0.35,
+        "gpu_memory_utilization": 0.9 if execution_policy == "cached" else 0.35,
         "kv_cache_memory_bytes": 1024**3,
         "seed": 0,
         "disable_log_stats": True,
@@ -47,7 +52,15 @@ def offline_engine_options(model_root: Path, artifact: Path) -> dict:
             "enable_flashcomm1": False,
             "mix_placement": False,
             "multistream_dsv4_dsa_overlap": False,
-            "vq2a8_offline": {"enabled": True, "artifact": str(artifact), "cache_experts": 2, "token_chunk": 2},
+            "vq2a8_offline": {
+                "enabled": True,
+                "artifact": str(artifact),
+                "execution_policy": execution_policy,
+                "cache_experts": 256 if execution_policy == "cached" else 2,
+                "token_chunk": 2,
+                "cache_budget_gib": cache_budget_gib,
+                "cache_reserve_gib": cache_reserve_gib,
+            },
         },
     }
 
@@ -57,7 +70,15 @@ def validate_offline_config(config) -> dict:
     options = (config.additional_config or {}).get("vq2a8_offline")
     if not isinstance(options, dict) or options.get("enabled") is not True:
         raise ValueError("This architecture requires explicit additional_config.vq2a8_offline.enabled=true.")
-    allowed = {"enabled", "artifact", "cache_experts", "token_chunk"}
+    allowed = {
+        "enabled",
+        "artifact",
+        "cache_experts",
+        "token_chunk",
+        "execution_policy",
+        "cache_budget_gib",
+        "cache_reserve_gib",
+    }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
         raise ValueError("Invalid vq2a8_offline options/artifact path.")
     parallel, model = config.parallel_config, config.model_config
@@ -100,10 +121,16 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Generic offload/sleep cannot manage standalone packed-cache ownership.")
     if config.load_config.load_format != "safetensors":
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
-    for key, default in (("cache_experts", 2), ("token_chunk", 2)):
+    if options.get("execution_policy", "baseline") not in ("baseline", "cached"):
+        raise ValueError("execution_policy must be baseline or cached.")
+    for key, default, upper in (("cache_experts", 2, 256), ("token_chunk", 2, 8)):
         value = options.get(key, default)
-        if type(value) is not int or not 1 <= value <= 8:
-            raise ValueError(f"{key} must be an integer in [1,8].")
+        if type(value) is not int or not 1 <= value <= upper:
+            raise ValueError(f"{key} must be an integer in [1,{upper}].")
+    for key, default, minimum in (("cache_budget_gib", 0.0, 0), ("cache_reserve_gib", 16.0, 1)):
+        value = options.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
+            raise ValueError(f"{key} must be finite and >= {minimum}.")
     return options
 
 
@@ -143,7 +170,7 @@ def audit_offline_root(model_root: Path) -> dict:
 
 
 class OfflineMoEOwner:
-    """One artifact index per model; per-layer caches are small and explicit."""
+    """One artifact index per model; lazy per-layer caches share a byte budget."""
 
     def __init__(self, model_root: Path, options: dict, device: torch.device):
         self.artifact = open_vq2a8_tp1_artifact(
@@ -157,6 +184,7 @@ class OfflineMoEOwner:
         self.device = device
         self.layers: dict[int, VQ2TP1MoE] = {}
         self.calls: dict[int, int] = {}
+        self.cache_plan = None
 
     def create_layer(self, index: int) -> VQ2TP1MoE:
         if index in self.layers:
@@ -165,17 +193,41 @@ class OfflineMoEOwner:
         # vLLM constructs under a default NPU device. Keep CPU validation
         # factories on CPU; the tested runtime moves its roots explicitly.
         with torch.device("cpu"):
-            layer = VQ2TP1MoE(
+            runtime_class = CachedVQ2TP1MoE if self.options.get("execution_policy") == "cached" else VQ2TP1MoE
+            layer = runtime_class(
                 self.artifact,
                 index,
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
+                **({"progress": True} if runtime_class is CachedVQ2TP1MoE else {}),
             )
         self.layers[index] = layer
         self.calls[index] = 0
         print(f"MODEL layer={index} stage=moe_root_load_done", flush=True)
         return layer
+
+    def configure_cache(self, memory_fraction: float) -> None:
+        """Call after strict root load, before profiling populates any cache."""
+        if self.options.get("execution_policy") != "cached":
+            return
+        if any(layer.cache_stats()["resident_experts"] for layer in self.layers.values()):
+            raise ValueError("Configure the packed cache before the first expert call.")
+        budget = device_cache_budget(
+            self.device,
+            reserve_gib=self.options.get("cache_reserve_gib", 16.0),
+            budget_gib=self.options.get("cache_budget_gib", 0.0),
+            memory_fraction=memory_fraction,
+        )
+        plan = packed_cache_plan(
+            [layer.layer for layer in self.layers.values()],
+            budget["budget_bytes"],
+            expert_limit=self.options.get("cache_experts", 256),
+        )
+        for index, layer in self.layers.items():
+            layer.cache_experts = plan["layer_limits"][index]
+        self.cache_plan = {**budget, **plan}
+        print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
 
     def delegated_names(self) -> set[str]:
         return {f"layers.{index}.ffn.{name}" for index, layer in self.layers.items() for name in layer.root}
@@ -239,8 +291,12 @@ class OfflineMoEOwner:
         return {
             "resident_packed_bytes": sum(item["resident_bytes"] for item in stats),
             "resident_experts": sum(item["resident_experts"] for item in stats),
-            "per_layer_cache_limit": self.options.get("cache_experts", 2),
+            "per_layer_cache_limit": max((layer.cache_experts for layer in self.layers.values()), default=0),
             "layer_calls": dict(self.calls),
+            "loads": sum(item["loads"] for item in stats),
+            "hits": sum(item["hits"] for item in stats),
+            "evictions": sum(item.get("evictions", 0) for item in stats),
+            "plan": self.cache_plan,
         }
 
 
@@ -261,6 +317,9 @@ def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list
         raise ValueError("Strict full-model loading was not evidenced.")
     if evidence["cache"]["resident_experts"] > layers * evidence["cache"]["per_layer_cache_limit"]:
         raise ValueError("Packed expert cache exceeded its declared bound.")
+    plan = evidence["cache"].get("plan")
+    if plan and evidence["cache"]["resident_packed_bytes"] > plan["planned_bytes"]:
+        raise ValueError("Packed expert cache exceeded its planned byte budget.")
     logits = evidence["logits"]
     if logits.shape != (len(generated), vocab) or not bool(torch.isfinite(logits).all()):
         raise ValueError("Invalid shape or non-finite generation logits.")

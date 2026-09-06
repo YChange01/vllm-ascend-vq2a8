@@ -32,7 +32,7 @@ def config():
         quant_config=None,
         scheduler_config=NS(max_num_seqs=1, max_num_batched_tokens=32),
         compilation_config=NS(mode=0, cudagraph_mode=0),
-        cache_config=NS(),
+        cache_config=NS(gpu_memory_utilization=0.9),
         load_config=NS(load_format="safetensors"),
     )
 
