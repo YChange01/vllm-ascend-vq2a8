@@ -124,9 +124,12 @@ def environment_report() -> dict[str, Any]:
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
     for name in (
         "vllm_ascend/models/deepseek_v4.py",
+        "vllm_ascend/attention/dsa_v1.py",
+        "vllm_ascend/ops/linear.py",
         "vllm_ascend/patch/worker/vq2a8_offline_model.py",
         "tools/validate_vq2a8_tp1_offline.py",
         "tools/validate_vq2a8_tp1_acceptance.py",
+        "tools/vq2a8_live_log.py",
     ):
         source_hashes[name] = hashlib.sha256((repo / name).read_bytes()).hexdigest()
     return {

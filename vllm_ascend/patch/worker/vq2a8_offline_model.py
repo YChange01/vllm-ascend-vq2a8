@@ -29,8 +29,10 @@ class OfflineMoEAdapter(nn.Module):
     def forward(self, hidden_states, input_ids=None):
         if input_ids is None:
             raise ValueError("Offline MoE must receive actual input_ids, including hash layers.")
+        print(f"MODEL layer={self.layer_index} stage=moe_start tokens={input_ids.numel()}", flush=True)
         result = self.runtime.forward(hidden_states, input_ids)
         self.owner.calls[self.layer_index] += 1
+        print(f"MODEL layer={self.layer_index} stage=moe_done", flush=True)
         return result
 
 
@@ -38,6 +40,12 @@ class OfflineDecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, topk_indices_buffer, owner):
         self._offline_owner = owner
         super().__init__(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer)
+
+    def forward(self, *args, **kwargs):
+        print(f"MODEL layer={self.layer_idx} stage=decoder_start", flush=True)
+        result = super().forward(*args, **kwargs)
+        print(f"MODEL layer={self.layer_idx} stage=decoder_done", flush=True)
+        return result
 
     def _build_mlp(self, vllm_config, config, prefix, is_draft_layer):
         if is_draft_layer:
@@ -114,6 +122,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             )
         if self._offline_trace and not get_forward_context().attn_metadata:
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
+        phase = ("prefill" if not self._offline_steps else "decode") if self._offline_trace else "profile"
+        print(
+            f"MODEL stage=forward_start phase={phase} step={len(self._offline_steps)} tokens={input_ids.numel()}",
+            flush=True,
+        )
         result = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
         if not bool(torch.isfinite(result).all()):
             raise ValueError("Non-finite final decoder hidden states.")
@@ -121,9 +134,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             if len(self._offline_steps) >= 128:
                 raise ValueError("Offline step trace exceeded the bounded gate budget.")
             self._offline_steps.append({"tokens": input_ids.numel(), "positions": positions.cpu().tolist()})
+        print(f"MODEL stage=forward_done phase={phase}", flush=True)
         return result
 
     def compute_logits(self, hidden_states):
+        print(f"MODEL stage=logits_start rows={hidden_states.shape[0]}", flush=True)
         logits = super().compute_logits(hidden_states)
         if logits is None or not bool(torch.isfinite(logits).all()):
             raise ValueError("Non-finite or missing model logits.")
@@ -131,6 +146,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             if sum(value.shape[0] for value in self._offline_logits) + logits.shape[0] > 128:
                 raise ValueError("Offline logits exceeded the bounded gate budget.")
             self._offline_logits.append(logits.float().cpu())
+        print(f"MODEL stage=logits_done rows={logits.shape[0]} finite=True", flush=True)
         return logits
 
     def offline_evidence(self):

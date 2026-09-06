@@ -4,7 +4,7 @@
 """Run bounded TP1 checks and retain a report even if a device child aborts.
 
 This supervisor imports no torch/NPU modules. Each expert probe runs in its
-own child process, with full output on disk and a small summary on stdout.
+own child process, with full output both live on stdout and saved on disk.
 Only --stage model starts an offline vLLM instance. No stage starts an HTTP
 server or exercises an experimental Cube implementation.
 """
@@ -20,6 +20,11 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any
+
+try:
+    from tools.vq2a8_live_log import LiveChildLog
+except ModuleNotFoundError:  # Direct script invocation without repo PYTHONPATH.
+    from vq2a8_live_log import LiveChildLog
 
 _RESULT_PREFIXES = (
     "ENVIRONMENT ",
@@ -367,21 +372,24 @@ def main() -> int:
                 command.append("--verify-tensor-hashes")
         if args.allow_partial_artifact:
             command.append("--allow-partial-artifact")
-        print(f"PROBE_START={probe} LOG={log}", flush=True)
+        print(f"PROBE_START={probe} progress={index + 1}/{len(probes)} LOG={log}", flush=True)
         timed_out = False
         returncode = None
         try:
-            with log.open("w", encoding="utf-8") as stream:
-                completed = subprocess.run(
-                    command,
-                    cwd=repo,
-                    env=child_env,
-                    stdout=stream,
-                    stderr=subprocess.STDOUT,
-                    timeout=args.timeout,
-                    check=False,
-                )
-                returncode = completed.returncode
+            with log.open("w", encoding="utf-8") as stream, LiveChildLog(log, probe):
+                try:
+                    completed = subprocess.run(
+                        command,
+                        cwd=repo,
+                        env=child_env,
+                        stdout=stream,
+                        stderr=subprocess.STDOUT,
+                        timeout=args.timeout,
+                        check=False,
+                    )
+                    returncode = completed.returncode
+                finally:
+                    stream.flush()
         except subprocess.TimeoutExpired:
             timed_out = True
         except OSError as error:

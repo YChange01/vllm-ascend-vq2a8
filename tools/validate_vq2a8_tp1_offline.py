@@ -49,6 +49,7 @@ def main() -> None:
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
 
     # Lazy device imports: --help is usable on a host without torch/NPU.
+    print("MODEL stage=import_runtime_start", flush=True)
     import torch
     import torch_npu  # noqa: F401
     from safetensors.torch import save_file
@@ -69,6 +70,7 @@ def main() -> None:
     from vllm_ascend.quantization.vq2a8_validation import audit_model_storage
 
     print("ENVIRONMENT " + json.dumps(environment_report()), flush=True)
+    print("MODEL stage=device_init_start", flush=True)
     print("DEVICE " + json.dumps(_initialize_device(torch.device(args.device))), flush=True)
     print("MODEL stage=artifact_and_root_audit", flush=True)
     artifact = open_vq2a8_tp1_artifact(
@@ -108,6 +110,7 @@ def main() -> None:
     print("MODEL_PLAN " + json.dumps(options), flush=True)
     print("MODEL stage=construct_load_profile_kv_cache", flush=True)
     llm = LLM(**options)
+    print("MODEL stage=engine_ready", flush=True)
     samples = SamplingParams(temperature=0, max_tokens=OFFLINE_NEW_TOKENS, ignore_eos=True, detokenize=False)
     baseline_logits, baseline_tokens = None, None
     for run in range(OFFLINE_RUNS):
@@ -116,6 +119,7 @@ def main() -> None:
             raise RuntimeError("Worker isolation contract failed: worker is outside the supervised process.")
         print(f"MODEL run={run} stage=prefill_decode", flush=True)
         generated = llm.generate([{"prompt_token_ids": prompt}], samples, use_tqdm=False)
+        print(f"MODEL run={run} stage=collect_validate_evidence", flush=True)
         if len(generated) != 1 or not generated[0].finished or len(generated[0].outputs) != 1:
             raise ValueError("The short offline request did not finish normally.")
         tokens = list(generated[0].outputs[0].token_ids)

@@ -161,6 +161,7 @@ class OfflineMoEOwner:
     def create_layer(self, index: int) -> VQ2TP1MoE:
         if index in self.layers:
             raise ValueError(f"Duplicate offline MoE layer {index}.")
+        print(f"MODEL layer={index} stage=moe_root_load_start", flush=True)
         # vLLM constructs under a default NPU device. Keep CPU validation
         # factories on CPU; the tested runtime moves its roots explicitly.
         with torch.device("cpu"):
@@ -173,6 +174,7 @@ class OfflineMoEOwner:
             )
         self.layers[index] = layer
         self.calls[index] = 0
+        print(f"MODEL layer={index} stage=moe_root_load_done", flush=True)
         return layer
 
     def delegated_names(self) -> set[str]:
@@ -182,10 +184,13 @@ class OfflineMoEOwner:
         expected_delegated = self.delegated_names()
         seen, loaded, delegated, skipped = set(), set(), set(), set()
         widened = []
+        print(f"MODEL stage=root_weight_load_start expected_non_mtp={len(self.inventory)}", flush=True)
         for name, value in weights:
             if name in seen:
                 raise ValueError(f"Duplicate streamed checkpoint tensor {name}.")
             seen.add(name)
+            if len(seen) == 1 or len(seen) % 64 == 0:
+                print(f"MODEL stage=root_weight_load tensors_seen={len(seen)} current={name}", flush=True)
             if name.startswith("mtp."):
                 skipped.add(name)
                 continue
@@ -220,6 +225,7 @@ class OfflineMoEOwner:
                 f"delegated={sorted(expected_delegated - delegated)}, "
                 f"source={sorted(set(self.inventory) - (seen - skipped))}."
             )
+        print(f"MODEL stage=root_weight_load_done registered={len(loaded)} delegated={len(delegated)}", flush=True)
         return loaded, {
             "registered_parameters_loaded": len(loaded),
             "moe_root_tensors_loaded": len(delegated),

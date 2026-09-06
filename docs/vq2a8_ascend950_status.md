@@ -385,5 +385,40 @@ keeps `NATIVE_FP8_DOT=False`, `LOGITS_REFERENCE_VERIFIED=False`,
 `QUALITY_VERIFIED=False` and `SERVING_VERIFIED=False`. It does not cover a
 128-token compressor boundary, long contexts, multiple requests, all expert
 routes or comparison with independent full-model logits. Those are later
-gates. No NPU full-model execution has yet been performed by this workflow;
-the disconnected Ascend host must return this new hardware result.
+gates. Full-model acceptance is not yet established; the disconnected Ascend
+host must return each new hardware result.
+
+### First offline attempt and live diagnostics
+
+The user reported a failed offline run at
+`0fed520deb72af81bf9a9ad0da54a16f25f48953` with a dirty worktree, report
+`/tmp/vq2a8-acceptance-wbcyzo2w`. It reached `run=0 stage=prefill_decode`
+and failed with `AscendColumnParallelLinear` missing `weight_scale`.
+The summary alone does not provide the full source traceback. Source review
+found an unconditional A5 FP8 output-projection branch which accesses that
+attribute even when `wo_a` is unquantized. Attention profiling without real
+metadata normally skips this output projection, so successful construction
+and profiling cannot validate this branch.
+
+The A5 output projection now distinguishes the actual unquantized linear
+method from the existing quantized path. The BF16 root loader retains
+`[G * R, K]`; views of that weight are used for grouped `torch.bmm` followed
+by `wo_b`. No placeholder scales, root conversion, artifact repack or
+accepted expert/MoE kernel changes are made. The existing FP8 path retains
+its required MX scales. CPU regression tests execute the real projection
+method with operator stand-ins, covering M=1/M=3, BF16/FP16, wrong layout,
+FP8 dispatch and the non-A5 path. They do not validate CANN execution.
+The updated VQ2A8 CPU/unit suite passes 263 tests, including live output
+before child exit, merged stderr, Unicode/large-output draining, heartbeat,
+timeout/failed-exit retention and the final-flush shutdown race.
+
+All acceptance stages now mirror complete child stdout/stderr live to the
+terminal and retain it in `probe-*.log`. Redirection remains file-backed,
+so a closed terminal pipe does not block the child's disk logging. After
+15 seconds without output, a terminal-only `PROBE_WAIT` line reports elapsed
+time and the last observed stage; it is not evidence of completed work.
+Runtime imports, per-layer root loads, root tensor counts, engine readiness,
+profile/prefill/decode forwards, decoder/MoE boundaries, logits and evidence
+collection have explicit flushed progress lines in the offline adapter.
+These diagnostics add no extra device-to-host tensor transfers. The compact
+`summary.txt` and full `summary.json` remain available after success/failure.
