@@ -76,8 +76,12 @@ bool VllmQuantLightningIndexerMetadataCpuKernel::CheckSingleParam()
     auto metaShape = metaData_->GetTensorShape();
     KERNEL_CHECK_NULLPTR(metaShape, false, "shape of metadata is null");
     KERNEL_CHECK_NULLPTR(metaData_->GetData(), false, "data of metadata is null");
-    // 核心数校验
-    if (aicCoreNum_ == 0 || aivCoreNum_ == 0 || (aivCoreNum_ % aicCoreNum_ != 0)) {
+    // The consumer maps Vector block i to Cube metadata i / 2. Available
+    // core counts need not be divisible (e.g. Ascend950 reports 28/64).
+    // Require enough Vector partners, and bound both fixed metadata arrays.
+    constexpr uint32_t VECTOR_CORES_PER_CUBE = 2;
+    if (aicCoreNum_ == 0 || aicCoreNum_ > AIC_CORE_NUM || aivCoreNum_ > AIV_CORE_NUM ||
+        aivCoreNum_ < VECTOR_CORES_PER_CUBE * aicCoreNum_) {
         KERNEL_LOG_ERROR("Core num invalid: aic:%u, aiv:%u", aicCoreNum_, aivCoreNum_);
         return false;
     }
@@ -863,6 +867,11 @@ bool VllmQuantLightningIndexerMetadataCpuKernel::BalanceSchedule(SplitResult &sp
 bool VllmQuantLightningIndexerMetadataCpuKernel::GenMetaData(SplitResult &splitRes)
 {
     optiling::detail::QliMetaData* metaDataPtr = (optiling::detail::QliMetaData*)metaData_->GetData();
+    // The torch binding allocates an uninitialized buffer. Extra Vector
+    // blocks can consult LI slots beyond aicCoreNum_; leave all unused slots
+    // disabled, including cores absent from this runtime's available counts.
+    // Only initialize the defined ABI struct, not the reserved output tail.
+    *metaDataPtr = {};
     // LI Metadata Generate
     for (size_t i = 0; i < aicCoreNum_; ++i) {
         if (i >= splitRes.usedCoreNum) {

@@ -68,6 +68,7 @@ def main() -> None:
     from vllm import LLM, SamplingParams
     from vllm.engine.arg_utils import EngineArgs
 
+    from tools.validate_vq2a8_qli_metadata import run_preflight
     from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device, environment_report
     from tools.vq2a8_baseline import compare_baseline_run, load_baseline
     from vllm_ascend.quantization.vq2a8_offline import (
@@ -121,6 +122,8 @@ def main() -> None:
         prompt.insert(0, bos)
     if not 2 <= len(prompt) <= OFFLINE_CONTEXT_LIMIT - OFFLINE_NEW_TOKENS:
         raise ValueError(f"Prompt does not fit the short execution gate: {len(prompt)} tokens.")
+    print("MODEL stage=qli_metadata_preflight", flush=True)
+    run_preflight(torch.device(args.device), config, prompt_tokens=len(prompt))
     options = offline_engine_options(
         model_root,
         artifact_root,

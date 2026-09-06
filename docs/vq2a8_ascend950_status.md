@@ -1034,3 +1034,70 @@ only an accepted optimization and rerun MoE and full-model regressions
 after phase 3's root-FP8 model acceptance. Phase 4 is not complete until
 those integration/performance gates pass. Phase 2 remains skipped and
 quality is explicitly unverified; phase 5 serving work stays deferred.
+
+## Phase 3 model: QLI AICPU available-core mismatch
+
+The user's `/tmp/vq2a8-phase3-f4rt5hh5` run at `0aca98cf` completed
+the 43-layer profile, but failed before the first real prefill forward.
+Device logs identify the cause of 507018/22007 precisely:
+`CheckSingleParam: Core num invalid: aic:28, aiv:64`.
+The custom library and `RunCpuKernel` entry point both loaded successfully.
+This is a parameter rejection, not the earlier Cube MTE alignment error,
+FP8 rounding regression or an established timeout.
+
+The host API passes `GetCubeCoreNum()` and `GetVectorCoreNum()` into the
+AICPU scheduler. These runtime values need not match the earlier device
+property snapshot of 32/64; why this process obtained 28 is not established.
+Do not overwrite the runtime count with 32 or reset the device.
+
+The QLI consumer maps Vector block `i` to LI slot `i / 2`. Scheduling 28
+Cube slots with 64 available Vector cores has enough partners. Replace
+the unnecessary divisibility check with nonzero Cube count, fixed ABI
+capacity limits (36 Cube / 72 Vector), and at least two Vector cores per
+scheduled Cube core. Initialize the entire defined metadata struct so
+unused slots, including 28..31 in this case, are disabled rather than
+uninitialized. The reserved 160-word output tail remains untouched.
+Neither attention mathematics nor any FP8/VQ2 weight format changes.
+
+`tools/validate_vq2a8_qli_metadata.py` runs a weight-free prefill/decode
+metadata probe, checks defined ABI fields and three exact repetitions,
+and records extension/package paths and hashes. A PASS establishes only
+the tested metadata calls, not attention numerics or full-model execution.
+The offline gate now also runs this preflight before constructing the LLM,
+so a broken AICPU package does not first spend minutes on model profiling.
+
+This fix changes compiled AICPU code: **git pull alone is insufficient**.
+Rebuild in the user's existing CANN 9.1.0 environment, without replacing
+torch, torch-npu, Triton or vLLM:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+export ASCEND_TOOLKIT_HOME="$ASCEND_HOME_PATH"
+export SOC_VERSION=ascend950pr_958b
+export COMPILE_CUSTOM_KERNELS=1 MAX_JOBS=16
+set -o pipefail
+python3 -m pip install -v -e . --no-build-isolation --no-deps --force-reinstall 2>&1 | tee /tmp/vq2a8-qli-rebuild.log
+build_status=${PIPESTATUS[0]}
+echo "BUILD_EXIT=$build_status"
+if [ "$build_status" -eq 0 ]; then
+  python3 tools/validate_vq2a8_qli_metadata.py --physical-npu 4 2>&1 | tee /tmp/vq2a8-qli-preflight.log
+  probe_status=${PIPESTATUS[0]}
+  echo "QLI_EXIT=$probe_status"
+fi
+```
+
+Only after `QLI_METADATA_PREFLIGHT=PASS` and `QLI_EXIT=0`, rerun the
+existing phase-3 command. Its smoke/root/model requirements remain intact.
+The 950 cannot be accessed from the developer workspace; the fix still
+requires the user's rebuilt-package preflight and full-model acceptance.
+Host tests compile the actual AICPU scheduler with a minimal CANN context
+shim and undefined-behavior sanitization. They cover 28/64 and ordinary
+core counts, short/zero-compressed/multi-core sequences, invalid counts,
+complete nonoverlapping schedules, canaries and disabled-slot initialization.
+Developer validation: all 499 VQ2A8 tests pass on the existing NVIDIA/host
+test environment, including 36 actual C++ scheduler cases. Ruff check/format,
+Markdown lint and `git diff --check` pass. `bash format.sh ci` was attempted
+but is blocked by the local missing `pre-commit`; no CANN build or 950
+hardware PASS is claimed by these development results.
