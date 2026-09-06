@@ -93,3 +93,21 @@ def test_validate_tp1_m1_requires_native_e4m3_inputs() -> None:
 
     with pytest.raises(ValueError, match="activation must use torch.float8_e4m3fn"):
         validate_vq2a8_tp1_m1_inputs(*values)
+
+
+@pytest.mark.parametrize("index", [0, 3, 4, 5])
+def test_contiguous_view_with_unaligned_address_is_rejected(index: int) -> None:
+    values = list(_inputs())
+    original = values[index]
+    storage = torch.zeros(original.numel() + 1, dtype=original.dtype)
+    values[index] = storage[1:].reshape(original.shape)
+    assert values[index].is_contiguous()
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        validate_vq2a8_tp1_m1_inputs(*values)
+
+
+def test_tile_count_must_fit_uint8_ids() -> None:
+    values = list(_inputs())
+    values[4] = torch.zeros((257, 2, 16, 2), dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="1 to 256"):
+        validate_vq2a8_tp1_m1_inputs(*values)

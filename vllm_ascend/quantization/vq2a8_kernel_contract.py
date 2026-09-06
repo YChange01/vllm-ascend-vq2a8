@@ -15,9 +15,10 @@ VQ2_INDEX_BITS = 4
 VQ2_ROW_GROUP_SIZE = 32
 VQ2_BLOCK_M = 32
 VQ2_BLOCK_N = 32
-# A5 FP8 Cube kernels use a 32x32 output tile.  E4M3 K=512 is a 512-byte
-# activation transfer and leaves every packed-word block 256-byte aligned.
+# The portable Cube path uses BLOCK_M; the Ascend Vector path uses only N/K.
+# K=512 gives a 512-byte activation transfer and 256-byte packed-word runs.
 VQ2_BLOCK_K = 512
+VQ2_GM_ALIGNMENT = 32
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,7 @@ def _require_tensor(
     dtype: torch.dtype,
     ndim: int,
     device: torch.device,
+    alignment: int = 1,
 ) -> None:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
@@ -48,6 +50,10 @@ def _require_tensor(
         raise ValueError(f"{name} must be on {device}, got {tensor.device}.")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous.")
+    # A contiguous view can still start at an unaligned storage offset.
+    # This is a host-side pointer check; it does not synchronize the device.
+    if tensor.data_ptr() % alignment:
+        raise ValueError(f"{name} data pointer must be {alignment}-byte aligned; contiguous() alone is insufficient.")
 
 
 def validate_vq2a8_tp1_m1_inputs(
@@ -68,6 +74,7 @@ def validate_vq2a8_tp1_m1_inputs(
         dtype=torch.float8_e4m3fn,
         ndim=2,
         device=device,
+        alignment=VQ2_GM_ALIGNMENT,
     )
     _require_tensor(
         activation_scale,
@@ -89,6 +96,7 @@ def validate_vq2a8_tp1_m1_inputs(
         dtype=torch.int32,
         ndim=2,
         device=device,
+        alignment=VQ2_GM_ALIGNMENT,
     )
     _require_tensor(
         codebooks,
@@ -96,6 +104,7 @@ def validate_vq2a8_tp1_m1_inputs(
         dtype=torch.float8_e4m3fn,
         ndim=4,
         device=device,
+        alignment=VQ2_GM_ALIGNMENT,
     )
     _require_tensor(
         codebook_tile_ids,
@@ -103,6 +112,7 @@ def validate_vq2a8_tp1_m1_inputs(
         dtype=torch.uint8,
         ndim=1,
         device=device,
+        alignment=VQ2_GM_ALIGNMENT,
     )
 
     if tuple(activation.shape[:1]) != (1,):
@@ -123,8 +133,8 @@ def validate_vq2a8_tp1_m1_inputs(
 
     column_tiles, row_tiles, code_count, vector_length = codebooks.shape
     expected_row_tiles = size_n // VQ2_ROW_GROUP_SIZE
-    if column_tiles <= 0:
-        raise ValueError("codebooks must contain at least one column tile.")
+    if not 1 <= column_tiles <= 256:
+        raise ValueError("codebooks must contain 1 to 256 column tiles addressable by uint8 tile IDs.")
     if row_tiles != expected_row_tiles:
         raise ValueError(
             f"codebooks row tile count must be N/{VQ2_ROW_GROUP_SIZE}={expected_row_tiles}, got {row_tiles}."

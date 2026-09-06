@@ -47,7 +47,10 @@ def deepseek_v4_swiglu_reference(
     if gate_up.ndim < 1 or gate_up.shape[-1] <= 0 or gate_up.shape[-1] % 2:
         raise ValueError(f"gate_up last dimension must be positive and even, got shape={tuple(gate_up.shape)}.")
     if swiglu_limit is not None and (
-        isinstance(swiglu_limit, bool) or not isinstance(swiglu_limit, int | float) or swiglu_limit < 0
+        isinstance(swiglu_limit, bool)
+        or not isinstance(swiglu_limit, int | float)
+        or not math.isfinite(swiglu_limit)
+        or swiglu_limit < 0
     ):
         raise ValueError(f"swiglu_limit must be non-negative or None, got {swiglu_limit!r}.")
     gate, up = gate_up.chunk(2, dim=-1)

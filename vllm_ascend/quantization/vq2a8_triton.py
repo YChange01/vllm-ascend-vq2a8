@@ -8,8 +8,10 @@ expert weight.
 
 The portable accelerator path feeds decoded E4M3 tiles to ``tl.dot``.  The
 Ascend 950 correctness path instead converts each decoded tile to FP32 and
-uses Vector multiply/reduction.  CANN 9.1's plain E4M3 ``tl.dot`` lowering
-currently aborts at runtime in the generated Vector-to-Cube/fixpipe bridge.
+uses Vector multiply/reduction.  The mixed E4M3 ``tl.dot`` implementation
+aborted with an MTE alignment error on the tested CANN 9.1 / Triton-Ascend
+3.2.2 development build. The precise offending instruction is not yet known;
+the Vector/Cube transfer path is a hypothesis, not a proven compiler defect.
 Keeping the Ascend baseline on AIV establishes packed-artifact correctness
 without relying on that compiler path; a supported Cube implementation is a
 separate performance milestone.
@@ -216,10 +218,9 @@ if ascend_language is not None:
                     selected = (source_tiles[None, :] == source_tile) & (codes == code)
                     weights = tl.where(selected, codebook_value[:, None], weights)
 
-            # CANN 9.1 can lower E4M3 -> FP32 on Vector, while its ordinary
-            # E4M3 tl.dot path creates an invalid Vector-to-Cube/fixpipe
-            # address on Ascend 950. Keep this correctness baseline entirely
-            # on AIV and accumulate one [N] partial per K tile.
+            # This Vector path passed the Ascend 950 layer-0 hardware smoke.
+            # Keep it stable while investigating the mixed kernel's MTE
+            # alignment failure independently. Accumulate one [N] partial.
             weights_e4m3 = weights.to(tl.float8e4nv, bitcast=True)
             partial = tl.sum(
                 weights_e4m3.to(tl.float32) * activation_vector[None, :].to(tl.float32),

@@ -253,7 +253,12 @@ class VQ2PayloadSummary:
 
 @dataclass(frozen=True)
 class VQ2ModelLayout:
-    """Expected expert layout read from a model ``config.json``."""
+    """Storage layout for the pinned reference export, not general MoE topology.
+
+    This export stores only expert 0 in the hash layers. A serving loader
+    must additionally check the checkpoint's tid2eid tables: num_hash_layers
+    alone does not imply that a layer has just one logical routed expert.
+    """
 
     num_hidden_layers: int
     num_hash_layers: int
