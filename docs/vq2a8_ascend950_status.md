@@ -937,7 +937,7 @@ The implementation adds an experimental `vq2a8_vector_gather.py` kernel:
   RHT/dynamic-A8 preparation. It does not batch the quantization arithmetic
   or assume different reduction trees give identical FP8 encodings.
 - The candidate explicitly bounds column tiles to 32. The largest logical
-  lookup table is 128 KiB of int32, before indices and other temporaries;
+  lookup table is 128 KiB of FP32 byte values, before indices and other temporaries;
   this is not proof of the A5 compiler's UB allocation. Invalid shape,
   dtype, stride, device or required base alignment is rejected. Tensor
   values must come from the existing validated artifact/preparer.
@@ -1219,3 +1219,56 @@ on the host without claiming to simulate CANN tiling.
 After the Python fix, all 661 VQ2A8 tests pass in the existing NVIDIA/host
 environment. Ruff, Markdown lint and `git diff --check` pass; the required
 `bash format.sh ci` remains blocked by missing local `pre-commit`.
+
+## Phase 3 accepted on the user's 950; phase 4 gather dtype correction
+
+The user reports `PHASE3=PASS` at `57e48c73`, with evidence retained at
+`/tmp/vq2a8-phase3-ej7e_5co`. All 43 layers executed for two runs of the
+10-token prompt plus three decode steps. Tokens/logits repeat exactly,
+root FP8 execution and native root matmul are verified by that gate, and
+native expert dot remains false. Peak allocated/reserved memory was
+20.453/20.500 GiB. This is operator plus short offline-execution acceptance,
+not independent-reference, quality, performance or serving acceptance.
+The generated IDs `223,20,201,671` differ from the historical BF16-root
+baseline; preserve the new run's logits, source hashes and dirty-worktree
+details as an FP8 regression baseline, not an independent numerical oracle.
+
+The subsequent standalone phase-4 run, `/tmp/vq2a8-phase4-d8jody16`,
+stopped at `lookup` before NPU execution. Its installed Triton-Ascend
+frontend rejects the candidate's `tl.gather` **source** dtype `int32`.
+The local version's diagnostic explicitly lists `fp32` as supported;
+the index remains `int32`. Public
+[gather documentation](https://triton-ascend.readthedocs.io/en/latest/python-api/generated/triton.language.gather.html)
+also distinguishes the source tensor from its index tensor. Do not infer
+A5 build compatibility from a different release or the CUDA backend.
+
+Use on-chip FP32 values to carry the loaded unsigned bytes (0 through
+255), gather them, convert back to uint8, then bitcast to E4M3. All byte
+values are exactly representable, so this changes neither FP8 encodings
+nor quantization arithmetic. The packed index words and lookup indices
+remain integers. GM codebooks remain E4M3; there is no dense FP32 expert
+allocation. The logical maximum table remains 128 KiB, but actual A5 UB
+allocation/lowering and performance still require the hardware gate.
+
+The phase-4 summary now says `PHASE3_MODEL=NOT_EVALUATED_BY_THIS_RUN`:
+this standalone driver does not read phase-3 evidence and must not label
+an already accepted model as still awaiting acceptance. It also must not
+claim phase-3 PASS without evidence. The separate accepted phase-3 report
+remains authoritative, and the default model backend is unchanged.
+
+This patch is Python/Triton source only. Pull it and rerun the phase-4
+driver; no C++ rebuild, reinstall, repack or cache deletion is needed.
+The driver still stops on any failed child and does not enable the
+experimental Cube/CV tests by default. Use one-line shell commands when
+copying to avoid introducing Markdown fences into Bash continuations.
+
+Regression checks cover all 256 byte encodings, including signed zeros
+and NaN bit patterns as transport-only cases (NaN artifacts stay invalid).
+A CUDA development test inspects the actual candidate's generated
+`tt.gather` IR for FP32 source and int32 indices and checks its output
+against the CPU oracle. It fails against the old int32-source candidate
+and passes after the fix. This is not an Ascend compiler or device test.
+All 663 VQ2A8 development tests pass on the existing NVIDIA/host system,
+including candidate numerical, batch/chunk and repeat checks. Ruff,
+Markdown lint and `git diff --check` pass. Required `bash format.sh ci`
+was attempted but remains blocked by missing local `pre-commit`.

@@ -16,7 +16,7 @@ from vllm.triton_utils import tl, triton
 
 from vllm_ascend.quantization.vq2a8_kernel_contract import validate_vq2a8_tp1_m1_inputs
 
-# Bound the on-chip lookup tile: [32, 32 * 32] int32 = 128 KiB, plus
+# Bound the on-chip lookup tile: [32, 32 * 32] float32 = 128 KiB, plus
 # indices/decoded tile/temporaries. This is not a compiler UB allocation proof.
 MAX_COLUMN_TILES = 32
 MAX_BATCH_ROWS = 32
@@ -62,8 +62,9 @@ def _packed_vector_gather_kernel(
     columns = tl.arange(0, 512)
     table_tiles = tl.arange(0, TABLE_TILES)
     table_entries = tl.arange(0, 32)
-    # Affine [tiles,32] E4M3 GM transfer. The byte-to-int32 conversion is
-    # on chip, not a resident FP32/BF16 replacement for FP8 codebooks.
+    # Affine [tiles,32] byte GM transfer. Ascend gather rejects int32 sources.
+    # FP32 exactly represents every byte value (0..255); this is an on-chip
+    # byte carrier, NOT FP8 dequantization or a resident FP32 codebook.
     table = tl.load(
         CODEBOOK.to(tl.pointer_type(tl.uint8))
         + table_tiles[:, None] * (N // 32 * 32)
@@ -71,7 +72,7 @@ def _packed_vector_gather_kernel(
         + table_entries[None, :],
         mask=table_tiles[:, None] < COLUMN_TILES,
         other=0,
-    ).to(tl.int32)
+    ).to(tl.float32)
     table = tl.reshape(table, (TABLE_TILES * 32,))
     table = tl.broadcast_to(table[None, :], (32, TABLE_TILES * 32))
     accumulator = tl.zeros((32,), tl.float32)
@@ -82,6 +83,7 @@ def _packed_vector_gather_kernel(
         codes = tl.reshape(tl.broadcast_to(codes[:, None, :], (16, 2, 512)), (32, 512))
         tile = tl.load(TILE_IDS + start + columns).to(tl.int32)
         lookup = tile[None, :] * 32 + codes * 2 + outputs[:, None] % 2
+        # Restore the selected byte before interpreting its E4M3 bits.
         weights = tl.gather(table, lookup, axis=1).to(tl.uint8).to(tl.float8e4nv, bitcast=True)
         x = tl.load(X + row * K + start + columns)
         accumulator += tl.sum(weights.to(tl.float32) * x[None, :].to(tl.float32), axis=1)

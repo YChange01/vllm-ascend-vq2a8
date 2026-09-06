@@ -123,7 +123,7 @@ def short_report(report):
         "PERFORMANCE_VERIFIED=False (standalone timings require hardware/profile review)",
         "DEFAULT_MODEL_BACKEND=UNCHANGED MODEL_INTEGRATION_VERIFIED=False",
         "NATIVE_FP8_EXPERT_DOT=False QUALITY_VERIFIED=False SERVING_VERIFIED=False",
-        "PHASE2=SKIPPED PHASE3_MODEL=AWAITING_SEPARATE_ACCEPTANCE PHASE5=DEFERRED",
+        "PHASE2=SKIPPED PHASE3_MODEL=NOT_EVALUATED_BY_THIS_RUN PHASE5=DEFERRED",
     ]
     return "\n".join(lines) + "\n"
 

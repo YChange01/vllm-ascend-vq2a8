@@ -22,9 +22,43 @@ from tools.validate_vq2a8_phase4_kernel import (
 )
 from tools.validate_vq2a8_tp1_phase4 import evidence_passed, probe_list, short_report
 from vllm_ascend.quantization.vq2a8_vector_gather import (
+    _packed_vector_gather_kernel,
     validate_vector_gather_inputs,
     vq2a8_packed_vector_gather,
 )
+
+
+def test_float32_lookup_carrier_preserves_all_fp8_byte_encodings():
+    # These are byte VALUES, not dequantized FP8 weights. Include both zero
+    # signs and NaN encodings to test transport; NaN artifacts remain invalid.
+    payload = torch.arange(256).to(torch.uint8)
+    order = (torch.arange(512) * 73 + 19) % 256
+    transported = torch.gather(payload.float(), 0, order).to(torch.uint8)
+    restored = transported.view(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(restored, payload[order])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer IR check only; not Ascend compilation")
+def test_candidate_gather_ir_uses_float32_source_not_int32():
+    # Inspect actual candidate IR, not a separately reimplemented microkernel.
+    # The user's Ascend frontend rejects int32 sources; int32 indices are OK.
+    host = synthetic_inputs(1, size_n=32, tiles=3)
+    inputs = tuple(t.cuda() for t in host)
+    output = torch.empty((1, 32), dtype=torch.bfloat16, device="cuda")
+    compiled = _packed_vector_gather_kernel[(1, 1)](
+        *inputs,
+        output,
+        N=32,
+        K=512,
+        COLUMN_TILES=3,
+        TABLE_TILES=4,
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    gathers = [line for line in compiled.asm["ttir"].splitlines() if "tt.gather " in line]
+    assert gathers and all("xf32>" in line and "xi32>" in line for line in gathers), gathers
+    expected = same_fp8_oracle(host[:3], synthetic_dense_oracle(*host[3:]))
+    assert compare(expected, output)["allclose"]
 
 
 @pytest.mark.parametrize("rows", [1, 3, 10, 32])
@@ -159,6 +193,8 @@ def test_short_report_keeps_boundary_rows_and_full_evidence_unchanged():
     assert "m=1:event=2.500x,wall=3.000x" in text and "m=32:event=" in text
     assert "m=3:" not in text and "m=10:" not in text
     assert report == before and "PHASE4=INCOMPLETE" in text
+    assert "PHASE3_MODEL=NOT_EVALUATED_BY_THIS_RUN" in text
+    assert "AWAITING_SEPARATE_ACCEPTANCE" not in text
 
 
 def _evidence(stage="lookup", device="npu:0", probe="0:0", rows=None, cases=None):
