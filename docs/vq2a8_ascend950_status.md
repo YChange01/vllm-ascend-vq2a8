@@ -8,12 +8,15 @@ Expert weights stay packed; activation and codebook storage stay E4M3FN.
 Full-model logits/token quality, peak HBM and throughput are acceptance
 criteria. An HTTP 200 or one passing expert is not full-model acceptance.
 
-**Latest milestone (2026-09-06):** phase 1 has an actual NPU bit-exact
-offline regression PASS. Phase 3 now has actual NPU smoke/root-operator
-PASS (1061 real-root checks), but its FP8-root full-model run is still
-waiting for the machine. At the user's request, phase-4 standalone kernel
-development proceeds during this wait; it is not NPU performance or model
-integration acceptance. Phase 2 stays skipped and phase 5 stays deferred.
+**Latest milestone (2026-09-07):** phase 1 has an actual NPU bit-exact
+offline regression PASS. The user also reported phase-3 operator and
+FP8-root offline-model PASS at `57e48c73`, with 43 layers and two identical
+runs (`/tmp/vq2a8-phase3-ej7e_5co`). Native FP8 root matmul is verified;
+native FP8 expert dot, independent full-model reference and quality are not.
+At the user's request, the phase-4 Vector optimization branch is paused;
+development now targets the standalone VQ-decode + native FP8 Cube fused
+prototype described at the end of this document. It does not change the
+accepted model backend. Phase 2 stays skipped and phase 5 stays deferred.
 The following sections preserve the earlier milestones as history.
 
 Commit `533a906b8bb67735a3cca0a35a01313c05cfdfbb` passed a user-run hardware
@@ -1377,3 +1380,145 @@ passes lookup (12 cases) and native micro at
 950 acceptance or phase-4 completion. Ruff check/format, Markdown lint
 and `git diff --check` pass. Required `bash format.sh ci` was attempted
 but remains blocked by missing local `pre-commit`.
+
+## Phase 4 redirected: VQ decode + native FP8 Cube prototype
+
+The user explicitly selected this direction after the Vector-gather UB
+failure. Do not spend the next hardware run on the old 16-step Vector
+benchmark sequence. Keep its implementation and evidence as history and
+comparison material, not as the native FP8 expert deliverable.
+
+`vllm_ascend/quantization/vq2a8_fused_fp8.py` now contains a separate,
+opt-in fused projection kernel. Its actual data path is:
+
+```text
+GM: packed int32 indices + typed E4M3 codebook + tile IDs
+  -> unpack VQ codes -> shared flat byte-carrier gather
+  -> E4M3 weight tile [32,128]
+  -> FP8 dot with prepared E4M3 activation -> FP32 accumulator
+  -> per-row activation scale + bias correction -> BF16 output
+```
+
+This is actual VQ decode feeding the dot, not the sign-flip CV microtest
+renamed as a fused expert. It uses the frozen `vq2a8_direct_tp1_v1` layout;
+the wrapper allocates only output, not a dense expert or a decode scratch
+tensor. A8/RHT preparation, gate/up ordering, SwiGLU and the down-projection
+boundary remain unchanged. This first prototype fuses **one projection's
+decode and matmul**, not all expert preparation/activation/routing in one
+launch. It is not registered in the MoE executor or serving path.
+
+The Ascend tile is M=32, N=32, K=128, masking logical M=1/3/10/32 rows.
+Packed-word row transfers are 64 bytes, FP8 K transfers 128 bytes,
+codebook rows 32 bytes and output rows 64 bytes. The shared FP32 byte
+carrier is at most 4 KiB and the decoded FP8 weight tile is 4 KiB.
+These source sizes are **not** the final UB allocation: intermediate
+lifetimes, compiler buffers and spills still need A5 codegen review.
+The K=128 FP32 accumulation is checked numerically, not declared bit-exact
+to the accepted K=512 Vector reduction. There is no FP32 Vector MAC
+fallback in this prototype.
+
+Ascend uses `tl.dot_scaled` with E4M3 operands and no microscale tensors;
+the existing row scale/bias is applied once after accumulation. The
+[official dot_scaled reference](https://triton-ascend.readthedocs.io/en/latest/python-api/generated/triton.language.dot_scaled.html)
+lists Ascend 950 FP8 support and a K multiple-of-64 restriction. That
+documentation does not certify this CV pipeline on the user's installed
+Triton-Ascend development build. Unsupported lowering must fail visibly.
+
+### Isolated bring-up and evidence
+
+Run the new supervisor, not `validate_vq2a8_tp1_phase4.py`:
+
+```bash
+python3 -u tools/validate_vq2a8_fused_fp8.py --physical-npu 4
+```
+
+It runs fresh child processes in this order and stops at the first failure:
+
+1. `direct`: aligned FP8 dot, with the same internal K=128 tiling.
+2. `bridge`: loaded FP8 weight bytes transformed on the Vector side before
+   dot. This is only a CV diagnostic, not VQ fusion acceptance.
+3. `fused`: real VQ unpack/lookup feeding dot; five shapes, four input cases,
+   CPU same-FP8 oracle, accepted projection comparison, exact row chunking
+   and three exact repeats. Warm timings are diagnostic, not a speedup gate.
+4. Optional `expert`, selected by `--model`: one real gate_up/SwiGLU/down
+   chain (default `--probe 0:0`), four row counts and four input cases.
+   Both same-prepared-FP8 and independently prepared accepted chains are
+   checked. Real dense reference weights stay on CPU only.
+
+To include that real-expert step in the same isolated sequence:
+
+```bash
+python3 -u tools/validate_vq2a8_fused_fp8.py \
+    --physical-npu 4 \
+    --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256
+```
+
+No C++ rebuild, reinstall, repack or Triton-cache deletion is needed for
+these Python/Triton additions. The supervisor retains each child's log,
+incremental JSON, source hashes, successful compiler IR/binary outputs and
+compiler metadata under `FUSED_REPORT_DIR`. It does not retry, reset the
+NPU, relax tolerances or switch to the accepted backend after failure.
+The parent imports no accelerator runtime. Partial artifacts are rejected
+on NPU; the explicit partial-artifact option is CUDA-development-only.
+
+`FUSED_PROTOTYPE=PASS` means the requested isolated stages executed and
+passed their checks. `native_instruction_verified` and
+`on_chip_decode_verified` stay false pending Ascend compiler/binary and
+memory-plan review. A source-level dot or even a successful launch alone
+does not establish absence of FP16 fallback or GM spills. Full phase-4
+completion additionally requires real-expert coverage, reviewed native
+FP8/CV evidence, NPU timing/peak-memory assessment and opt-in model
+integration/regression. Phase 5 is still deferred.
+
+### Development checks versus Ascend acceptance
+
+On the SM90 CUDA development host, M=32 source-level FP8 `tl.dot` was
+observed to lower to FP16 MMA. This was caught by inspecting the actual
+candidate PTX, not by a numerical test. The CUDA-only internal M tile is
+therefore 64; Ascend remains 32. Unit tests and the CUDA probe now require
+native E4M3 MMA in generated PTX and reject silent FP16 lowering. CUDA
+codegen evidence is explicitly separate from Ascend instruction review.
+The CUDA dot also bounds reduced-precision WGMMA partial accumulation to
+32 elements before FP32 addition; the original unlimited partial sum
+failed the same-prepared real-weight oracle. This CUDA-only setting does
+not change the Ascend dot API or relax any numerical gate.
+
+The test suite covers metadata/alignment rejection, CPU-only dense oracles,
+different rows and table counts, multiple N groups and K blocks, finite
+FP8 extremes/subnormals, zero/impulse/small cases, poisoned outputs and
+canaries, row chunking, repeats, generated IR/PTX and fail-closed subprocess
+evidence handling. Default model/Vector implementations remain unchanged.
+
+Development result: **734 VQ2A8 tests passed**, including 57 new prototype
+tests, on the NVIDIA/host development system. This is not an NPU test run.
+The final synthetic-only supervisor passes all three stages at
+`/tmp/vq2a8-fused-fp8-hifwkyd_`: 4 direct controls, 4 CV controls and 20
+fused projection cases, with native E4M3 WGMMA found in CUDA PTX.
+Ruff check/format, Markdown lint and `git diff --check` pass. Required
+`bash format.sh ci` was attempted but is blocked by missing `pre-commit`.
+The real expert `0:0`, M=32 deterministic chain has an explicit **FAIL** at
+`/tmp/vq2a8-fused-fp8-hd9eiq2w`; its gates were not loosened:
+
+- Gate/up same-FP8 oracle: PASS, maximum absolute error 0.03125,
+  relative L2 error about 0.0006692; row chunks and repeats are exact.
+- Down on the candidate's prepared input: PASS, maximum absolute error
+  0.03125, relative L2 error about 0.0007150; exact chunks and repeats.
+- Independently prepared accepted-versus-candidate full chain: FAIL,
+  7,414/131,072 elements outside `rtol=0.03, atol=0.05`, maximum absolute
+  error 0.125, relative L2 about 0.024994. Aggregate L2 alone is not PASS.
+
+The diagnostic replay `expert-diagnostic2.json` preserves the passing
+projection evidence plus `passed=false, failure_stage=chain_baseline` for
+the failing down chain. Its preparation comparison has 2,226 differing
+activation bytes, maximum scale difference about 1.31e-6 and maximum bias
+difference about 0.01401. Inputs, prepared A8/scales/biases and outputs are
+retained in the adjacent `*-chain-failure.safetensors` (about 898 KiB).
+This localizes a downstream preparation difference; it does not by itself
+prove the complete numerical cause or predict the Ascend result. Do not
+promote this prototype into the model while that chain gate is failing.
+
+Next hardware action is the **synthetic-only** supervisor command above:
+establish Ascend direct/CV/VQ-dot execution and inspect its generated
+memory plan and FP8 instructions. Real-chain numerical convergence,
+broader expert coverage and opt-in model integration remain required work,
+not postponed checks that may be marked PASS. Phase 2 stays skipped.
