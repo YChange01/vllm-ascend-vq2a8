@@ -333,7 +333,7 @@ def test_rounding_probe_requires_exact_inputs_scales_and_fp32_before_weight_gate
         labels.append(label)
 
     rounding_probe(compare, torch.device("cpu"))
-    assert len(labels) == 38
+    assert len(labels) == 39 and labels[0] == "rounding:fma_conformance:bytes"
     assert "rounding:small:g6:bytes" in labels and "rounding:zero:inverse_rope_fp32" in labels
 
 
@@ -361,3 +361,127 @@ def test_explicit_device_inverse_rope_rounding_regression():
         assert torch.equal(expected.float().cpu(), actual.float().cpu()), label
 
     rounding_probe(compare, torch.device("cuda"))
+
+
+def _exact_fma_bits(a, b, c):
+    """Independent test oracle: arbitrary-width exact integers, no sticky bits.
+
+    Align at the SMALLEST exponent, retain every bit, then round once. The
+    accelerator uses bounded int64 and right-shift-jam instead. NaN payloads
+    are not compared, but finite values, infinities and signed zeros are.
+    """
+    ap, bp, cp = (bits & 0x7FFFFFFF for bits in (a, b, c))
+    ps, cs = ((a ^ b) >> 31) & 1, c >> 31
+    pi = ap == 0x7F800000 or bp == 0x7F800000
+    pz = ap == 0 or bp == 0
+    if max(ap, bp, cp) > 0x7F800000 or (pi and (pz or (cp == 0x7F800000 and ps != cs))):
+        return 0x7FC00000
+    if cp == 0x7F800000:
+        return c
+    if pi:
+        return (ps << 31) | 0x7F800000
+
+    def parts(bits):
+        field = (bits >> 23) & 255
+        m = (bits & 0x7FFFFF) | (0x800000 if field else 0)
+        return (-m if bits >> 31 else m), (field - 150 if field else -149)
+
+    (am, ae), (bm, be), (cm, ce) = (parts(bits) for bits in (a, b, c))
+    exponent = min(ae + be, ce)
+    total = ((am * bm) << (ae + be - exponent)) + (cm << (ce - exponent))
+    if total == 0:
+        return (ps & cs) << 31
+    sign, total = int(total < 0) << 31, abs(total)
+    shift = max(total.bit_length() - 24, -149 - exponent)
+    if shift > 0:
+        retained, remainder = divmod(total, 1 << shift)
+        half = 1 << (shift - 1)
+        retained += int(remainder > half or (remainder == half and retained & 1))
+    else:
+        retained = total << -shift
+    quantum = exponent + shift
+    if retained >= 0x1000000:
+        retained >>= 1
+        quantum += 1
+    field = 0 if retained < 0x800000 else quantum + 150
+    if field >= 255:
+        return sign | 0x7F800000
+    return sign | (field << 23) | (retained & 0x7FFFFF)
+
+
+def test_exact_fma_oracle_known_ties_underflow_overflow_and_signed_zero():
+    from tools.validate_vq2a8_root_fp8 import fma_conformance_words
+
+    for a, b, c, expected in fma_conformance_words():
+        assert _exact_fma_bits(a, b, c) == expected
+    assert _exact_fma_bits(0x7F800000, 0, 0) == 0x7FC00000
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA check, not NPU acceptance")
+def test_integer_device_fma_against_exact_oracle_edges_and_random_bits():
+    from itertools import product
+
+    from vllm_ascend.quantization.vq2a8_root_fp8_triton import root_fma_fp32
+
+    edges = [0, 1, 3, 0x007FFFFF, 0x00800000, 0x33800000, 0x3F000000, 0x3F800000, 0x3F800001, 0x7F7FFFFF]
+    edges += [bits | 0x80000000 for bits in edges] + [0x7F800000, 0xFF800000, 0x7FC00000]
+    triples = list(product(edges, repeat=3))
+    generator = torch.Generator().manual_seed(314)
+    triples.extend(torch.randint(0, 2**32, (8192, 3), generator=generator, dtype=torch.int64).tolist())
+    raw = torch.tensor(triples, dtype=torch.int64).to(torch.int32)
+    a, b, c = (raw[:, i].contiguous().view(torch.float32).cuda() for i in range(3))
+    actual = root_fma_fp32(a, b, c).cpu().view(torch.int32)
+    expected = torch.tensor([_exact_fma_bits(*triple) for triple in triples], dtype=torch.int64).to(torch.int32)
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA check, not NPU acceptance")
+@pytest.mark.parametrize("cancellation", [False, True])
+def test_integer_device_fma_random_bits_against_hardware(cancellation):
+    from vllm_ascend.quantization.vq2a8_root_fp8_triton import root_fma_fp32
+
+    generator = torch.Generator().manual_seed(43)
+    raw = torch.randint(0, 2**32, (262144, 3), generator=generator, dtype=torch.int64).to(torch.int32)
+    a, b, c = (raw[:, i].contiguous().view(torch.float32).cuda() for i in range(3))
+    if cancellation:
+        c = -(a * b)
+    actual = root_fma_fp32(a, b, c)
+    expected = torch.addcmul(c, a, b)
+    equal = (actual.view(torch.int32) == expected.view(torch.int32)) | (actual.isnan() & expected.isnan())
+    assert bool(equal.all())
+
+
+@pytest.mark.parametrize("fail_step", [None, "smoke", "roots", "missing_evidence"])
+def test_phase3_operators_only_never_starts_or_certifies_model(tmp_path, monkeypatch, capsys, fail_step):
+    from tools import validate_vq2a8_tp1_phase3 as driver
+
+    model, output = tmp_path / "model", tmp_path / "report"
+    model.mkdir()  # No expert artifact is needed for root projection tests.
+    monkeypatch.setattr(sys, "argv", ["phase3", "--model", str(model), "--output-dir", str(output), "--operators-only"])
+    monkeypatch.setattr(driver, "LiveChildLog", lambda *args: nullcontext())
+    stages = []
+
+    def run(command, **kwargs):
+        stage = command[command.index("--stage") + 1]
+        assert stage in ("smoke", "roots") and kwargs["timeout"] == 1800
+        stages.append(stage)
+        if fail_step != "missing_evidence":
+            (output / f"{stage}.json").write_text(
+                json.dumps({"status": "passed", "stage": stage, "device": "npu:0", "results": [{"passed": True}]})
+            )
+        return NS(returncode=int(stage == fail_step))
+
+    monkeypatch.setattr(driver.subprocess, "run", run)
+    assert driver.main() == int(fail_step is not None)
+    report = json.loads((output / "phase3.json").read_text())
+    assert report["scope"] == "operators_only" and report["planned_steps"] == ["smoke", "roots"]
+    assert report["root_fp8_execution_verified"] is False and report["serving_verified"] is False
+    assert report["status"] == ("incomplete" if fail_step is None else "failed")
+    assert report["root_fp8_operators_verified"] is (fail_step is None)
+    assert not (output / "model").exists()
+    text = capsys.readouterr().out
+    assert "PHASE3=PASS" not in text
+    if fail_step is None:
+        assert stages == ["smoke", "roots"] and "PHASE3_OPERATORS=PASS PHASE3=INCOMPLETE MODEL=NOT_RUN" in text
+    elif fail_step in ("smoke", "missing_evidence"):
+        assert stages == ["smoke"]

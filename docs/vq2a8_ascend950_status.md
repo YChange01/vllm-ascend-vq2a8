@@ -811,3 +811,86 @@ Original compiled-weight byte differences remain disclosed above; they
 are unrelated to this fix. NPU acceptance of this correction is pending:
 rerun the same one-command phase-3 driver. It still stops before roots/model
 if the new rounding preflight fails, and does not execute phases 2/4/5.
+
+### Phase-3 actual A5 FMA failure supersedes the previous correction (2026-09-06)
+
+The subsequent **real Ascend950 result at `14f55ce8` failed**, in
+`/tmp/vq2a8-phase3-u561cz8n`, before real weights or the model were tested.
+The earlier CUDA PASS did not establish A5 single-rounding behavior.
+The same-input FP8 bytes/scales passed, but inverse-RoPE FP32 had 10077
+different elements (maximum absolute error `5.684341886080802e-14`). At
+group 6/token 6/channel 970, both explicit `tl.fma` and eager `addcmul`
+returned `3.7252905826790084e-7`, whereas the fused reference returned
+`3.725290298461914e-7`. This reproduces the previously identified FP8
+midpoint failure. Calling an API "FMA" was not sufficient to fix it.
+This evidence describes the installed build/path, not every A5 instruction.
+
+The public
+[Triton-Ascend FMA test](https://github.com/Ascend/triton-ascend/blob/main/third_party/ascend/unittest/generalization_cases/test_general_fma.py)
+uses `x * y + z` with tolerance-based validation; it does not establish
+bitwise single-rounding conformance for this installed A5 build.
+
+The replacement small accelerator kernel implements single rounding with
+integer significands: normalize FP32 operands (including subnormals), form
+the exact 48-bit product, align product/addend with guard and sticky bits,
+then round the signed sum to nearest-even. Intermediate magnitudes fit
+int64. Shift counts are bounded even in unselected branches. It handles
+signed zero, cancellation, subnormal rounding and overflow; NaNs are
+canonicalized rather than promising reference NaN-payload identity.
+It uses neither floating `tl.fma`, FP64, CPU transfers in the hot path,
+nor Cube/fixpipe. This is a correctness workaround, not an acceleration
+claim. Installed A5 integer lowering and performance still require testing.
+
+Smoke and roots now start with an 11-case, weight-free primitive check
+(including ties, subnormals, signed zeros and overflow cancellation),
+followed by the existing exact inverse-RoPE/FP8 regression. Primitive
+results are compared as bytes to preserve every FP32 bit and zero sign.
+`ROOT_FP8_FMA` identifies `integer_single_rounding_rne` and prints bounded
+hex encodings. All FP32/FP8 exactness checks and projection error limits
+remain intact. CANN native FP8 root matmul, the online quantization policy,
+BF16 historical baseline, expert artifacts and expert compute are unchanged.
+No repack or blanket BF16 fallback is introduced.
+
+Developer evidence in `/tmp/vq2a8-phase3-integer-aAG2qr`:
+
+- All 397 VQ2A8 unit tests pass, run with
+  `--confcutdir=tests/ut/quantization` to exclude NPU-wide integration fixtures
+  on the NVIDIA development host. This is not the entire Ascend test suite.
+- The new Triton kernel matches an independently implemented arbitrary-width
+  integer oracle on 20359 edge/random triples, and CUDA hardware FMA on
+  524288 random/cancellation triples. Finite results and signed zeros are
+  checked bitwise; hardware NaN payload differences are not treated as bugs.
+- The original 112 SM90 real-root comparisons pass; FP8 activation encodings
+  are exact. Previously disclosed compiled/eager **weight** byte differences
+  remain (`weights_bitwise_equal=False`); no full-model reference is claimed.
+- CPU smoke passes 235 checks. Ruff and Markdown lint pass.
+  `bash format.sh ci` cannot complete because local `pre-commit` is absent.
+
+**Resource constraint and next real-device run:** this report's device is
+still physical 4 / logical `npu:0`, SoC260 / `Ascend950PR_958b`, CANN9.1,
+torch2.10 / torch-npu2.10.post4, Triton-Ascend3.2.2 dev20260729205041.
+It reports only 7046828032 free bytes (**6.56 GiB**) of 115662127104 total;
+that snapshot is insufficient for the earlier full-model footprint. It does
+not identify the occupying process. Do not kill processes, reset the device,
+switch cards or upgrade the environment implicitly.
+
+Use the new operator-only mode first:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_phase3.py --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 4 --operators-only
+```
+
+This runs `smoke -> roots`, streams and saves logs, and never constructs
+the full model. The expert artifact need not be present for these operator
+checks. Success is explicitly
+`PHASE3_OPERATORS=PASS PHASE3=INCOMPLETE MODEL=NOT_RUN`, with
+`root_fp8_execution_verified=False`; a failed or missing child result
+still stops the driver with a nonzero exit. `phase3.json` records the scope,
+planned steps and operator verification separately, and operator JSON now
+preserves the device memory snapshot. Once these gates pass and the device
+has sufficient available HBM, the normal command without `--operators-only`
+runs all three steps. No phase-3 completion is claimed before the actual
+root-FP8 offline model passes. Phase 2 remains skipped; phases 4/5 remain
+deferred. The Ascend950 is still not directly accessible from this workspace.

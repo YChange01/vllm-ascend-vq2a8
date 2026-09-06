@@ -66,12 +66,17 @@ def main():
     parser.add_argument("--artifact", type=Path)
     parser.add_argument("--physical-npu", type=int, default=4)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--operators-only",
+        action="store_true",
+        help="Run smoke and root projections only; never start or certify the full model/phase 3.",
+    )
     args = parser.parse_args()
     if args.physical_npu < 0:
         parser.error("Physical NPU must be non-negative.")
     repo = Path(__file__).resolve().parents[1]
     model = args.model.resolve(strict=True)
-    artifact = (args.artifact or model / "experts_vq_ascend_v2").resolve(strict=True)
+    artifact = (args.artifact or model / "experts_vq_ascend_v2").resolve(strict=not args.operators_only)
     if args.output_dir:
         output = args.output_dir.resolve()
         output.mkdir(parents=True, exist_ok=False)
@@ -98,30 +103,30 @@ def main():
         )
         for stage in ("smoke", "roots")
     ]
-    steps.append(
-        (
+    model_step = (
+        "model",
+        [
+            sys.executable,
+            str(repo / "tools/validate_vq2a8_tp1_acceptance.py"),
+            "--stage",
             "model",
-            [
-                sys.executable,
-                str(repo / "tools/validate_vq2a8_tp1_acceptance.py"),
-                "--stage",
-                "model",
-                "--model",
-                str(model),
-                "--artifact",
-                str(artifact),
-                "--physical-npu",
-                str(args.physical_npu),
-                "--root-linear-mode",
-                "online_fp8_sm90",
-                "--execution-policy",
-                "cached",
-                "--output-dir",
-                str(output / "model"),
-            ],
-            None,
-        )
+            "--model",
+            str(model),
+            "--artifact",
+            str(artifact),
+            "--physical-npu",
+            str(args.physical_npu),
+            "--root-linear-mode",
+            "online_fp8_sm90",
+            "--execution-policy",
+            "cached",
+            "--output-dir",
+            str(output / "model"),
+        ],
+        None,
     )
+    if not args.operators_only:
+        steps.append(model_step)
     report = {
         "phase": 3,
         "status": "running",
@@ -132,6 +137,10 @@ def main():
         "quality_verified": False,
         "serving_verified": False,
         "native_fp8_expert_dot": False,
+        "scope": "operators_only" if args.operators_only else "operators_and_model",
+        "planned_steps": [step[0] for step in steps],
+        "root_fp8_operators_verified": False,
+        "root_fp8_execution_verified": False,
     }
     for name, command, timeout in steps:
         log = output / f"{name}.log"
@@ -154,12 +163,19 @@ def main():
         passed = code == 0 and step_evidence_passed(output, name)
         report["results"].append({"step": name, "returncode": code, "passed": passed, "log": str(log)})
         report["status"] = "failed" if not passed else ("passed" if name == "model" else "running")
+        if passed and name == "roots":
+            report["root_fp8_operators_verified"] = True
+            if args.operators_only:
+                report["status"] = "incomplete"
         report["root_fp8_execution_verified"] = passed and name == "model"
         (output / "phase3.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
         short = [
             f"PHASE3={report['status'].upper()} completed={len(report['results'])}/3",
+            f"SCOPE={report['scope'].upper()} requested_completed={len(report['results'])}/{len(steps)}",
             *[f"STEP={r['step']} {'PASS' if r['passed'] else 'FAIL'}" for r in report["results"]],
             f"ROOT_FP8_EXECUTION_VERIFIED={report['root_fp8_execution_verified']}",
+            f"ROOT_FP8_OPERATORS_VERIFIED={report['root_fp8_operators_verified']}",
+            f"MODEL={'NOT_RUN' if args.operators_only else 'REQUIRED'}",
             "PHASE2=SKIPPED NATIVE_FP8_EXPERT_DOT=False QUALITY_VERIFIED=False SERVING_VERIFIED=False",
         ]
         (output / "summary.txt").write_text("\n".join(short) + "\n", encoding="utf-8")
@@ -167,6 +183,10 @@ def main():
             print(f"PHASE3=FAIL step={name} REPORT={output} (remaining steps skipped)", flush=True)
             return 1
         print(f"PHASE3_STEP_PASS={name}", flush=True)
+    if args.operators_only:
+        print((output / "summary.txt").read_text(encoding="utf-8"), end="", flush=True)
+        print(f"PHASE3_OPERATORS=PASS PHASE3=INCOMPLETE MODEL=NOT_RUN REPORT={output}", flush=True)
+        return 0
     print((output / "model/summary.txt").read_text(encoding="utf-8"), end="", flush=True)
     print(f"PHASE3=PASS REPORT={output} (operator + offline execution only)", flush=True)
     return 0

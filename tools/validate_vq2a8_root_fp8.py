@@ -63,12 +63,59 @@ def rounding_inputs(case="small"):
     return x, angle.cos().repeat_interleave(2, -1), angle.sin().repeat_interleave(2, -1)
 
 
+def fma_conformance_words():
+    """FP32 operand/result encodings, independent of host floating arithmetic."""
+    return [
+        (0x3F800000, 0x3F800000, 0x33800000, 0x3F800000),  # 1 + half ULP -> even
+        (0x3F800001, 0x3F800000, 0x33800000, 0x3F800002),  # odd -> even
+        (0x00000001, 0x3F000000, 0, 0),  # half minimum subnormal
+        (0x00000003, 0x3F000000, 0, 2),
+        (0x80000001, 0x3F000000, 0, 0x80000000),
+        (0x00800000, 0x3F000000, 0, 0x00400000),
+        (0x7F7FFFFF, 0x40000000, 0, 0x7F800000),
+        (0x7F7FFFFF, 0x40000000, 0xFF7FFFFF, 0x7F7FFFFF),  # no intermediate overflow
+        (0x3F800000, 0x3F800000, 0xBF800000, 0),
+        (0x80000000, 0x3F800000, 0x80000000, 0x80000000),
+        (0x80000000, 0x3F800000, 0, 0),
+    ]
+
+
+def fma_conformance_probe(compare, device):
+    """Tiny first gate for int64 lowering, ties, cancellation and signed zeros."""
+    import torch
+
+    words = torch.tensor(fma_conformance_words(), dtype=torch.int64).to(torch.int32)
+    a, b, c, expected = (words[:, i].contiguous().view(torch.float32) for i in range(4))
+    if device.type == "cpu":
+        actual = torch.addcmul(c, a, b)
+    else:
+        from vllm_ascend.quantization.vq2a8_root_fp8_triton import root_fma_fp32
+
+        actual = root_fma_fp32(a.to(device), b.to(device), c.to(device)).cpu()
+    print(
+        "ROOT_FP8_FMA "
+        + json.dumps(
+            {
+                "backend": "cpu_reference" if device.type == "cpu" else "integer_single_rounding_rne",
+                "actual_words": [f"{bits & 0xFFFFFFFF:08x}" for bits in actual.view(torch.int32).tolist()],
+                "expected_words": [f"{bits & 0xFFFFFFFF:08x}" for bits in words[:, 3].tolist()],
+            }
+        ),
+        flush=True,
+    )
+    # Byte comparisons preserve +/-0 and all 32 bits; converting int32
+    # encodings to float32 in compare() would discard low significand bits.
+    compare("rounding:fma_conformance:bytes", expected.view(torch.uint8), actual.view(torch.uint8), exact=True)
+
+
 def rounding_probe(compare, device):
     """Run before weights; isolate FMA from FP8 cast/scale on identical inputs."""
     import torch
 
     from vllm_ascend.quantization.vq2a8_root_fp8 import inverse_rope_fp32, quantize_root_activation
 
+    print("ROOT_FP8 stage=fma_conformance", flush=True)
+    fma_conformance_probe(compare, device)
     for case in ("small", "zero"):
         print(f"ROOT_FP8 stage=rounding_regression case={case} tokens=10 groups=8", flush=True)
         heads, cos, sin = rounding_inputs(case)
@@ -87,6 +134,7 @@ def rounding_probe(compare, device):
                     {
                         "group": 6,
                         "index": [6, 970],
+                        "fma_backend": "cpu_reference" if device.type == "cpu" else "integer_single_rounding_rne",
                         "expected_fp32": float(expected[6, 6, 970]),
                         "explicit_fma_fp32": float(actual[6, 6, 970]),
                         "legacy_addcmul_fp32": float(legacy[6, 49, 5]),
@@ -163,7 +211,9 @@ def main():
     save()
     print("ENVIRONMENT " + json.dumps(report["environment"]), flush=True)
     if device.type == "npu":
-        print("DEVICE " + json.dumps(_initialize_device(device)), flush=True)
+        report["device_info"] = _initialize_device(device)
+        save()
+        print("DEVICE " + json.dumps(report["device_info"]), flush=True)
     matmul = root_fp8_matmul_npu if device.type == "npu" else root_fp8_matmul_reference
 
     def compare(label, expected, actual, *, exact=False, details=None):
