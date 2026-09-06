@@ -1101,3 +1101,88 @@ test environment, including 36 actual C++ scheduler cases. Ruff check/format,
 Markdown lint and `git diff --check` pass. `bash format.sh ci` was attempted
 but is blocked by the local missing `pre-commit`; no CANN build or 950
 hardware PASS is claimed by these development results.
+
+## Phase 3 model: A5 KV-quant SAS metadata initialization
+
+The user rebuilt `64b577a8` and passed all four weight-free QLI cases,
+each repeated three times. That preflight reported `Ascend950PR_957d`,
+28 Cube / 56 Vector cores and a different UUID from the older 958b
+snapshot. Physical-device argument 4 is not a sufficient identity check
+across runs. The original runtime 28/64 combination is not thereby
+hardware-certified; keep the actual DEVICE/QLI_ENV records with each run.
+
+The subsequent `/tmp/vq2a8-phase3-t426l1so` model run passed metadata
+construction and entered real prefill. It failed in layer 0 at
+`dsa_v1.py::_forward_prefill`, in the `compress_ratio <= 1` branch.
+On A5, `DeviceOperator` selects `npu_kv_quant_sparse_attn_sharedkv` here.
+Error 507015 with scalar-GM/DDR out-of-range diagnostics is different
+from the previous QLI AICPU 507018/22007 rejection. The 406-second
+profile did not establish that the real attention path was safe.
+
+Source inspection and host execution of the real C++ scheduler establish
+an independent defect in `KvQuantSparseAttnSharedkvMetadata::GenMetaData`:
+the output is allocated with `torch::empty`, but only the runtime-count
+prefixes are written. Unused flags and intervals in the fixed ABI retain
+allocator contents. The A5 consumer reads FA slots by block index and
+uses nonzero flags to enter the interval/address calculation. This is a
+strong candidate for the observed invalid accesses, not a hardware-proven
+complete diagnosis. Device-log core IDs alone do not prove logical block
+indices, the actual launch envelope or platform-count consistency.
+
+The fix initializes the entire **defined** KV-quant SAS struct (36 x 9 FA
+words plus 72 x 8 FD words = 900 int32 words), then writes the schedule.
+This is NOT QLI's 864-word ABI. The remaining 124 reserved output words
+are untouched. For N128, retain the paired-core schedule and the idle
+pair's `FA_S2_MAX_NUM` barrier counts. Do not replace the metadata tensor
+with zeros in Python: doing so would also disable real attention work.
+Reject zero counts and counts exceeding the fixed ABI before writing.
+No weights, quantization modes, attention mathematics or launch core
+counts are changed. Non-quantized SAS is outside this A5 fix's scope.
+
+`tools/validate_vq2a8_sas_attention.py` now runs QLI followed by a
+weight-free **SWA-only** attention preflight. It uses the production
+packed-FP8 KV scatter, a nonzero page-table entry, the A5 SAS metadata
+operator, and the actual attention operator for prefill and three decode
+lengths. It checks all defined metadata words, exact repeats, finite
+outputs, and an analytic oracle: Q=0, V=+/-0.5 and a zero-logit sink give
+`V * visible_keys / (visible_keys + 1)`. This isolates a small nonzero
+output check without depending on root/expert weights. It does not test
+general attention scores, compressed DSA/indexer selection, model quality
+or serving. Each substage is logged before launch. The offline validator
+also invokes it before `LLM` construction/profile so failures are early.
+
+After pulling this fix, rebuild custom ops as described above. For a clean
+rebuild, only the generated `csrc/build`, `csrc/build_out`, `csrc/output`
+directories need removal; never remove `csrc` or the model. The existing
+build script replaces the installed `_cann_ops_custom` package after a
+successful build. Run the new preflight in a fresh Python process:
+
+```bash
+(
+set -euo pipefail
+cd /home/g00872988/vllm-ascend-vq2a8
+timeout 180s /usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_sas_attention.py \
+  --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --physical-npu 4 2>&1 | tee /tmp/vq2a8-sas-preflight.log
+echo SAS_EXIT=0
+)
+```
+
+Require both `SAS_ATTENTION_PREFLIGHT=PASS` and `SAS_EXIT=0` before rerunning
+the full phase-3 command. Do not mark phase 3 complete from a preflight.
+The earlier short/standalone successes and phase-2 skip are unchanged;
+phases 4 and 5 retain their prior scope/status.
+
+The developer cannot connect directly to the Ascend 950. A regression
+test first failed against the old real C++ scheduler with a poisoned
+output buffer, then passed after the fix. New host cases cover 28/64,
+28/56, 32/64, 24/48, 36/72; 64/128 heads; SWA/C4/C128 schedules; prefill
+and decode lengths; disabled slots, N128 pairs, fixed ABI capacity,
+reserved-tail/canary preservation and exact repeats. The host harness
+uses undefined-behavior sanitization; it is not a CANN or NPU simulator.
+The new attention preflight still requires the user's actual NPU run.
+Developer validation: all 656 VQ2A8 tests pass in the existing NVIDIA/host
+environment, including 124 new real SAS C++ scheduler cases. Ruff check
+and formatting, Markdown lint and `git diff --check` pass. The required
+`bash format.sh ci` was attempted but cannot run without the local
+`pre-commit` dependency; no complete CI or 950 build/run PASS is claimed.

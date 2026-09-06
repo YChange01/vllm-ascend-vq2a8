@@ -220,3 +220,147 @@ def test_offline_checks_metadata_before_expensive_engine_construction():
     )
     assert preflight.lineno < construct.lineno
     assert any(k.arg == "prompt_tokens" for k in preflight.keywords)
+
+
+# The A5 attention consumer has a different ABI from QLI: 36 x 9 FA words
+# followed by 72 x 8 FD words. Compile its real scheduler in a separate binary.
+SAS_HARNESS = r"""
+#include "cpu_context.h"
+#include "op_kernel_aicpu/kv_quant_sparse_attn_sharedkv_metadata_aicpu.h"
+#include "../kv_quant_sparse_attn_sharedkv/op_kernel/kv_quant_sparse_attn_sharedkv_metadata.h"
+using namespace aicpu;
+using namespace optiling;
+int main(int argc, char** argv) {
+    assert(argc == 8);
+    const auto aic = std::atoi(argv[1]), aiv = std::atoi(argv[2]);
+    int32_t qlen = std::atoi(argv[3]), klen = std::atoi(argv[4]);
+    const int heads = std::atoi(argv[5]), ratio = std::atoi(argv[6]);
+    const bool valid = std::atoi(argv[7]);
+    const int pair = heads == 128 ? 2 : 1;
+    std::array<int32_t, 2> cq{0, qlen}, ck{0, klen};
+    std::array<uint32_t, SAS_META_SIZE + 2> storage;
+    std::vector<uint32_t> previous;
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        const uint32_t poison = 0xa5a50000U + repeat;
+        storage.fill(poison);
+        Tensor q{cq.data(), {2}}, k{ck.data(), {2}}, usedQ{&qlen, {1}}, usedK{&klen, {1}};
+        Tensor out{storage.data() + 1, {SAS_META_SIZE}};
+        CpuKernelContext ctx{{&q, &k, nullptr, &usedQ, &usedK}, {&out}, {}};
+        const std::map<std::string, int64_t> attrs{
+            {"aic_core_num", aic}, {"aiv_core_num", aiv}, {"num_heads_q", heads},
+            {"num_heads_kv", 1}, {"head_dim", 512}, {"batch_size", 1},
+            {"max_seqlen_q", qlen}, {"max_seqlen_kv", klen},
+            {"ori_topk", 0}, {"cmp_topk", ratio == 4 ? 512 : 0},
+            {"cmp_ratio", ratio}, {"ori_mask_mode", 4}, {"cmp_mask_mode", 3},
+            {"ori_win_left", 127}, {"ori_win_right", 0},
+            {"has_ori_kv", 1}, {"has_cmp_kv", ratio != 1}
+        };
+        for (const auto& item : attrs) ctx.attrs[item.first].integer = item.second;
+        ctx.attrs["soc_version"].text = "Ascend950PR_957d";
+        ctx.attrs["layout_q"].text = "TND";
+        ctx.attrs["layout_kv"].text = "PA_ND";
+        KvQuantSparseAttnSharedkvMetadataCpuKernel kernel;
+        assert((kernel.Compute(ctx) == 0) == valid);
+        if (!valid) {
+            for (auto value : storage) assert(value == poison);
+            continue;
+        }
+        assert(storage.front() == poison && storage.back() == poison);
+        const auto* meta = reinterpret_cast<const detail::SasMetaData*>(out.data);
+        bool disabled = false;
+        std::array<uint32_t, 3> end{};
+        for (uint32_t i = 0; i < AIC_CORE_NUM; ++i) {
+            const auto* row = meta->faMetadata[i];
+            if (klen <= 32) assert(row[FA_FIRST_FD_DATA_WORKSPACE_IDX_INDEX] == 0);
+            if (row[FA_CORE_ENABLE_INDEX] == 0) {
+                disabled = true;
+                // N128 deliberately writes FA_S2_MAX_NUM for idle paired cores;
+                // the AIV barrier loop consumes it even when FA is disabled.
+                for (uint32_t j = 0; j < FA_METADATA_SIZE; ++j) {
+                    if (heads != 128 || j != FA_S2_MAX_NUM) assert(row[j] == 0);
+                    if (i >= static_cast<uint32_t>(aic / pair * pair)) assert(row[j] == 0);
+                }
+            } else {
+                assert(!disabled && i < static_cast<uint32_t>(aic / pair * pair));
+                assert(row[FA_CORE_ENABLE_INDEX] == 1);
+                if (heads == 128 && i % 2) {
+                    for (uint32_t j = 0; j < FA_METADATA_SIZE; ++j)
+                        assert(row[j] == meta->faMetadata[i - 1][j]);
+                } else {
+                    const std::array<uint32_t, 3> start{row[1], row[2], row[3]};
+                    assert(start == end);
+                    end = {row[4], row[5], row[6]};
+                    assert(end > start);
+                }
+            }
+        }
+        assert((end == std::array<uint32_t, 3>{1, 0, 0}));
+        for (uint32_t i = 0; i < AIV_CORE_NUM; ++i) {
+            const auto* row = meta->fdMetadata[i];
+            if (klen <= 32) assert(row[FD_CORE_ENABLE_INDEX] == 0);
+            assert(row[0] == 0 || row[0] == 1);
+            if (row[0] == 0 || i >= static_cast<uint32_t>(aiv / pair))
+                for (uint32_t j = 0; j < FD_METADATA_SIZE; ++j) assert(row[j] == 0);
+        }
+        constexpr size_t words = sizeof(detail::SasMetaData) / sizeof(uint32_t);
+        static_assert(words == 900);
+        std::vector<uint32_t> current(storage.begin() + 1, storage.begin() + 1 + words);
+        if (repeat) assert(current == previous);
+        previous = current;
+        for (size_t i = 1 + words; i < storage.size(); ++i) assert(storage[i] == poison);
+    }
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def sas_scheduler(tmp_path_factory):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if not compiler:
+        pytest.skip("Host C++ compiler required for real A5 SAS scheduler regression")
+    work = tmp_path_factory.mktemp("sas-host-scheduler")
+    (work / "context_shim.h").write_text(CONTEXT, encoding="utf-8")
+    for name in ("cpu_context.h", "cpu_kernel.h", "cpu_tensor.h", "log.h", "status.h", "cust_op/cust_cpu_utils.h"):
+        path = work / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#include "context_shim.h"\n', encoding="utf-8")
+    with (work / "status.h").open("a", encoding="utf-8") as stream:
+        stream.write("#define KERNEL_STATUS_OK 0\n#define KERNEL_STATUS_PARAM_INVALID 1\n")
+    main = work / "main.cpp"
+    main.write_text(SAS_HARNESS, encoding="utf-8")
+    binary = work / "scheduler"
+    op = REPO / "csrc/attention/kv_quant_sparse_attn_sharedkv_metadata"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O1",
+            "-g",
+            "-fsanitize=undefined",
+            "-fno-sanitize-recover=all",
+            f"-I{work}",
+            f"-I{op}",
+            str(main),
+            str(op / "op_kernel_aicpu/kv_quant_sparse_attn_sharedkv_metadata_aicpu.cpp"),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return binary
+
+
+@pytest.mark.parametrize("cores", [(28, 64), (28, 56), (32, 64), (24, 48), (36, 72)])
+@pytest.mark.parametrize("lengths", [(10, 10), (1, 11), (32, 32), (1, 129)])
+@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("ratio", [1, 4, 128])
+def test_real_sas_scheduler_initializes_entire_abi(sas_scheduler, cores, lengths, heads, ratio):
+    subprocess.run([str(sas_scheduler), *map(str, (*cores, *lengths, heads, ratio)), "1"], check=True, timeout=10)
+
+
+@pytest.mark.parametrize("cores", [(0, 64), (28, 0), (37, 74), (36, 73)])
+def test_real_sas_scheduler_rejects_abi_overflow_before_writing(sas_scheduler, cores):
+    subprocess.run([str(sas_scheduler), *map(str, cores), "10", "10", "128", "1", "0"], check=True, timeout=10)
