@@ -111,7 +111,9 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         self.progress = progress
         self.evictions = 0
         self._resident_bytes = 0
-        self.timing = dict.fromkeys(("host_load_validate_s", "h2d_s", "prepare_s", "packed_projection_s"), 0.0)
+        self.timing = dict.fromkeys(
+            ("host_load_validate_s", "host_read_s", "host_validate_s", "h2d_s", "prepare_s", "packed_projection_s"), 0.0
+        )
         self.projection_rows = 0
         self.prepare_batches = 0
 
@@ -152,11 +154,12 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             self.evictions += 1
         self._emit("expert_load_start", expert=expert_id)
         start = time.perf_counter()
+        host_timings = {}
         # Read/validate on CPU, once per cache miss, retaining strict checks.
         # Explicit CPU context is necessary under vLLM's NPU default device.
         with torch.device("cpu"):
             host = {
-                kind: self.artifact.load_expert(self.layer_index, expert_id, kind, device="cpu")
+                kind: self.artifact.load_expert(self.layer_index, expert_id, kind, device="cpu", timings=host_timings)
                 for kind in ("gate_up", "down")
             }
         host_s = time.perf_counter() - start
@@ -168,6 +171,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         synchronize_execution(self.device)
         h2d_s = time.perf_counter() - start if self.device.type != "cpu" else 0.0
         self.timing["host_load_validate_s"] += host_s
+        for key, value in host_timings.items():
+            self.timing[key] += value
         self.timing["h2d_s"] += h2d_s
         self._cache[expert_id] = expert
         self._resident_bytes += self._payload_bytes(expert)
@@ -177,6 +182,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             "expert_load_done",
             expert=expert_id,
             host_s=f"{host_s:.3f}",
+            read_s=f"{host_timings.get('host_read_s', 0.0):.3f}",
+            validate_s=f"{host_timings.get('host_validate_s', 0.0):.3f}",
             h2d_s=f"{h2d_s:.3f}",
             resident=len(self._cache),
             limit=self.cache_experts,

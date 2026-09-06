@@ -117,6 +117,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_kernel_contract.py",
         "vq2a8_reference.py",
         "vq2a8_runtime.py",
+        "vq2a8_repack.py",
         "vq2a8_moe.py",
         "vq2a8_offline.py",
         "vq2a8_execution.py",
@@ -132,6 +133,9 @@ def environment_report() -> dict[str, Any]:
         "tools/validate_vq2a8_tp1_moe.py",
         "tools/validate_vq2a8_tp1_acceptance.py",
         "tools/vq2a8_live_log.py",
+        "tools/vq2a8_baseline.py",
+        "tools/benchmark_vq2a8_host_load.py",
+        "tools/validate_vq2a8_tp1_phase1.py",
     ):
         source_hashes[name] = hashlib.sha256((repo / name).read_bytes()).hexdigest()
     return {
@@ -140,6 +144,7 @@ def environment_report() -> dict[str, Any]:
         "git": git_identity,
         "source_sha256": source_hashes,
         "torch_runtime_version": torch.__version__,
+        "cpu_threads": {"intraop": torch.get_num_threads(), "interop": torch.get_num_interop_threads()},
         "arguments": sys.argv[1:],
         "packages": packages,
         "environment": {

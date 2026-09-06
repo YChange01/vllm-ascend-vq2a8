@@ -407,6 +407,32 @@ def test_repacked_validation_rejects_bad_tile_ids_values_signs_and_device() -> N
         validate_repacked_matrix(non_cpu, spec)
 
 
+@pytest.mark.parametrize("columns", [4, 8, 12, 16])
+def test_runtime_validator_never_expands_index_grid_and_preserves_all_codes(monkeypatch, columns):
+    spec = _spec(columns=columns)
+    payload = repack_matrix_tp1(_canonical_payload(spec), spec)
+    # Exhaust all possible nibble values, including signed int32 high bits.
+    for code in range(16):
+        codes = torch.full((spec.rows // 2, columns), code, dtype=torch.uint8)
+        payload["packed_indices"] = pack_repacked_indices(codes)
+        before = {name: tensor.view(torch.uint8).clone() for name, tensor in payload.items()}
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("Runtime validation must not allocate an unpacked grid")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(vq2a8_repack_module, "unpack_repacked_indices", forbidden)
+            patch.setattr(vq2a8_repack_module, "_unpack_packed_rows", forbidden)
+            validate_repacked_matrix(payload, spec)
+        for name, tensor in payload.items():
+            assert torch.equal(tensor.view(torch.uint8), before[name])
+        assert torch.equal(unpack_repacked_indices(payload["packed_indices"], columns), codes)
+    if columns % 8:
+        payload["packed_indices"][:, -1] |= 1 << ((columns % 8) * 4)
+        with pytest.raises(ValueError, match="padding nibbles"):
+            validate_repacked_matrix(payload, spec)
+
+
 def test_pack_rejects_out_of_range_wrong_dtype_and_non_cpu_indices() -> None:
     out_of_range = torch.zeros((1, 8), dtype=torch.uint8)
     out_of_range[0, -1] = 16

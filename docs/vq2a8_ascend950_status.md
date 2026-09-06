@@ -524,3 +524,112 @@ A standalone or full offline PASS still does not certify independent
 full-model logits, original quantization equivalence, generation quality,
 native FP8 Cube compute, or HTTP serving. In particular, no NPU speedup is
 claimed without the new stage timings from the actual Ascend950 run.
+
+### Phase 1: accepted offline baseline and CPU validation optimization
+
+The Ascend950 user report `/tmp/vq2a8-acceptance-u8qzcixx` at
+`f9e802da5eb14fe40f850ac5c7c2177bc9e48a3a` (dirty worktree) passes the
+complete short offline gate: 43 layers, 10 prompt tokens, three decode
+steps per request, two exactly repeated logits/token sequences. Generated
+IDs are `[223, 20, 16, 1]`, decoded as a space and `2.` followed by EOS. This is
+execution evidence, not independent original-model quality certification.
+
+The reported completed MoE calls total 1520.473 s host load/validation,
+8.980 s H2D, 29.826 s preparation and 465.214 s packed projections. These
+include profiling and both requests; they overlap forward totals and
+must not be added to them. There were 1514 cache loads, 7798 hits and no
+evictions. Actual packed residency was 9.096 GiB; 61.541 GiB is the planned
+full cache, not a measured full-residency peak. The second request took
+113.086 s; the last decode forward took 8.845 s. Root linears remain the
+BF16 diagnostic fallback and the NPU kernel remains pure Vector FP32 MAC
+with E4M3 storage, not native FP8 Cube multiplication.
+
+Phase 1 changes only CPU payload validation and diagnostics:
+
+- Remove full unpacking solely to check `code >= 16`. Every four-bit
+  pattern is legal for the 16-entry codebook and the unpacker already masks
+  with 15; this check cannot reject a payload. Retain shape, dtype, stride,
+  high padding nibble, finite codebook/normalization, tile ID population
+  and sign checks. Padding validation widens only the last packed word
+  per row. Repack's independent bitwise round-trip is unchanged.
+- Do not change payload bytes, artifact format, cache policy, routing,
+  per-row RHT/A8 geometry, shared experts, attention or either GPU kernel.
+- Split `host_read_s` and `host_validate_s` inside `host_load_validate_s`.
+  These are wall times, not disk counters: mapped-file page faults can
+  occur in later validation/H2D. `HOST_BREAKDOWN` is a subset of the old
+  total, never an additional cost. Record CPU intra/inter-op thread counts
+  without changing them.
+- Add a CPU-only warm-payload microbenchmark comparing retained checks
+  against retained checks plus the removed full-grid work. It is explicitly
+  a legacy-work replay, not a cold disk benchmark or a run of an old commit.
+- Add `--baseline-report` to the model acceptance stage. Copy the old
+  report/logits into a new snapshot, verify saved logits SHA256, preserve
+  recorded source hashes/git status, and capture current relevant source
+  files and the current tracked dirty diff. Never clean the user's tree.
+  The old dirty source bytes cannot be reconstructed from hashes: capture-
+  time files and small model/tokenizer/manifest identity hashes are labelled
+  separately from historical run evidence. A manifest hash does not verify
+  all checkpoint payloads.
+- Before model construction, verify the frozen files, critical package
+  versions and unchanged compute-source hashes. Compare each new run's
+  prompt, execution metadata, tokens, dtype/shape and full logits against
+  the corresponding old run, with exact equality. Missing evidence,
+  changed identity or a mismatch fails; new logits/failure details remain
+  available. This is same-implementation regression, not phase 2's
+  independent reference. `LOGITS_REFERENCE_VERIFIED` remains false.
+
+The one-command driver below preserves the baseline first, then runs a
+CPU validation benchmark, the accepted 12 real-weight MoE cases, and the
+complete model regression. Each step streams output and retains its log;
+failure skips remaining steps. Device-child timeouts remain owned by the
+acceptance supervisor, with no competing outer timeout that could orphan
+its worker. No repack, TP4 or HTTP server is launched.
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_phase1.py --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 4 --baseline-report /tmp/vq2a8-acceptance-u8qzcixx
+```
+
+Keep the previous report until snapshot completion. `PHASE1_REPORT_DIR`
+contains `baseline/`, `host.json`, `moe/`, `model/`, full step logs and
+`phase1.json`. The final short report must show `BASELINE_EXACT=PASS
+completed=2/2`, not merely the offline execution PASS. The driver labels
+success `PHASE1_REGRESSION=PASS`; performance requires reviewing host
+breakdown and cold/warm timings, not inferring speed from correctness.
+
+Development validation uses the accessible NVIDIA host, not Ascend950.
+Four real CPU payloads (layers 0/3, gate-up/down, 96 CPU threads,
+torch 2.13.0+cu129) retained identical bytes. Five-sample validation medians
+were 1.88-4.70 ms for legacy-work replay versus 0.41-0.54 ms for retained
+checks. These warm CPU measurements do not predict the user's 1520 s
+Ascend host total or warm NPU decode speed. The disconnected Ascend950
+must still return the new phase-1 report before hardware acceptance.
+
+The phase-1 VQ2A8 unit suite passes 330 tests. The real CUDA checks for
+layers 0/3 pass all 12 accepted deterministic/zero, M=1/3/10 cases with
+exact same-device baseline agreement and three exact repeats. Full logs
+are retained on the development host under
+`/tmp/vq2a8-acceptance-44xgxxtr` and `/tmp/vq2a8-acceptance-1q6cxztn`.
+That scratch worktree reports its old git HEAD; the synchronized source
+hashes in each report identify the tested files. It is not an Ascend run.
+Ruff and Markdown checks pass. The required `bash format.sh ci` was
+attempted but remains unavailable because the test environment does not
+have `pre-commit`; this is not reported as a repository-wide CI pass.
+
+### Explicit remaining plan (user decision)
+
+1. Phase 1: execute CPU loading/validation optimization and exact regression
+   against the accepted offline run; keep all valid corruption checks.
+2. Phase 2: **skipped by user request**. Do not generate an independent
+   full-model reference or mark independent logits/quality as verified.
+3. Phase 3, deferred: adapt the original online FP8 root-linear semantics,
+   with focused operator/attention regression. Skipping phase 2 does not
+   supply evidence of original full-model equivalence.
+4. Phase 4, deferred: profile and optimize packed NPU execution. Keep the
+   accepted Vector baseline; isolate Cube/FP8, alignment and CV/fixpipe
+   experiments in microkernels before integration. No new kernel in phase 1.
+5. Phase 5, deferred: broaden prompts/context/compressor boundary and
+   residency tests, then normal vLLM/HTTP streaming and request lifecycle.
+   Report unverified quality explicitly rather than treating service success
+   as quality evidence. TP4 and further repacking are not current tasks.

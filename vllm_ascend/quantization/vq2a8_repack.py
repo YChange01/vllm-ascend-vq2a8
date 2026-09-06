@@ -198,10 +198,11 @@ def validate_repacked_matrix(
         logical_columns=spec.columns,
         name=f"{spec.name}.packed_indices",
     )
-    # Unpacking also independently exercises the direct-layout padding check.
-    unpacked = unpack_repacked_indices(packed_indices, spec.columns)
-    if bool((unpacked >= VQ2_CODEBOOK_SIZE).any()):
-        raise ValueError(f"{spec.name}.packed_indices contains an out-of-range code.")
+    # Every 4-bit pattern is a valid index into the 16-entry codebook. The
+    # unpacker masks with 15, so expanding the entire grid just to check
+    # index >= 16 cannot reject anything. Shape/dtype/stride and unused high
+    # padding nibbles are checked above. Repack's independent bitwise
+    # round-trip remains separate; this runtime check is not a file hash.
 
     expected_codebook_shape = (
         spec.column_tiles,
@@ -329,8 +330,8 @@ def _validate_packed_tensor(
     remainder = logical_columns % VQ2_INDICES_PER_WORD
     if remainder == 0:
         return
-    words = tensor.reshape(-1, tensor.shape[-1]).to(torch.int64) & _UINT32_MASK
-    padding = words[:, -1] >> (remainder * VQ2_INDEX_BITS)
+    words = tensor[..., -1].to(torch.int64) & _UINT32_MASK
+    padding = words >> (remainder * VQ2_INDEX_BITS)
     if bool((padding != 0).any()):
         raise ValueError(f"{name}: unused high padding nibbles must be zero.")
 

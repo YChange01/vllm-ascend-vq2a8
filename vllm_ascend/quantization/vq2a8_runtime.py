@@ -16,6 +16,7 @@ import hashlib
 import json
 import math
 import re
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
@@ -152,8 +153,15 @@ class VQ2TP1Artifact:
         *,
         device: torch.device | str = "cpu",
         validate_payload: bool = True,
+        timings: dict[str, float] | None = None,
     ) -> tuple[dict[str, torch.Tensor], VQ2MatrixSpec]:
-        """Load one expert slice without reading the layer's full expert axis."""
+        """Load one expert slice, optionally accumulating CPU stage wall times.
+
+        Read time covers mapping/slicing, shape checks and contiguity; demand
+        paging may occur later during payload validation or transfer. Timings
+        are not physical disk I/O counters. Failed loads publish no timings.
+        """
+        read_start = time.perf_counter()
         layer = self.layer(layer_index)
         spec = layer.spec_for(expert_id, kind)
         expert_position = layer.expert_ids.index(expert_id)
@@ -171,11 +179,17 @@ class VQ2TP1Artifact:
                         f"dtype={expected_dtype}, shape={expected_shape}."
                     )
                 tensors[field] = tensor.contiguous()
+        read_s = time.perf_counter() - read_start
+        validation_start = time.perf_counter()
         if validate_payload:
             validate_repacked_matrix(tensors, spec)
+        validate_s = time.perf_counter() - validation_start if validate_payload else 0.0
         target = torch.device(device)
         if target.type != "cpu":
             tensors = {name: tensor.to(device=target, non_blocking=False) for name, tensor in tensors.items()}
+        if timings is not None:
+            for key, value in (("host_read_s", read_s), ("host_validate_s", validate_s)):
+                timings[key] = timings.get(key, 0.0) + value
         return tensors, spec
 
 

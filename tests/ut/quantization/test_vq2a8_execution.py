@@ -89,7 +89,9 @@ def cache_only_runtime(limit=3):
     runtime.cache_hits = runtime.cache_loads = runtime.cache_peak_bytes = 0
     runtime._resident_bytes = runtime.evictions = 0
     runtime.progress = False
-    runtime.timing = dict.fromkeys(("host_load_validate_s", "h2d_s", "prepare_s", "packed_projection_s"), 0.0)
+    runtime.timing = dict.fromkeys(
+        ("host_load_validate_s", "host_read_s", "host_validate_s", "h2d_s", "prepare_s", "packed_projection_s"), 0.0
+    )
     runtime.prepare_batches = runtime.projection_rows = 0
     return runtime
 
@@ -99,7 +101,10 @@ def test_cached_weights_validate_only_on_misses_and_survive_repeated_passes():
     calls = []
 
     def load(layer, expert, kind, **kwargs):
-        assert kwargs == {"device": "cpu"}  # Never disable payload validation.
+        assert set(kwargs) == {"device", "timings"}  # Never disable payload validation.
+        assert kwargs["device"] == "cpu"
+        for key, seconds in (("host_read_s", 0.25), ("host_validate_s", 0.75)):
+            kwargs["timings"][key] = kwargs["timings"].get(key, 0.0) + seconds
         calls.append((expert, kind))
         return {"packed": torch.ones(4, dtype=torch.int32)}, None
 
@@ -108,6 +113,7 @@ def test_cached_weights_validate_only_on_misses_and_survive_repeated_passes():
         for expert in (0, 1, 2):
             runtime._get_expert(expert)
     assert len(calls) == 6  # two projections once per expert, not per pass
+    assert runtime.timing["host_read_s"] == 1.5 and runtime.timing["host_validate_s"] == 4.5
     assert runtime.cache_stats() == dict(
         resident_experts=3, resident_bytes=96, peak_packed_bytes=96, loads=3, hits=3, evictions=0
     )

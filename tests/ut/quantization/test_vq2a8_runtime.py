@@ -231,6 +231,42 @@ def test_runtime_reader_binds_complete_artifact_and_loads_one_expert(tmp_path: P
     torch.testing.assert_close(tensors["weight_bias"], torch.full((4,), 1 / 16))
 
 
+def test_reader_splits_cpu_timings_without_changing_payload_or_disabling_validation(tmp_path, monkeypatch):
+    from vllm_ascend.quantization import vq2a8_runtime as runtime
+
+    artifact_path, config_path = _write_artifact(tmp_path)
+    artifact = open_vq2a8_tp1_artifact(artifact_path, config_path)
+    expected, _ = artifact.load_expert(0, 1, "gate_up")
+    clock = iter([0.0, 2.0, 3.0, 7.0])
+    monkeypatch.setattr(runtime.time, "perf_counter", lambda: next(clock))
+    timings = {"host_read_s": 10.0, "host_validate_s": 20.0}
+    actual, _ = artifact.load_expert(0, 1, "gate_up", timings=timings)
+    assert timings == {"host_read_s": 12.0, "host_validate_s": 24.0}
+    for name in actual:
+        assert torch.equal(actual[name].view(torch.uint8), expected[name].view(torch.uint8))
+
+    monkeypatch.setattr(runtime.time, "perf_counter", lambda: 0.0)
+
+    def invalid(*args):
+        raise ValueError("Payload rejected")
+
+    monkeypatch.setattr(runtime, "validate_repacked_matrix", invalid)
+    before = dict(timings)
+    with pytest.raises(ValueError, match="Payload rejected"):
+        artifact.load_expert(0, 1, "gate_up", timings=timings)
+    assert timings == before
+
+
+def test_cpu_benchmark_replays_old_check_without_mutating_payload(tmp_path):
+    from tools.benchmark_vq2a8_host_load import benchmark_projection
+
+    artifact, config = _write_artifact(tmp_path)
+    runtime = open_vq2a8_tp1_artifact(artifact, config)
+    report = benchmark_projection(runtime, 0, 1, "down", 3)
+    assert report["payload_unchanged"]
+    assert all(len(samples) == 3 for samples in report["validation_samples_s"].values())
+
+
 def test_runtime_reader_selected_payload_executes_repacked_reference(tmp_path: Path) -> None:
     artifact_path, config_path = _write_artifact(tmp_path)
     artifact = open_vq2a8_tp1_artifact(artifact_path, config_path)

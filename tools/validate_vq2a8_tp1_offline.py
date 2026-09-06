@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--artifact", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--baseline-report", type=Path, help="Frozen report from the acceptance supervisor.")
     parser.add_argument("--device", choices=["npu:0"], default="npu:0")
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
@@ -65,6 +66,7 @@ def main() -> None:
     from vllm.engine.arg_utils import EngineArgs
 
     from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device, environment_report
+    from tools.vq2a8_baseline import compare_baseline_run, load_baseline
     from vllm_ascend.quantization.vq2a8_offline import (
         OFFLINE_CONTEXT_LIMIT,
         OFFLINE_NEW_TOKENS,
@@ -76,7 +78,13 @@ def main() -> None:
     from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
     from vllm_ascend.quantization.vq2a8_validation import audit_model_storage
 
-    print("ENVIRONMENT " + json.dumps(environment_report()), flush=True)
+    environment = environment_report()
+    print("ENVIRONMENT " + json.dumps(environment), flush=True)
+    previous_runs, previous_logits = None, None
+    if args.baseline_report:
+        print("MODEL stage=baseline_preflight", flush=True)
+        previous_runs, previous_logits = load_baseline(args.baseline_report, environment, model_root, artifact_root)
+        print("BASELINE_PREFLIGHT=PASS INDEPENDENT_REFERENCE=False", flush=True)
     print("MODEL stage=device_init_start", flush=True)
     print("DEVICE " + json.dumps(_initialize_device(torch.device(args.device))), flush=True)
     print("MODEL stage=artifact_and_root_audit", flush=True)
@@ -173,6 +181,14 @@ def main() -> None:
         )
         # Retain every run before checking reproducibility, including failures.
         (output / f"run-{run}.json").write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+        if previous_runs is not None:
+            comparison = compare_baseline_run(previous_runs[run], previous_logits[run], result, logits)
+            (output / f"run-{run}-baseline.json").write_text(json.dumps(comparison, indent=2) + "\n")
+            print("MODEL_BASELINE_RESULT " + json.dumps(comparison), flush=True)
+            if not comparison["baseline_exact"]:
+                raise AssertionError(
+                    "Offline logits/tokens differ from the frozen phase-1 baseline; evidence retained."
+                )
         if baseline_logits is not None:
             if tokens != baseline_tokens or not torch.equal(logits, baseline_logits):
                 print(
@@ -200,6 +216,7 @@ def main() -> None:
                 "layers": len(artifact.layers),
                 "native_fp8_dot": False,
                 "repeat_exact": True,
+                "baseline_exact": True if previous_runs is not None else None,
                 "offline_execution_verified": True,
                 "logits_reference_verified": False,
                 "quality_verified": False,

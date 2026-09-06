@@ -22,8 +22,10 @@ from pathlib import Path
 from typing import Any
 
 try:
+    from tools.vq2a8_baseline import freeze_baseline
     from tools.vq2a8_live_log import LiveChildLog
 except ModuleNotFoundError:  # Direct script invocation without repo PYTHONPATH.
+    from vq2a8_baseline import freeze_baseline
     from vq2a8_live_log import LiveChildLog
 
 _RESULT_PREFIXES = (
@@ -41,6 +43,7 @@ _RESULT_PREFIXES = (
     "MODEL_LOAD_RESULT ",
     "MODEL_RESULT ",
     "MODEL_REPEAT_FAILURE ",
+    "MODEL_BASELINE_RESULT ",
     "MODEL_CACHE_PLAN ",
     "MODEL_MOE_TIMING ",
     "MODEL_FORWARD_TIMING ",
@@ -105,6 +108,13 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                     f"PEAK_ALLOCATED_GIB={latest['peak_allocated_bytes'] / 1024**3:.3f} "
                     f"PEAK_RESERVED_GIB={latest['peak_reserved_bytes'] / 1024**3:.3f}"
                 )
+            if summary.get("baseline_report"):
+                comparisons = [r["data"] for r in result.get("records", []) if r["type"] == "MODEL_BASELINE_RESULT"]
+                exact = len(comparisons) == 2 and all(c.get("baseline_exact") is True for c in comparisons)
+                lines.append(
+                    f"BASELINE_EXACT={'PASS' if exact else 'NOT_PASSED'} "
+                    f"completed={len(comparisons)}/2 INDEPENDENT_REFERENCE=False"
+                )
             if not result.get("passed"):
                 lines.append(
                     f"  exit={result.get('returncode')} timeout={result.get('timed_out', False)} "
@@ -138,6 +148,14 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                 lines.append(
                     "MOE_COMPLETED_TOTAL " + " ".join(f"{key}={sum(t[key] for t in timings):.3f}" for key in fields)
                 )
+                if all("host_read_s" in t and "host_validate_s" in t for t in timings):
+                    lines.append(
+                        "HOST_BREAKDOWN "
+                        + " ".join(
+                            f"{key}={sum(t[key] for t in timings):.3f}" for key in ("host_read_s", "host_validate_s")
+                        )
+                        + " (included_in_host_load_validate_s)"
+                    )
                 lines.append(
                     "CACHE_COMPLETED_TOTAL "
                     + " ".join(
@@ -294,6 +312,11 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=None, help="Seconds per child (default: 1800; model: 3600).")
     parser.add_argument("--output-dir", type=Path, help="New directory; existing paths are refused.")
+    parser.add_argument(
+        "--baseline-report",
+        type=Path,
+        help="Model only: freeze a previous PASS and require exact logits/tokens (not an independent oracle).",
+    )
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument(
         "--execution-policy",
@@ -315,6 +338,8 @@ def main() -> int:
         parser.error("--model is required unless --summarize is used.")
     if args.stage == "expert" and args.execution_policy is not None:
         parser.error("--execution-policy applies to --stage moe/model only.")
+    if args.baseline_report and (args.stage != "model" or args.execution_policy == "baseline"):
+        parser.error("--baseline-report requires the cached model stage.")
     if (
         not math.isfinite(args.cache_budget_gib)
         or args.cache_budget_gib < 0
@@ -355,6 +380,11 @@ def main() -> int:
         output.mkdir(parents=True, exist_ok=False)
     else:
         output = Path(tempfile.mkdtemp(prefix="vq2a8-acceptance-"))
+    frozen_baseline = None
+    if args.baseline_report:
+        frozen_baseline = freeze_baseline(
+            args.baseline_report, output / "baseline", repo, model, artifact, args.physical_npu
+        )
     child_env = acceptance_environment(repo, args.physical_npu, args.device)
     summary: dict[str, Any] = {
         "schema_version": 1,
@@ -370,6 +400,7 @@ def main() -> int:
         "results": [],
         "serving_integration_verified": False,
         "device_kernel_performance_verified": False,
+        "baseline_report": str(frozen_baseline) if frozen_baseline else None,
     }
     summary_path = output / "summary.json"
     short_path = output / "summary.txt"
@@ -443,6 +474,8 @@ def main() -> int:
                 "--cache-reserve-gib",
                 str(args.cache_reserve_gib),
             ]
+            if frozen_baseline:
+                command.extend(["--baseline-report", str(frozen_baseline)])
         if index == 0:
             command.append("--audit-model")
             if args.verify_tensor_hashes:
