@@ -168,13 +168,15 @@ def run_sas_preflight(device, config, prompt_tokens=10):
                 raise ValueError("SAS defined metadata is not exactly repeatable.")
             previous_meta = current_meta
             print(f"SAS_START case={name} repeat={repeat} stage=attention active_fa_cores={active}", flush=True)
+            # Match the production A5 PA_ND call: compute consumes seqused_kv
+            # and the block table. Unlike metadata above, its tiling rejects
+            # cu_seqlens_ori_kv (and cu_seqlens_cmp_kv / ori_sparse_indices).
             result = torch.ops._C_ascend.npu_kv_quant_sparse_attn_sharedkv(
                 q,
                 kv_quant_mode=1,
                 ori_kv=cache,
                 ori_block_table=table,
                 cu_seqlens_q=cuq,
-                cu_seqlens_ori_kv=cuk,
                 seqused_kv=usedk,
                 sinks=sinks,
                 metadata=metadata,

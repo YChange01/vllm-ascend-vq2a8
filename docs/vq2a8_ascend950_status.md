@@ -1186,3 +1186,36 @@ environment, including 124 new real SAS C++ scheduler cases. Ruff check
 and formatting, Markdown lint and `git diff --check` pass. The required
 `bash format.sh ci` was attempted but cannot run without the local
 `pre-commit` dependency; no complete CI or 950 build/run PASS is claimed.
+
+## Phase 3 SAS preflight: separate metadata and compute argument contracts
+
+The user successfully rebuilt `a7e0a7df` (`BUILD_EXIT=0`). The 957d
+28/56 device passed all QLI cases again. SAS prefill completed KV scatter
+and the first metadata validation (10 active FA cores), but attention
+failed during **host tiling**, before device computation:
+`cuSeqLensOriKv is not supported now, it must be nullptr`.
+This is a bug in the new preflight's Python call, not evidence of another
+failed build or a recurrence of the earlier device GM access failure.
+
+The A5 metadata operator accepts `cu_seqlens_ori_kv`; the compute operator
+does not. Its `CheckUnrequiredParaExistence` also rejects
+`cu_seqlens_cmp_kv` and `ori_sparse_indices`, despite their presence in the
+torch schema. The production A5 SWA call already omits these inputs.
+The preflight now matches that call: retain query cumulative lengths,
+`seqused_kv` and the page table, and pass cumulative KV lengths only to
+metadata. Do not weaken the C++ tiling checks or change quantization.
+
+For users who have already rebuilt `a7e0a7df`, this correction is
+**Python-only**: pull the update and rerun the SAS preflight command above
+in a fresh process. No C++ rebuild, cache clearing or reinstall is needed.
+Both preflight PASS markers are still required before the full phase-3
+model run. Attention numerics, the prior GM fault's resolution and full
+phase-3 execution remain unverified until those NPU runs complete.
+
+Regression tests check the forbidden compute inputs, retained metadata
+lengths, and parity with the production A5 SWA keyword set/base settings.
+Two tests fail against the old script, reproducing the argument mismatch
+on the host without claiming to simulate CANN tiling.
+After the Python fix, all 661 VQ2A8 tests pass in the existing NVIDIA/host
+environment. Ruff, Markdown lint and `git diff --check` pass; the required
+`bash format.sh ci` remains blocked by missing local `pre-commit`.
