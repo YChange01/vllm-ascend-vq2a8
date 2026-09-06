@@ -5,7 +5,8 @@
 
 This supervisor imports no torch/NPU modules. Each expert probe runs in its
 own child process, with full output on disk and a small summary on stdout.
-It does not start vLLM or exercise any experimental Cube implementation.
+Only --stage model starts an offline vLLM instance. No stage starts an HTTP
+server or exercises an experimental Cube implementation.
 """
 
 from __future__ import annotations
@@ -31,6 +32,11 @@ _RESULT_PREFIXES = (
     "CHAIN_RESULT ",
     "ROUTER_RESULT ",
     "MOE_RESULT ",
+    "MODEL_PLAN ",
+    "MODEL_LOAD_RESULT ",
+    "MODEL_RESULT ",
+    "MODEL_REPEAT_FAILURE ",
+    "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS ",
     "VQ2A8_TP1_MOE_GATE=PASS ",
     "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS ",
 )
@@ -53,6 +59,8 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
     ]
     if summary.get("stage") == "moe":
         lines.insert(1, "STAGE=MOE_STANDALONE")
+    elif summary.get("stage") == "model":
+        lines.insert(1, "STAGE=MODEL_OFFLINE_EXECUTION")
     records = [record for result in results for record in result.get("records", [])]
     environment = next((r["data"] for r in records if r["type"] == "ENVIRONMENT"), {})
     git = environment.get("git", {})
@@ -69,6 +77,32 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
         return f"{max(values):.6g}"
 
     for result in results:
+        if summary.get("stage") == "model":
+            runs = [r["data"] for r in result.get("records", []) if r["type"] == "MODEL_RESULT"]
+            gate = next(
+                (r["data"] for r in result.get("records", []) if r["type"] == "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS"),
+                {},
+            )
+            latest = runs[-1] if runs else {}
+            lines.append(
+                f"PROBE={result.get('probe', '?')} {'PASS' if result.get('passed') is True else 'FAIL'} "
+                f"runs={len(runs)} layers={latest.get('layers_executed', '?')} "
+                f"prefill={latest.get('prefill_tokens', '?')} decode={latest.get('decode_steps', '?')} "
+                f"finite={latest.get('finite_logits', False)} repeat_exact={gate.get('repeat_exact', False)}"
+            )
+            if runs:
+                lines.append("TOKENS=" + ",".join(map(str, latest["generated_token_ids"])))
+                lines.append(
+                    f"PEAK_ALLOCATED_GIB={latest['peak_allocated_bytes'] / 1024**3:.3f} "
+                    f"PEAK_RESERVED_GIB={latest['peak_reserved_bytes'] / 1024**3:.3f}"
+                )
+            if not result.get("passed"):
+                lines.append(
+                    f"  exit={result.get('returncode')} timeout={result.get('timed_out', False)} "
+                    f"stage={result.get('last_stage', '?')}"
+                )
+                lines.extend("  " + e[:240] for e in result.get("error_excerpt", [])[:2])
+            continue
         comparisons, prepared, kernels, chains, moe_cases = [], [], [], set(), set()
         for record in result.get("records", []):
             kind, data = record["type"], record["data"]
@@ -113,15 +147,22 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
             lines.extend("  " + error.replace("\n", " ")[:240] for error in result.get("error_excerpt", [])[:2])
 
     gates = [
-        r["data"] for r in records if r["type"] in ("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "VQ2A8_TP1_MOE_GATE=PASS")
+        r["data"]
+        for r in records
+        if r["type"]
+        in ("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "VQ2A8_TP1_MOE_GATE=PASS", "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS")
     ]
     modes = sorted({str(g.get("native_fp8_dot", "unknown")) for g in gates})
     lines.append("NATIVE_FP8_DOT=" + (",".join(modes) if modes else "unknown"))
+    if summary.get("stage") == "model":
+        lines.extend(["LOGITS_REFERENCE_VERIFIED=False", "QUALITY_VERIFIED=False"])
     lines.append(f"SERVING_VERIFIED={summary.get('serving_integration_verified', False)}")
     return "\n".join(lines) + "\n"
 
 
-def summarize_log(path: Path, returncode: int | None, *, timed_out: bool = False) -> dict[str, Any]:
+def summarize_log(
+    path: Path, returncode: int | None, *, timed_out: bool = False, expected_pass: str | None = None
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "passed": False,
         "returncode": returncode,
@@ -134,7 +175,7 @@ def summarize_log(path: Path, returncode: int | None, *, timed_out: bool = False
     saw_pass = False
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
-            if line.startswith(("KERNEL ", "CHAIN ", "MOE ")):
+            if line.startswith(("KERNEL ", "CHAIN ", "MOE ", "MODEL ")):
                 result["last_stage"] = line.strip()
             for prefix in _RESULT_PREFIXES:
                 if line.startswith(prefix):
@@ -143,7 +184,7 @@ def summarize_log(path: Path, returncode: int | None, *, timed_out: bool = False
                     except json.JSONDecodeError:
                         continue
                     result["records"].append({"type": prefix.strip(), "data": record})
-                    saw_pass |= prefix.endswith("=PASS ")
+                    saw_pass |= prefix.endswith("=PASS ") and (expected_pass is None or prefix.strip() == expected_pass)
                     break
             if len(result["error_excerpt"]) < 12 and any(
                 marker in line for marker in ("what():", "errorStr:", "Error:", "Assertion", "error code", "error:")
@@ -181,7 +222,7 @@ def main() -> int:
     parser.add_argument("--summarize", type=Path, help="Print a short existing summary.json report; no device access.")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--artifact", type=Path)
-    parser.add_argument("--stage", choices=["expert", "moe"], default="expert")
+    parser.add_argument("--stage", choices=["expert", "moe", "model"], default="expert")
     parser.add_argument("--layers", default="0,3", help="MoE stage layer IDs.")
     parser.add_argument("--token-counts", type=int, nargs="+", default=[1, 3], help="MoE stage token counts.")
     parser.add_argument("--physical-npu", type=int, default=4)
@@ -195,7 +236,7 @@ def main() -> int:
     )
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--timeout", type=int, default=1800, help="Seconds per isolated expert probe.")
+    parser.add_argument("--timeout", type=int, default=None, help="Seconds per child (default: 1800; model: 3600).")
     parser.add_argument("--output-dir", type=Path, help="New directory; existing paths are refused.")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument(
@@ -210,6 +251,12 @@ def main() -> int:
         parser.error("--model is required unless --summarize is used.")
     if args.cases is None:
         args.cases = ["deterministic", "zero"] if args.stage == "moe" else ["deterministic", "zero", "impulse", "small"]
+    if args.timeout is None:
+        args.timeout = 3600 if args.stage == "model" else 1800
+    if args.stage == "model":
+        if args.allow_partial_artifact or args.device != "npu:0":
+            parser.error("Model stage requires a complete artifact and logical npu:0.")
+        args.cases = ["short_prefill_decode_repeat"]
     if args.physical_npu < 0 or args.warmups < 0 or args.repeats < 1 or args.timeout < 1:
         parser.error("Invalid physical NPU, warmup, repeat or timeout value.")
     probes = args.probes.split(",")
@@ -224,6 +271,8 @@ def main() -> int:
         if any(count < 1 for count in args.token_counts):
             parser.error("MoE token counts must be positive.")
         probes = [f"layer{layer}" for layer in layers]
+    elif args.stage == "model":
+        probes = ["full_model"]
     repo = Path(__file__).resolve().parents[1]
     model = args.model.resolve(strict=True)
     artifact = (args.artifact or model / "experts_vq_ascend_v2").resolve(strict=True)
@@ -299,6 +348,19 @@ def main() -> int:
                 "--repeats",
                 str(args.repeats),
             ]
+        elif args.stage == "model":
+            command = [
+                sys.executable,
+                str(repo / "tools/validate_vq2a8_tp1_offline.py"),
+                "--model",
+                str(model),
+                "--artifact",
+                str(artifact),
+                "--device",
+                args.device,
+                "--output-dir",
+                str(output / "model-evidence"),
+            ]
         if index == 0:
             command.append("--audit-model")
             if args.verify_tensor_hashes:
@@ -325,7 +387,12 @@ def main() -> int:
         except OSError as error:
             with log.open("a", encoding="utf-8") as stream:
                 stream.write(f"SupervisorError: {error}\n")
-        result = summarize_log(log, returncode, timed_out=timed_out)
+        result = summarize_log(
+            log,
+            returncode,
+            timed_out=timed_out,
+            expected_pass="VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS" if args.stage == "model" else None,
+        )
         result["probe"] = probe
         result["command"] = command
         summary["results"].append(result)

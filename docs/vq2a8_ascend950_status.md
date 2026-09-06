@@ -21,8 +21,9 @@ probes, four input cases each, chained projections and at least three exact
 repeats. It reported Git `bb3b4fcaea39d32cb3d178e08e4918eaf4c4a795` with a
 dirty worktree. Preserve the full report's source hashes/status: that result
 must not be attributed to the clean commit alone. Native FP8 dot and serving
-remained false. The next stage is standalone MoE acceptance, described below;
-it does not register a serving backend or change the accepted Vector kernel.
+remained false. Standalone MoE acceptance has subsequently passed on the
+user's NPU as recorded below. The next stage is bounded offline model
+execution, not a serving backend or a change to the accepted Vector kernel.
 
 The CPU reference/repack tests and CUDA kernel tests exercise different code
 from the Ascend-specific JIT body. Their success cannot certify NPU lowering.
@@ -282,15 +283,14 @@ token generation. Continue to retain the earlier large-input discrepancy.
 
 1. Preserve the user-reported expanded expert acceptance and dirty-worktree
    provenance; do not discard successful artifacts or rerun repack.
-2. Run the standalone TP1 MoE stage on Ascend. CPU/CUDA implementation
-   checks are complete for the default cases, but the new NPU route/mix/shared
-   operations still require hardware acceptance.
-3. Register the quantization/loader integration without dense placeholders.
-   Verify all weights loaded, layerwise outputs and peak HBM on a short
-   offline prefill/decode, then validate logits/tokens against a known-good
-   execution of this checkpoint.
-4. Start serving only after the offline model gate passes. Run repeated
-   prompts and mixed lengths, then establish a quality/performance baseline.
+2. Preserve the completed standalone TP1 MoE NPU acceptance below.
+3. Run the opt-in offline execution gate. Verify strict root loading,
+   every layer, prefill/decode steps, finite logits and peak HBM. Then compare
+   logits/tokens against a known-good execution of this checkpoint; repeat
+   consistency alone cannot establish numerical correctness.
+4. Start serving only after offline execution and independent numerical
+   validation pass. Run repeated prompts and mixed lengths, then establish
+   a quality/performance baseline.
 5. Optimize decode lookup and activation preparation; evaluate minimal
    native FP8 Cube primitives independently before changing the accepted
    Vector kernel. TP4 is a later milestone with separate routing/reduction
@@ -300,3 +300,90 @@ The available eager preparation rebuilds/transfers a Hadamard matrix and
 performs finite checks that synchronize. It remains a reference path, not
 the final serving hot path. Optimize it with explicit preparation/cache
 ownership after integration correctness has been established.
+
+## User-run standalone MoE acceptance
+
+The user reported `ACCEPTANCE=PASS completed=2/2 passed=2` at
+`0f2e5bd0b8adb7c62c3b8df26f30c34bf2323de4`, with a dirty worktree. The report
+directory was `/tmp/vq2a8-acceptance-k7x2t_ia`. Each layer passed deterministic
+and zero cases at M=1/M=3, routing and chunk comparisons, and at least three
+exact repeats. Layer 0 maximum absolute/relative-L2 errors were 0.0625 and
+0.00389557; layer 3 errors were 0.0625 and 0.0120408. These are user-supplied
+NPU results, not reruns by the development agent. Source hashes in the full
+report are required to identify the dirty working files precisely.
+
+## Opt-in offline model execution stage
+
+`--stage model` now selects an inheritance adapter under `patch/worker/`.
+The ordinary `DeepseekV4ForCausalLM` registration and construction defaults
+remain unchanged. No model-runner patch, new environment variable, repack
+format, or Vector kernel change is introduced.
+
+The gate supplies an in-memory architecture override and clears HF's root
+quantization config only for this adapter. It does not edit `config.json`.
+Attention, HC, embedding, head and KV-cache execution are inherited from
+the Ascend implementation. Packed routed experts are explicitly owned by
+the accepted `VQ2TP1MoE` runtime; each layer retains at most two packed
+experts, with two-token chunks. The root shared experts remain BF16.
+This avoids allocating dense placeholders for all routed experts. It is
+an I/O-heavy correctness baseline, not a resident-weight performance design.
+
+The adapter fixes three integration boundaries:
+
+- Pass real input token IDs through the model/decoder to hash MoE layers.
+- Give the accepted MoE sole ownership of routing, routed scaling and
+  shared-output addition, without another FusedMoE runner/reduction.
+- Strictly account for every root tensor and registered parameter; reject
+  missing, duplicate, unknown, non-finite and shape/dtype-mismatched weights.
+  The only permitted dtype change is exact BF16-to-FP32 widening of A5
+  compressor norm weights, explicitly recorded in the load report. No FP8
+  root conversion is silently performed. MTP weights alone are excluded.
+
+Remote real-checkpoint header inspection and meta-constructor comparison
+accounted for all 1199 non-MTP root tensors: 984 model parameters and 215
+delegated router/shared tensors. All parameter names/shapes matched;
+62 compressor norm tensors require the documented widening. This test
+substitutes primitive layers/device operations with shape-only stand-ins;
+it does not certify the installed NPU worker, CANN kernels or execution.
+The regression suite passed 247 CPU/unit tests, including real constructor
+dispatch, strict loading, invalid execution modes and gate failure reports.
+
+The NPU command is:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_acceptance.py \
+  --stage model \
+  --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --physical-npu 4 \
+  --timeout 3600
+```
+
+It requires the complete `experts_vq_ascend_v2` artifact. The new stage uses
+one in-process vLLM worker in an isolated supervised child, eager mode,
+disabled compilation/graphs/async scheduling/prefix caching, max sequence
+count 1, context limit 32, and an explicit 1 GiB KV allocation. Profiling
+still executes; it is never reported as actual generation. The existing
+vLLM multiprocessing control is disabled only inside this diagnostic child.
+The worker control API is documented in
+[vLLM collective_rpc](https://docs.vllm.ai/en/stable/api/vllm/entrypoints/llm/).
+
+Two identical greedy requests each generate four tokens. Acceptance
+requires all 43 MoE layers once per forward, a real multi-token prefill,
+three sequential decode steps, finite full-vocabulary logits, agreement
+between greedy sampled tokens and logits, and exact token/logit repetition.
+An attention call without real metadata cannot count as a generation step.
+Exact-repeat failure is retained without relaxing tolerances. Full logits
+and per-run details are saved under `model-evidence/`; the short report
+prints stage, run/layer counts, token IDs and allocated/reserved peaks.
+The default one-hour child timeout can be raised explicitly for this slow
+baseline; it is not a throughput requirement.
+
+The stage is deliberately labelled `MODEL_OFFLINE_EXECUTION`. Even a PASS
+keeps `NATIVE_FP8_DOT=False`, `LOGITS_REFERENCE_VERIFIED=False`,
+`QUALITY_VERIFIED=False` and `SERVING_VERIFIED=False`. It does not cover a
+128-token compressor boundary, long contexts, multiple requests, all expert
+routes or comparison with independent full-model logits. Those are later
+gates. No NPU full-model execution has yet been performed by this workflow;
+the disconnected Ascend host must return this new hardware result.

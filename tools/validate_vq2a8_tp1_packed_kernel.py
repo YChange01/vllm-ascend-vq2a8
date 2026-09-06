@@ -118,9 +118,17 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_reference.py",
         "vq2a8_runtime.py",
         "vq2a8_moe.py",
+        "vq2a8_offline.py",
     ):
         source = repo / "vllm_ascend/quantization" / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+    for name in (
+        "vllm_ascend/models/deepseek_v4.py",
+        "vllm_ascend/patch/worker/vq2a8_offline_model.py",
+        "tools/validate_vq2a8_tp1_offline.py",
+        "tools/validate_vq2a8_tp1_acceptance.py",
+    ):
+        source_hashes[name] = hashlib.sha256((repo / name).read_bytes()).hexdigest()
     return {
         "python": sys.executable,
         "repo": str(repo),
