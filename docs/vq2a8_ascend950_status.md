@@ -148,7 +148,21 @@ Each child has isolated visible-device/rank environment variables. Full
 output goes to a new temporary directory. The supervisor survives a child
 SIGABRT, records the stage and exit code, and stops after the first failed
 probe. `summary.json` explicitly distinguishes expert acceptance from
-serving readiness. Return that report; full logs remain available beside it.
+serving readiness. Return the short `summary.txt` report; the full JSON and
+logs remain available beside it. The short report is also printed on exit.
+
+An existing long JSON report can be summarized without accessing the NPU,
+rerunning tests or changing the original file:
+
+```bash
+python3 tools/validate_vq2a8_tp1_acceptance.py \
+  --summarize /tmp/vq2a8-acceptance-REPLACE/summary.json
+```
+
+The short report includes run revision, input cases, one line per probe,
+maximum absolute/relative-L2 errors, same-FP8-input error, checked repeats
+and native-FP8/serving status. Failed probes retain a bounded error excerpt.
+
 Add `--cases deterministic zero impulse small large` for magnitude stress.
 An existing `--output-dir` is refused so earlier evidence is preserved.
 

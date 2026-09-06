@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,8 +14,9 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tools import validate_vq2a8_tp1_acceptance as acceptance
 from tools import validate_vq2a8_tp1_packed_kernel as gate
-from tools.validate_vq2a8_tp1_acceptance import acceptance_environment, summarize_log
+from tools.validate_vq2a8_tp1_acceptance import acceptance_environment, format_compact_summary, summarize_log
 from vllm_ascend.quantization.vq2a8_reference import deepseek_v4_swiglu_reference
 from vllm_ascend.quantization.vq2a8_validation import audit_model_storage, validate_tolerances
 
@@ -155,3 +158,113 @@ def test_supervisor_keeps_numerical_failure_and_prepared_input_evidence(tmp_path
     result = summarize_log(log, 1)
     assert not result["passed"]
     assert [record["type"] for record in result["records"]] == ["PREPARED_INPUT_RESULT", "NUMERIC_FAILURE"]
+
+
+def _report_fixture() -> dict:
+    probes = ["0:0", "1:0", "2:0", "3:0", "3:127", "3:255", "42:255"]
+    comparison = {"max_abs_error": 0.015625, "relative_l2_error": 0.0002}
+    records = [
+        {"type": "ENVIRONMENT", "data": {"git": {"head": "bb3b4fca", "status": ""}}},
+        {
+            "type": "CHAIN_RESULT",
+            "data": {
+                "case": "zero",
+                "comparison": comparison,
+                "same_prepared_input_comparison": comparison,
+                "determinism": {"allclose": True},
+                "repeats_checked": 3,
+            },
+        },
+        {"type": "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "data": {"native_fp8_dot": False}},
+    ]
+    return {
+        "status": "passed",
+        "probes": probes,
+        "cases": ["zero"],
+        "device": "npu:0",
+        "physical_npu": 4,
+        "results": [{"probe": p, "passed": True, "records": records} for p in probes],
+    }
+
+
+def test_short_report_is_copyable_and_preserves_numeric_limits() -> None:
+    text = format_compact_summary(_report_fixture())
+    assert len(text) < 2500
+    assert len(text.splitlines()) == 13
+    assert "completed=7/7 passed=7" in text
+    assert "RUN_GIT=bb3b4fca" in text
+    assert "PROBE=42:255 PASS chain_cases=1 abs=0.015625 rel_l2=0.0002" in text
+    assert "same_fp8_abs=0.015625 repeat_min=3 det=PASS" in text
+    assert "NATIVE_FP8_DOT=False" in text
+    assert "SERVING_VERIFIED=False" in text
+
+
+def test_short_report_preserves_abort_and_truncates_error_text() -> None:
+    report = _report_fixture()
+    report.update(
+        status="failed",
+        results=[
+            {
+                "probe": "0:0",
+                "passed": False,
+                "returncode": -6,
+                "last_stage": "KERNEL 0:0",
+                "error_excerpt": ["MTE error " * 1000],
+            }
+        ],
+    )
+    text = format_compact_summary(report)
+    assert "ACCEPTANCE=FAIL completed=1/7 passed=0" in text
+    assert "exit=-6" in text and "stage=KERNEL 0:0" in text and "MTE error" in text
+    assert "abs=?" in text and "det=UNKNOWN_OR_FAIL" in text
+    assert len(text) < 1000
+
+
+def test_short_report_cannot_mark_partial_results_all_pass() -> None:
+    report = _report_fixture()
+    report["results"].pop()
+    assert "ACCEPTANCE=INCOMPLETE completed=6/7" in format_compact_summary(report)
+
+
+def test_summarize_cli_reads_old_report_without_model_or_device(tmp_path) -> None:
+    path = tmp_path / "summary.json"
+    original = json.dumps(_report_fixture())
+    path.write_text(original)
+    result = subprocess.run(
+        [sys.executable, str(Path(acceptance.__file__).resolve()), "--summarize", str(path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "ACCEPTANCE=PASS completed=7/7" in result.stdout
+    assert path.read_text() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_new_acceptance_run_writes_both_reports(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "report"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acceptance",
+            "--model",
+            str(tmp_path),
+            "--artifact",
+            str(tmp_path),
+            "--probes",
+            "0:0",
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    def child(*args, **kwargs):
+        kwargs["stdout"].write("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS {}\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(acceptance.subprocess, "run", child)
+    assert acceptance.main() == 0
+    assert json.loads((output / "summary.json").read_text())["status"] == "passed"
+    assert "ACCEPTANCE=PASS completed=1/1" in (output / "summary.txt").read_text()
