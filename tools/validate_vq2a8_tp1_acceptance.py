@@ -29,6 +29,9 @@ _RESULT_PREFIXES = (
     "NUMERIC_FAILURE ",
     "KERNEL_RESULT ",
     "CHAIN_RESULT ",
+    "ROUTER_RESULT ",
+    "MOE_RESULT ",
+    "VQ2A8_TP1_MOE_GATE=PASS ",
     "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS ",
 )
 
@@ -48,6 +51,8 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
         f"DEVICE={summary.get('device', '?')} PHYSICAL_NPU={summary.get('physical_npu', '?')}",
         "CASES=" + ",".join(summary.get("cases", [])),
     ]
+    if summary.get("stage") == "moe":
+        lines.insert(1, "STAGE=MOE_STANDALONE")
     records = [record for result in results for record in result.get("records", [])]
     environment = next((r["data"] for r in records if r["type"] == "ENVIRONMENT"), {})
     git = environment.get("git", {})
@@ -64,27 +69,39 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
         return f"{max(values):.6g}"
 
     for result in results:
-        comparisons, prepared, kernels, chains = [], [], [], set()
+        comparisons, prepared, kernels, chains, moe_cases = [], [], [], set(), set()
         for record in result.get("records", []):
             kind, data = record["type"], record["data"]
-            if kind in ("KERNEL_RESULT", "CHAIN_RESULT"):
+            if kind in ("KERNEL_RESULT", "CHAIN_RESULT", "MOE_RESULT"):
                 kernels.append(data)
                 comparisons.extend(data[key] for key in ("comparison", "swiglu") if key in data)
                 if "same_prepared_input_comparison" in data:
                     prepared.append(data["same_prepared_input_comparison"])
             if kind == "CHAIN_RESULT":
                 chains.add(data.get("case", "unknown"))
+            elif kind == "MOE_RESULT":
+                moe_cases.add(data.get("case", "unknown"))
             elif kind == "PREPARED_INPUT_RESULT":
                 prepared.append(data["comparison"])
             elif kind == "NUMERIC_FAILURE":
                 comparisons.append(data)
         deterministic = bool(kernels) and all(k.get("determinism", {}).get("allclose") is True for k in kernels)
         repeat_counts = [k["repeats_checked"] for k in kernels if "repeats_checked" in k]
+        case_count = f"moe_cases={len(moe_cases)}" if summary.get("stage") == "moe" else f"chain_cases={len(chains)}"
+        if summary.get("stage") == "moe":
+            route_ok = bool(kernels) and all(k.get("router_comparison", {}).get("allclose") is True for k in kernels)
+            chunk_ok = bool(kernels) and all(
+                k.get("token_chunk_comparison", {}).get("allclose") is True for k in kernels
+            )
+            extra = f"router={'PASS' if route_ok else '?'} chunks={'PASS' if chunk_ok else '?'} "
+        else:
+            extra = f"same_fp8_abs={max_metric(prepared, 'max_abs_error')} "
         lines.append(
             f"PROBE={result.get('probe', '?')} {'PASS' if result.get('passed') is True else 'FAIL'} "
-            f"chain_cases={len(chains)} abs={max_metric(comparisons, 'max_abs_error')} "
+            f"{case_count} "
+            f"abs={max_metric(comparisons, 'max_abs_error')} "
             f"rel_l2={max_metric(comparisons, 'relative_l2_error')} "
-            f"same_fp8_abs={max_metric(prepared, 'max_abs_error')} "
+            f"{extra}"
             f"repeat_min={min(repeat_counts) if repeat_counts else '?'} "
             f"det={'PASS' if deterministic else 'UNKNOWN_OR_FAIL'}"
         )
@@ -95,7 +112,9 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
             )
             lines.extend("  " + error.replace("\n", " ")[:240] for error in result.get("error_excerpt", [])[:2])
 
-    gates = [r["data"] for r in records if r["type"] == "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS"]
+    gates = [
+        r["data"] for r in records if r["type"] in ("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "VQ2A8_TP1_MOE_GATE=PASS")
+    ]
     modes = sorted({str(g.get("native_fp8_dot", "unknown")) for g in gates})
     lines.append("NATIVE_FP8_DOT=" + (",".join(modes) if modes else "unknown"))
     lines.append(f"SERVING_VERIFIED={summary.get('serving_integration_verified', False)}")
@@ -115,7 +134,7 @@ def summarize_log(path: Path, returncode: int | None, *, timed_out: bool = False
     saw_pass = False
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
-            if line.startswith(("KERNEL ", "CHAIN ")):
+            if line.startswith(("KERNEL ", "CHAIN ", "MOE ")):
                 result["last_stage"] = line.strip()
             for prefix in _RESULT_PREFIXES:
                 if line.startswith(prefix):
@@ -162,6 +181,9 @@ def main() -> int:
     parser.add_argument("--summarize", type=Path, help="Print a short existing summary.json report; no device access.")
     parser.add_argument("--model", type=Path)
     parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--stage", choices=["expert", "moe"], default="expert")
+    parser.add_argument("--layers", default="0,3", help="MoE stage layer IDs.")
+    parser.add_argument("--token-counts", type=int, nargs="+", default=[1, 3], help="MoE stage token counts.")
     parser.add_argument("--physical-npu", type=int, default=4)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--probes", default="0:0,1:0,2:0,3:0,3:127,3:255,42:255")
@@ -169,7 +191,7 @@ def main() -> int:
         "--cases",
         nargs="+",
         choices=["deterministic", "zero", "impulse", "small", "large"],
-        default=["deterministic", "zero", "impulse", "small"],
+        default=None,
     )
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
@@ -186,6 +208,8 @@ def main() -> int:
         return 0
     if args.model is None:
         parser.error("--model is required unless --summarize is used.")
+    if args.cases is None:
+        args.cases = ["deterministic", "zero"] if args.stage == "moe" else ["deterministic", "zero", "impulse", "small"]
     if args.physical_npu < 0 or args.warmups < 0 or args.repeats < 1 or args.timeout < 1:
         parser.error("Invalid physical NPU, warmup, repeat or timeout value.")
     probes = args.probes.split(",")
@@ -193,6 +217,13 @@ def main() -> int:
         len(probe.split(":")) != 2 or not all(part.isdigit() for part in probe.split(":")) for probe in probes
     ):
         parser.error("Probes must be unique layer:expert pairs.")
+    if args.stage == "moe":
+        layers = args.layers.split(",")
+        if not all(layer.isdigit() for layer in layers) or len(set(layers)) != len(layers):
+            parser.error("MoE layers must be unique non-negative integers.")
+        if any(count < 1 for count in args.token_counts):
+            parser.error("MoE token counts must be positive.")
+        probes = [f"layer{layer}" for layer in layers]
     repo = Path(__file__).resolve().parents[1]
     model = args.model.resolve(strict=True)
     artifact = (args.artifact or model / "experts_vq_ascend_v2").resolve(strict=True)
@@ -204,6 +235,7 @@ def main() -> int:
     child_env = acceptance_environment(repo, args.physical_npu, args.device)
     summary: dict[str, Any] = {
         "schema_version": 1,
+        "stage": args.stage,
         "status": "running",
         "device": args.device,
         "physical_npu": args.physical_npu if args.device.startswith("npu") else None,
@@ -246,6 +278,27 @@ def main() -> int:
             "--repeats",
             str(args.repeats),
         ]
+        if args.stage == "moe":
+            command = [
+                sys.executable,
+                str(repo / "tools/validate_vq2a8_tp1_moe.py"),
+                "--model",
+                str(model),
+                "--artifact",
+                str(artifact),
+                "--device",
+                args.device,
+                "--layer",
+                probe.removeprefix("layer"),
+                "--token-counts",
+                *map(str, args.token_counts),
+                "--cases",
+                *args.cases,
+                "--warmups",
+                str(args.warmups),
+                "--repeats",
+                str(args.repeats),
+            ]
         if index == 0:
             command.append("--audit-model")
             if args.verify_tensor_hashes:

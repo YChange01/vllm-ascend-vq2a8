@@ -13,7 +13,16 @@ smoke for layer 0, expert 0, separate gate_up and down projections. Both
 matched the CPU oracle within tolerance and the one repeated result matched
 exactly. This is an M=1 packed Vector baseline. The branch does not yet
 register a VQ2A8 serving quantization method. TP4, prefill batching, MoE
-routing, complete decoder execution and full-model quality remain unverified.
+routing, complete decoder execution and full-model quality were unverified
+at that smoke milestone.
+
+The subsequent user-run expanded acceptance reported 7/7 passing expert
+probes, four input cases each, chained projections and at least three exact
+repeats. It reported Git `bb3b4fcaea39d32cb3d178e08e4918eaf4c4a795` with a
+dirty worktree. Preserve the full report's source hashes/status: that result
+must not be attributed to the clean commit alone. Native FP8 dot and serving
+remained false. The next stage is standalone MoE acceptance, described below;
+it does not register a serving backend or change the accepted Vector kernel.
 
 The CPU reference/repack tests and CUDA kernel tests exercise different code
 from the Ascend-specific JIT body. Their success cannot certify NPU lowering.
@@ -201,15 +210,81 @@ do not justify either changing the artifact or claiming full-model accuracy.
   The repository-wide `bash format.sh ci` could not run its hooks because
   `pre-commit` was absent in the available test environment.
 - No new NPU execution or full-model serving test was performed. The user
-  host must run the expanded acceptance before that boundary can advance.
+  subsequently supplied the expanded expert acceptance recorded above.
+
+## Standalone TP1 MoE stage
+
+`vq2a8_moe.py` adds an isolated eager MoE layer, not a model-runner patch:
+
+- Load real root checkpoint router/shared weights and packed expert slices.
+  `gate.bias` is the routing selection correction, not a linear-layer bias.
+- Use FP32 sqrt-softplus scores; non-hash top-k selects by corrected scores
+  with lowest-ID tie breaking, but weights use the original scores. Hash
+  routing requires token IDs and retains repeated expert IDs.
+- Give `mix_vq2a8_routes` sole ownership of routed scaling. Its input weights
+  are unscaled; shared output is added once without routed scaling. This is
+  an explicit standalone contract, not a drop-in replacement for a router
+  that already scales its weights. Upstream integration must preserve the
+  chosen rounding boundaries as well as the algebra.
+- Evaluate each unique (token, expert) once, retain every top-k slot in FP32
+  weighting/reduction, and use the accepted packed M=1 kernel for each row.
+  Larger token batches are processed in bounded chunks. Grouped top-k and
+  TP sizes other than one are rejected rather than silently approximated.
+- Keep only a configurable LRU set of packed experts on the device. No
+  dense routed-expert weights are materialized on NPU/CUDA; shared weights
+  remain dense BF16. CPU-only dense decoding supplies the numeric oracle.
+
+The gate defaults to layers 0 and 3, deterministic/zero inputs, M=1 and M=3,
+a two-token chunk, a two-expert cache and three checked repeats. It compares
+router IDs exactly, router weights numerically, full routed-plus-shared
+outputs against CPU, and chunked output against individual-token calls.
+Input amplitudes match the expert gate's cases without additional rescaling.
+Repeat comparisons are exact. The gate records packed-cache bytes and
+device allocated/reserved peaks, not a full-model memory estimate.
+
+On the remote NVIDIA host, both real layers passed all four default cases.
+The maximum relative-L2 output errors were about 0.00499 (layer 0) and
+0.00488 (layer 3). The cache held at most two experts; layer 0 needed one.
+These runs used synchronized working files in the remote test staging area,
+whose Git HEAD is older and whose worktree is dirty; their reports retain
+source hashes. They are CPU/CUDA evidence, not Ascend or serving acceptance.
+
+The MoE stage regression run passed 188 CPU/unit tests across the artifact,
+reference, repack, runtime, packed kernel contract, validation and MoE test
+files. Added checks include duplicate slot accumulation, shared-output and
+cache contracts, invalid router options, unchanged test input amplitude,
+every repeat, and the isolated MoE supervisor's short/failure reports.
+Ruff and Markdown checks passed; the repository-wide format script remains
+unavailable because the test environment has no `pre-commit` installation.
+
+Run the new stage on the disconnected Ascend host without repacking:
+
+```bash
+python3 tools/validate_vq2a8_tp1_acceptance.py \
+  --stage moe \
+  --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 \
+  --physical-npu 4
+```
+
+Each layer runs in its own child process. The same short-report mechanism
+prints one line per layer, including `moe_cases`, router/chunk checks,
+output errors and repeat status; return `summary.txt`. Detailed root IDs,
+weights, memory and failure context stay in `summary.json` and child logs.
+On NPU, `NATIVE_FP8_DOT=False` and `SERVING_VERIFIED=False` remain expected.
+
+Host routing plans, per-row launches, synchronous validation, eager RHT and
+cache-miss disk/device copies are deliberate bring-up limitations. This
+path is not graph-compatible or throughput-qualified. Passing it does not
+validate attention, actual decoder activations, KV cache, full prefill or
+token generation. Continue to retain the earlier large-input discrepancy.
 
 ## Next acceptance milestones
 
-1. Run the expanded packed expert acceptance on the user host. Keep any
-   failing case, environment and artifact identity together.
-2. Implement a bounded TP1 expert/MoE runtime: M>1 handling, duplicate route
-   accumulation, shared experts, one routed-scale owner and finite outputs.
-   Repeated M=1 calls may establish prefill correctness before optimization.
+1. Preserve the user-reported expanded expert acceptance and dirty-worktree
+   provenance; do not discard successful artifacts or rerun repack.
+2. Run the standalone TP1 MoE stage on Ascend. CPU/CUDA implementation
+   checks are complete for the default cases, but the new NPU route/mix/shared
+   operations still require hardware acceptance.
 3. Register the quantization/loader integration without dense placeholders.
    Verify all weights loaded, layerwise outputs and peak HBM on a short
    offline prefill/decode, then validate logits/tokens against a known-good

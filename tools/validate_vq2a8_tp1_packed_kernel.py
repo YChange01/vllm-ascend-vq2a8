@@ -112,7 +112,13 @@ def environment_report() -> dict[str, Any]:
     except (OSError, subprocess.TimeoutExpired) as error:
         git_identity["error"] = str(error)
     source_hashes = {}
-    for name in ("vq2a8_triton.py", "vq2a8_kernel_contract.py", "vq2a8_reference.py", "vq2a8_runtime.py"):
+    for name in (
+        "vq2a8_triton.py",
+        "vq2a8_kernel_contract.py",
+        "vq2a8_reference.py",
+        "vq2a8_runtime.py",
+        "vq2a8_moe.py",
+    ):
         source = repo / "vllm_ascend/quantization" / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()
     return {
