@@ -759,3 +759,55 @@ retained in `smoke.log`, `roots.log`, `model.log` and model child logs.
 retain details. On a failure, provide the short summary and the first
 error block from the failed step; another full model run is not required
 to diagnose a smoke/real-projection failure.
+
+### Phase-3 Ascend rounding failure and focused correction (2026-09-06)
+
+The user report `/tmp/vq2a8-phase3-ij7h4_0p` stopped in real-root testing at
+`layers.0.attn.wo_a.weight:10:small:g6:activation_bytes`. This is a strict
+activation encoding failure, not a matmul exception, expert kernel failure,
+or completed phase-3 acceptance. Earlier shown grouped outputs and repeats
+passed; the model step was correctly skipped. No repack is needed.
+
+On the accessible developer host, replacing fused inverse-RoPE FMA with
+separate FP32 products/addition reproduces exactly one differing byte at
+group 6, token 6, channel 970:
+
+| Quantity | Fused | Unfused |
+| --- | --- | --- |
+| FP32 input bits | 885522432 | 885522433 |
+| Scale | 1.862645149230957e-9 | same |
+| Scaled value | 200.0 (FP8 midpoint) | 200.00001525878906 |
+| E4M3 byte / decoded value | 116 / 192 | 117 / 208 |
+
+This is a strong rounding fingerprint, **not direct proof of the installed
+NPU kernel's instruction sequence**. The public
+[op-plugin Addcmul implementation](https://github.com/Ascend/op-plugin/blob/master/op_plugin/ops/opapi/AddcmulKernelNpuOpApi.cpp)
+dispatches to `aclnnAddcmul`; its mathematical formula is not a promise
+that every backend has the same single-rounding behavior as the CUDA FMA.
+
+The correction explicitly uses
+[Triton FP32 FMA](https://ascend.github.io/docs/sources/_generated/sources/triton-ascend/triton_api/Math_Ops/fma.html)
+on contiguous vectors, with the partner product rounded by a separate eager
+multiply before kernel launch. This small pure-Vector kernel has no FP8
+loads, Cube, fixpipe, or expert logic. CUDA executes the same new kernel for
+developer validation; CPU keeps the existing reference. CANN FP8 matmul,
+weight/activation quantization recipes, and all acceptance limits remain
+unchanged. No BF16 fallback or tolerance relaxation is introduced.
+
+Both smoke and roots now begin with a weight-free M=10/G=8 regression.
+It checks quantization of **identical CPU-prepared FP32 inputs** separately
+from full inverse RoPE, then all eight groups' FP8 bytes/scales. It also
+prints the old `addcmul` versus explicit-FMA boundary values on the actual
+device. Failed activation checks retain mismatch counts and up to eight
+coordinates with input bits, scales and decoded FP8 values in JSON and
+terminal logs. Byte-space L2 is not a decoded activation norm: for example,
+negative zero has byte 128 but numerical value zero.
+
+The corrected kernel passes the original 112 real-root SM90 operator
+comparisons in `/tmp/vq2a8-phase3-rounding-NdXUDU/cuda-reference.log`.
+The full VQ2A8 test set passes 389 tests, including CUDA FMA broadcast/tail
+checks and the exact midpoint regression; CPU smoke passes 234 checks.
+Original compiled-weight byte differences remain disclosed above; they
+are unrelated to this fix. NPU acceptance of this correction is pending:
+rerun the same one-command phase-3 driver. It still stops before roots/model
+if the new rounding preflight fails, and does not execute phases 2/4/5.

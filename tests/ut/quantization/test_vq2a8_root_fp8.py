@@ -287,3 +287,77 @@ def test_root_operator_progress_updates_heartbeat_stage(tmp_path):
     relay._record_stage("ROOT_FP8 stage=weight_pre")
     relay._record_stage("pare name=wo_a\n")
     assert relay._last_stage == "ROOT_FP8 stage=weight_prepare name=wo_a"
+
+
+def test_inverse_rope_fp8_midpoint_regression_and_bounded_diagnostics():
+    from tools.validate_vq2a8_root_fp8 import activation_mismatch_details, rounding_inputs
+
+    heads, cos, sin = rounding_inputs()
+    expected = inverse_rope_fp32(heads, cos, sin, 448).reshape(10, 8, 4096)
+    r = heads.float()[..., 448:].reshape(10, 64, 32, 2)
+    c, s = (t.reshape(10, 1, 32, 2) for t in (cos, sin))
+    even = r[..., 0] * c[..., 0] + r[..., 1] * s[..., 0]
+    odd = r[..., 1] * c[..., 1] - r[..., 0] * s[..., 1]
+    unfused = torch.cat((heads.float()[..., :448], torch.stack((even, odd), -1).flatten(-2)), -1)
+    unfused = unfused.reshape_as(expected)
+    q, scale = quantize_root_activation(expected[:, 6], "block128")
+    dq, dscale = quantize_root_activation(unfused[:, 6], "block128")
+    diagnostic = activation_mismatch_details(expected[:, 6], unfused[:, 6], q, dq, scale, dscale)
+    assert diagnostic["byte_mismatch_count"] == 1
+    sample = diagnostic["mismatch_samples"][0]
+    assert sample["index"] == [6, 970]
+    assert sample["expected_byte"] == 116 and sample["actual_byte"] == 117
+    assert sample["expected_input_bits"] == 885522432 and sample["actual_input_bits"] == 885522433
+    assert sample["expected_scaled"] == 200.0 and sample["actual_scaled"] > 200.0
+    assert torch.equal(scale, dscale)
+    assert sample["expected_fp8_value"] == 192 and sample["actual_fp8_value"] == 208
+    many = activation_mismatch_details(
+        torch.ones(3, 128),
+        torch.zeros(3, 128),
+        torch.ones(3, 128).to(torch.float8_e4m3fn),
+        torch.zeros(3, 128).to(torch.float8_e4m3fn),
+        torch.ones(3, 1),
+        torch.ones(3, 1),
+    )
+    assert many["byte_mismatch_count"] == 384 and len(many["mismatch_samples"]) == 8
+    json.dumps(diagnostic, allow_nan=False)
+
+
+def test_rounding_probe_requires_exact_inputs_scales_and_fp32_before_weight_gates():
+    from tools.validate_vq2a8_root_fp8 import rounding_probe
+
+    labels = []
+
+    def compare(label, expected, actual, *, exact, details=None):
+        assert exact and torch.equal(expected.float(), actual.float())
+        labels.append(label)
+
+    rounding_probe(compare, torch.device("cpu"))
+    assert len(labels) == 38
+    assert "rounding:small:g6:bytes" in labels and "rounding:zero:inverse_rope_fp32" in labels
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA check, not NPU acceptance")
+@pytest.mark.parametrize("size", [0, 1, 65, 1024, 1025])
+def test_explicit_device_fma_matches_fused_reference_with_broadcast_and_tail(size):
+    from vllm_ascend.quantization.vq2a8_root_fp8_triton import root_fma_fp32
+
+    a = ((torch.arange(size * 6).reshape(size, 6) % 37 - 18).float() / 64)[:, ::2]
+    b = torch.tensor([0.9876543, -0.2345678, 0.9234567])
+    c = a * 0.7654321
+    expected = torch.addcmul(c, a, b)
+    actual = root_fma_fp32(a.cuda(), b.cuda(), c.cuda())
+    assert torch.equal(expected, actual.cpu()) and actual.dtype == torch.float32
+    with pytest.raises(ValueError, match="FP32"):
+        root_fma_fp32(a.cuda().bfloat16(), b.cuda(), c.cuda())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Developer CUDA check, not NPU acceptance")
+def test_explicit_device_inverse_rope_rounding_regression():
+    from tools.validate_vq2a8_root_fp8 import rounding_probe
+
+    def compare(label, expected, actual, *, exact, details=None):
+        assert exact
+        assert torch.equal(expected.float().cpu(), actual.float().cpu()), label
+
+    rounding_probe(compare, torch.device("cuda"))

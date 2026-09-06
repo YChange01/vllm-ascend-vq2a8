@@ -97,14 +97,23 @@ def inverse_rope_fp32(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, nop
     rope_dim = dim - nope_dim
     if cos.shape != sin.shape or tuple(cos.shape) != (tokens, 1, 1, rope_dim):
         raise ValueError("Unexpected Ascend inverse RoPE metadata shape.")
+    if cos.device != x.device or sin.device != x.device:
+        raise ValueError("Inverse RoPE inputs must be on the same device.")
     values = x.float()
     rotary = values[..., nope_dim:].reshape(tokens, x.shape[1], rope_dim // 2, 2)
     c = cos.float().reshape(tokens, 1, rope_dim // 2, 2)
     s = sin.float().reshape(tokens, 1, rope_dim // 2, 2)
-    # Match the fused NVIDIA kernel's FP32 multiply-add order: the partner
-    # product is rounded first, then x*cos + partner is a single addcmul.
-    even = torch.addcmul(rotary[..., 1] * s[..., 0], rotary[..., 0], c[..., 0])
-    odd = torch.addcmul(-(rotary[..., 0] * s[..., 1]), rotary[..., 1], c[..., 1])
+    # addcmul's formula does not guarantee a fused instruction on every
+    # backend. Pin FMA explicitly on accelerators: one FP32 ULP at an FP8
+    # midpoint changes its byte (M=10, small, group=6 is a regression case).
+    if x.device.type in ("npu", "cuda"):
+        from vllm_ascend.quantization.vq2a8_root_fp8_triton import root_fma_fp32
+
+        even = root_fma_fp32(rotary[..., 0], c[..., 0], rotary[..., 1] * s[..., 0])
+        odd = root_fma_fp32(rotary[..., 1], c[..., 1], -(rotary[..., 0] * s[..., 1]))
+    else:
+        even = torch.addcmul(rotary[..., 1] * s[..., 0], rotary[..., 0], c[..., 0])
+        odd = torch.addcmul(-(rotary[..., 0] * s[..., 1]), rotary[..., 1], c[..., 1])
     return torch.cat((values[..., :nope_dim], torch.stack((even, odd), -1).flatten(-2)), -1)
 
 

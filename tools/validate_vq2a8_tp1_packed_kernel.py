@@ -119,6 +119,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_runtime.py",
         "vq2a8_repack.py",
         "vq2a8_root_fp8.py",
+        "vq2a8_root_fp8_triton.py",
         "vq2a8_moe.py",
         "vq2a8_offline.py",
         "vq2a8_execution.py",

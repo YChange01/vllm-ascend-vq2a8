@@ -7,7 +7,121 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+from functools import partial
 from pathlib import Path
+
+
+def activation_mismatch_details(x, dx, qx, dqx, sx, dsx):
+    """Bounded failure evidence; byte deltas are not FP8 numerical errors."""
+    import torch
+
+    qb, dqb = qx.view(torch.uint8).cpu(), dqx.view(torch.uint8).cpu()
+    indices = (qb != dqb).nonzero()
+    x, dx, sx, dsx = (t.float().cpu() for t in (x, dx, sx, dsx))
+    qvalues, dqvalues = qx.float().cpu(), dqx.float().cpu()
+
+    def number(t):
+        value = float(t)
+        return value if math.isfinite(value) else None
+
+    samples = []
+    for row, channel in indices[:8].tolist():
+        block = channel // 128 if sx.shape[1] != 1 else 0
+        samples.append(
+            {
+                "index": [row, channel],
+                "expected_byte": int(qb[row, channel]),
+                "actual_byte": int(dqb[row, channel]),
+                "expected_fp8_value": number(qvalues[row, channel]),
+                "actual_fp8_value": number(dqvalues[row, channel]),
+                "expected_input": number(x[row, channel]),
+                "actual_input": number(dx[row, channel]),
+                "expected_input_bits": int(x[row, channel].view(torch.int32)),
+                "actual_input_bits": int(dx[row, channel].view(torch.int32)),
+                "expected_scale": number(sx[row, block]),
+                "actual_scale": number(dsx[row, block]),
+                "expected_scaled": number(x[row, channel] / sx[row, block]),
+                "actual_scaled": number(dx[row, channel] / dsx[row, block]),
+            }
+        )
+    return {"byte_mismatch_count": len(indices), "mismatch_samples": samples}
+
+
+def rounding_inputs(case="small"):
+    """Weight-free reproduction of M=10, G=8, K=4096, group-6 boundary."""
+    import torch
+
+    x = (((torch.arange(10 * 8 * 4096).reshape(10, 64, 512) * 7) % 61 - 30).float() / 64).bfloat16()
+    if case == "small":
+        x *= 1e-6
+    elif case == "zero":
+        x.zero_()
+    else:
+        raise ValueError("Unknown rounding regression case.")
+    angle = torch.arange(10 * 32).reshape(10, 1, 1, 32).float() / 64
+    return x, angle.cos().repeat_interleave(2, -1), angle.sin().repeat_interleave(2, -1)
+
+
+def rounding_probe(compare, device):
+    """Run before weights; isolate FMA from FP8 cast/scale on identical inputs."""
+    import torch
+
+    from vllm_ascend.quantization.vq2a8_root_fp8 import inverse_rope_fp32, quantize_root_activation
+
+    for case in ("small", "zero"):
+        print(f"ROOT_FP8 stage=rounding_regression case={case} tokens=10 groups=8", flush=True)
+        heads, cos, sin = rounding_inputs(case)
+        expected = inverse_rope_fp32(heads, cos, sin, 448).reshape(10, 8, 4096)
+        actual = inverse_rope_fp32(heads.to(device), cos.to(device), sin.to(device), 448).reshape_as(expected)
+        # Diagnostic only: does this installation's old eager addcmul have
+        # the same rounding fingerprint as two separate multiplies + add?
+        if case == "small":
+            r = heads.to(device).float()[..., 448:].reshape(10, 64, 32, 2)
+            c, s = (t.to(device).reshape(10, 1, 32, 2) for t in (cos, sin))
+            legacy = torch.addcmul(r[..., 1] * s[..., 0], r[..., 0], c[..., 0])
+            unfused = r[..., 0] * c[..., 0] + r[..., 1] * s[..., 0]
+            print(
+                "ROOT_FP8_ROUNDING "
+                + json.dumps(
+                    {
+                        "group": 6,
+                        "index": [6, 970],
+                        "expected_fp32": float(expected[6, 6, 970]),
+                        "explicit_fma_fp32": float(actual[6, 6, 970]),
+                        "legacy_addcmul_fp32": float(legacy[6, 49, 5]),
+                        "unfused_fp32": float(unfused[6, 49, 5]),
+                    }
+                ),
+                flush=True,
+            )
+        # Test quantization without NPU RoPE first, so failure identifies
+        # cast/scale handling separately from the FMA implementation.
+        q, scale = quantize_root_activation(expected[:, 6], "block128")
+        same = expected[:, 6].to(device)
+        dq, dscale = quantize_root_activation(same, "block128")
+        compare(
+            f"rounding:{case}:same_input:bytes",
+            q.view(torch.uint8),
+            dq.view(torch.uint8),
+            exact=True,
+            details=partial(activation_mismatch_details, expected[:, 6], same, q, dq, scale, dscale),
+        )
+        compare(f"rounding:{case}:same_input:scale", scale, dscale, exact=True)
+        compare(f"rounding:{case}:inverse_rope_fp32", expected, actual, exact=True)
+        for group in range(8):
+            q, scale = quantize_root_activation(expected[:, group], "block128")
+            dq, dscale = quantize_root_activation(actual[:, group], "block128")
+            compare(
+                f"rounding:{case}:g{group}:bytes",
+                q.view(torch.uint8),
+                dq.view(torch.uint8),
+                exact=True,
+                details=partial(
+                    activation_mismatch_details, expected[:, group], actual[:, group], q, dq, scale, dscale
+                ),
+            )
+            compare(f"rounding:{case}:g{group}:scale", scale, dscale, exact=True)
 
 
 def main():
@@ -52,7 +166,7 @@ def main():
         print("DEVICE " + json.dumps(_initialize_device(device)), flush=True)
     matmul = root_fp8_matmul_npu if device.type == "npu" else root_fp8_matmul_reference
 
-    def compare(label, expected, actual, *, exact=False):
+    def compare(label, expected, actual, *, exact=False, details=None):
         expected, actual = expected.float().cpu(), actual.float().cpu()
         finite = bool(torch.isfinite(expected).all() and torch.isfinite(actual).all())
         compatible = finite and expected.shape == actual.shape
@@ -78,6 +192,12 @@ def main():
             "actual_shape": list(actual.shape),
             **metrics,
         }
+        if not passed and compatible:
+            indices = (expected != actual).nonzero()
+            result["mismatch_count"] = len(indices)
+            result["first_mismatch_indices"] = indices[:8].tolist()
+            if details is not None:
+                result.update(details())
         report["results"].append(result)
         save()
         print("ROOT_FP8_RESULT " + json.dumps(result), flush=True)
@@ -129,7 +249,13 @@ def main():
                     qx, sx = quantize_root_activation(x[:, group], kind)
                     dqx, dsx = quantize_root_activation(dx[:, group], kind)
                     label = f"{name}:{tokens}:{case}:g{group}"
-                    compare(label + ":activation_bytes", qx.view(torch.uint8), dqx.view(torch.uint8), exact=True)
+                    compare(
+                        label + ":activation_bytes",
+                        qx.view(torch.uint8),
+                        dqx.view(torch.uint8),
+                        exact=True,
+                        details=partial(activation_mismatch_details, x[:, group], dx[:, group], qx, dqx, sx, dsx),
+                    )
                     compare(label + ":activation_scale", sx, dsx, exact=True)
                     scale = sw if kind == "tensor" else sw[group * rank // 128 : (group + 1) * rank // 128]
                     expected_parts.append(
@@ -148,6 +274,7 @@ def main():
                     compare(f"{name}:{tokens}:{case}:repeat{repeat + 1}", actual, execute(), exact=True)
 
     try:
+        rounding_probe(compare, device)
         if args.stage == "smoke":
             for kind in ("tensor", "block128"):
                 w = (((torch.arange(512 * 512).reshape(512, 512) * 3) % 37 - 18).float() / 64).to(torch.bfloat16)
