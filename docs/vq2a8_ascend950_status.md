@@ -1272,3 +1272,52 @@ All 663 VQ2A8 development tests pass on the existing NVIDIA/host system,
 including candidate numerical, batch/chunk and repeat checks. Ruff,
 Markdown lint and `git diff --check` pass. Required `bash format.sh ci`
 was attempted but remains blocked by missing local `pre-commit`.
+
+## Phase 4: preserve the typed codebook pointer through memory-scope inference
+
+At `6b929739`, the user's `/tmp/vq2a8-phase4-cawreadd/lookup.log`
+shows that the FP32 gather source passed the frontend. Compilation then
+failed in `InferHIVMMemScope`, before device execution. The diagnostic
+tail identifies the offending operation, not an allocation-size error:
+
+```text
+'func.func' op Failed to propagate memory scope for argument #6
+'builtin.unrealized_conversion_cast' op Unsupported user for root alloc op.
+```
+
+The dumped entry function's argument #6 is the FP8 codebook pointer.
+Casting it to a uint8 pointer leaves an unrealized memref conversion
+that this A5 memory-scope pass rejects. Change the candidate to the
+accepted Ascend kernel's loading pattern: load from the typed FP8
+pointer first, bitcast the loaded values to uint8, then numerically
+convert those byte values to the supported FP32 gather carrier.
+The masked-load fallback is floating-point zero, avoiding an unsupported
+int32-to-FP8 cast in the development frontend. FP8 encodings, codebook
+layout, integer indices, K=512 reduction and output arithmetic are unchanged.
+No compiler flags, accepted model backend, C++ operators or gate tolerances
+are changed. The earlier int32 gather source must not be restored.
+
+The phase-4 driver also retains a bounded, deduplicated diagnostic excerpt
+in each failed step's JSON and short report, with the full log path. It
+reads the existing log after child exit; it neither truncates the original
+IR dump nor reruns a failed kernel. PASS still requires the original
+complete numerical, coverage and execution evidence.
+
+The actual candidate IR regression reproduces the pointer cast with the
+old source and requires it to be absent after this change, while retaining
+the FP32 gather check and CPU numerical oracle. NVIDIA development checks
+do not establish Ascend backend support: the user's lookup and remaining
+phase-4 gates must be rerun. This remains a standalone experimental kernel,
+not model integration, performance acceptance or native FP8 expert dot.
+
+This is a Python/Triton update. For the existing rebuilt installation,
+pull it and rerun the same phase-4 command in a fresh process; no C++
+rebuild, reinstall, repack or cache clearing is required.
+
+All 668 VQ2A8 development tests pass on the existing NVIDIA/host system.
+This includes the real candidate's compiler IR, numerical oracle, row
+chunking and deterministic repeats, plus diagnostic extraction and
+fail-closed supervisor regressions. Ruff check/format, Markdown lint and
+`git diff --check` pass. Required `bash format.sh ci` was attempted but
+remains blocked by missing local `pre-commit`. No A5 compilation or
+runtime PASS is claimed for this revision before the user's rerun.

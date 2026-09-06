@@ -17,6 +17,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections import deque
 from pathlib import Path
 
 try:
@@ -25,6 +26,32 @@ try:
 except ModuleNotFoundError:
     from validate_vq2a8_tp1_acceptance import acceptance_environment
     from vq2a8_live_log import LiveChildLog
+
+
+MAX_ERROR_EXCERPT_LINES = 12
+MAX_ERROR_LINE_CHARS = 1200
+
+
+def error_excerpt(path):
+    """Keep diagnostic lines even when a compiler dumps thousands of IR lines.
+
+    Read the existing child log, without truncating it or retrying the kernel.
+    This is reporting only: evidence and return codes still control the gate.
+    """
+    diagnostics = deque(maxlen=MAX_ERROR_EXCERPT_LINES)
+    pattern = re.compile(
+        r"\berror:|\berrorStr:|\b\w*(?:Error|Exception):|IR Dump After .* Failed|encounters error", re.IGNORECASE
+    )
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if pattern.search(line):
+                    diagnostic = line.strip()[:MAX_ERROR_LINE_CHARS]
+                    if diagnostic not in diagnostics:
+                        diagnostics.append(diagnostic)
+    except OSError:
+        pass
+    return list(diagnostics)
 
 
 def probe_list(value):
@@ -104,6 +131,12 @@ def short_report(report):
         lines.append(
             f"STEP={r['name']} {'PASS' if r['passed'] else 'FAIL'} exit={r['returncode']} timeout={r['timeout']}"
         )
+        if not r["passed"]:
+            if r.get("error"):
+                lines.append(f"  ERROR={r['error']}")
+            lines.extend(f"  {line}" for line in r.get("error_excerpt", []))
+            if r.get("log"):
+                lines.append(f"  LOG={r['log']}")
         grouped = {}
         for sample in r.get("speedups", []):
             grouped.setdefault((sample["probe"], sample["projection"]), []).append(sample)
@@ -250,6 +283,7 @@ def main():
             "error": error,
             "log": str(log),
             "evidence": str(evidence),
+            "error_excerpt": error_excerpt(log) if not passed else [],
         }
         if passed and stage == "benchmark":
             results = json.loads(evidence.read_text())["results"]

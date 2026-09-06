@@ -62,17 +62,23 @@ def _packed_vector_gather_kernel(
     columns = tl.arange(0, 512)
     table_tiles = tl.arange(0, TABLE_TILES)
     table_entries = tl.arange(0, 32)
-    # Affine [tiles,32] byte GM transfer. Ascend gather rejects int32 sources.
+    # Affine [tiles,32] FP8 GM transfer, then reinterpret loaded values as
+    # bytes, as in the accepted Ascend kernel. Do not cast the GM pointer:
+    # it left an unrealized pointer conversion in the failing A5 scope IR.
+    # Ascend gather rejects int32 sources.
     # FP32 exactly represents every byte value (0..255); this is an on-chip
     # byte carrier, NOT FP8 dequantization or a resident FP32 codebook.
-    table = tl.load(
-        CODEBOOK.to(tl.pointer_type(tl.uint8))
-        + table_tiles[:, None] * (N // 32 * 32)
-        + group * 32
-        + table_entries[None, :],
-        mask=table_tiles[:, None] < COLUMN_TILES,
-        other=0,
-    ).to(tl.float32)
+    table = (
+        tl.load(
+            CODEBOOK + table_tiles[:, None] * (N // 32 * 32) + group * 32 + table_entries[None, :],
+            mask=table_tiles[:, None] < COLUMN_TILES,
+            # A float zero is also valid for the FP8 masked-load fallback;
+            # an int32 zero is not supported by every frontend's FP8 cast.
+            other=0.0,
+        )
+        .to(tl.uint8, bitcast=True)
+        .to(tl.float32)
+    )
     table = tl.reshape(table, (TABLE_TILES * 32,))
     table = tl.broadcast_to(table[None, :], (32, TABLE_TILES * 32))
     accumulator = tl.zeros((32,), tl.float32)

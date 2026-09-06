@@ -20,7 +20,14 @@ from tools.validate_vq2a8_phase4_kernel import (
     synthetic_dense_oracle,
     synthetic_inputs,
 )
-from tools.validate_vq2a8_tp1_phase4 import evidence_passed, probe_list, short_report
+from tools.validate_vq2a8_tp1_phase4 import (
+    MAX_ERROR_EXCERPT_LINES,
+    MAX_ERROR_LINE_CHARS,
+    error_excerpt,
+    evidence_passed,
+    probe_list,
+    short_report,
+)
 from vllm_ascend.quantization.vq2a8_vector_gather import (
     _packed_vector_gather_kernel,
     validate_vector_gather_inputs,
@@ -57,6 +64,11 @@ def test_candidate_gather_ir_uses_float32_source_not_int32():
     )
     gathers = [line for line in compiled.asm["ttir"].splitlines() if "tt.gather " in line]
     assert gathers and all("xf32>" in line and "xi32>" in line for line in gathers), gathers
+    # Keep FP8 GM pointers typed, as in the accepted Ascend kernel. Reinterpret
+    # the loaded VALUES instead of emitting a pointer conversion for the A5
+    # memory-scope pass. CUDA IR coverage does not prove A5 backend support.
+    pointer_casts = [line for line in compiled.asm["ttir"].splitlines() if "tt.bitcast " in line and "!tt.ptr" in line]
+    assert not pointer_casts, pointer_casts
     expected = same_fp8_oracle(host[:3], synthetic_dense_oracle(*host[3:]))
     assert compare(expected, output)["allclose"]
 
@@ -197,6 +209,27 @@ def test_short_report_keeps_boundary_rows_and_full_evidence_unchanged():
     assert "AWAITING_SEPARATE_ACCEPTANCE" not in text
 
 
+def test_compiler_excerpt_keeps_diagnostic_after_large_ir_dump(tmp_path):
+    log = tmp_path / "lookup.log"
+    before = "// IR Dump After InferHIVMMemScope Failed (hivm-infer-mem-scope) //"
+    after = 'loc("kernel.ttadapter.mlir":15:2): error: test scope diagnostic'
+    data = (before + "\n" + '"arith.constant"() : () -> i32\n' * 4000 + (after + "\n") * 5).encode()
+    log.write_bytes(data + b"invalid utf8: \xff\n")
+    assert error_excerpt(log) == [before, after]
+    assert log.read_bytes() == data + b"invalid utf8: \xff\n"
+
+
+def test_compiler_excerpt_bounds_lines_and_characters(tmp_path):
+    log = tmp_path / "lookup.log"
+    lines = [f"error: test {i}: " + "x" * 2000 for i in range(30)]
+    log.write_text("\n".join(lines))
+    assert error_excerpt(log) == [line[:MAX_ERROR_LINE_CHARS] for line in lines[-MAX_ERROR_EXCERPT_LINES:]]
+
+
+def test_compiler_excerpt_missing_log_is_not_another_exception(tmp_path):
+    assert error_excerpt(tmp_path / "missing.log") == []
+
+
 def _evidence(stage="lookup", device="npu:0", probe="0:0", rows=None, cases=None):
     rows, cases = rows or [1], cases or ["deterministic"]
     report = {
@@ -303,7 +336,7 @@ def test_benchmark_evidence_rejects_invalid_timing_or_chain(tmp_path, bad):
     assert evidence_passed(path, "benchmark", "npu:0", "0:0", [1], ["deterministic"]) is (bad is None)
 
 
-@pytest.mark.parametrize("fail", [None, "abort", "timeout", "missing_evidence"])
+@pytest.mark.parametrize("fail", [None, "abort", "timeout", "missing_evidence", "compiler"])
 @pytest.mark.parametrize("micro_only", [False, True])
 def test_phase4_supervisor_isolates_fails_closed_and_never_promotes(tmp_path, monkeypatch, fail, micro_only):
     from tools import validate_vq2a8_tp1_phase4 as driver
@@ -327,6 +360,9 @@ def test_phase4_supervisor_isolates_fails_closed_and_never_promotes(tmp_path, mo
             raise subprocess.TimeoutExpired(command, 1800)
         if fail == "abort":
             return SimpleNamespace(returncode=-6)
+        if fail == "compiler":
+            kwargs["stdout"].write('loc("kernel.mlir":15:2): error: test scope diagnostic\n')
+            return SimpleNamespace(returncode=1)
         if fail != "missing_evidence":
             cases = command[command.index("--cases") + 1 : command.index("--model")]
             path = output / (
@@ -344,6 +380,10 @@ def test_phase4_supervisor_isolates_fails_closed_and_never_promotes(tmp_path, mo
         ["lookup"] if fail else ["lookup", "native"] if micro_only else ["lookup", "native", "packed", "benchmark"]
     )
     assert "PHASE4=INCOMPLETE" in short_report(report)
+    if fail == "compiler":
+        assert report["results"][0]["error_excerpt"] == ['loc("kernel.mlir":15:2): error: test scope diagnostic']
+        assert "error: test scope diagnostic" in (output / "summary.txt").read_text()
+        assert f"LOG={output / 'lookup.log'}" in short_report(report)
 
 
 @pytest.mark.parametrize("value", ["", "0:0,0:0", "0", "-1:0", "0:0;rm", "0:1/2"])
