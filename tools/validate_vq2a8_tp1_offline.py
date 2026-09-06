@@ -43,11 +43,14 @@ def main() -> None:
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument("--execution-policy", choices=["baseline", "cached"], default="cached")
+    parser.add_argument("--root-linear-mode", choices=["bf16", "online_fp8_sm90"], default="bf16")
     parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="0: auto budget after root loading.")
     parser.add_argument(
         "--cache-reserve-gib", type=float, default=16.0, help="Reserve for KV, workspace and allocator."
     )
     args = parser.parse_args()
+    if args.baseline_report and args.root_linear_mode != "bf16":
+        parser.error("The phase-1 BF16 baseline is not an exact oracle for online FP8; do not mix these gates.")
     model_root, artifact_root = args.model.resolve(strict=True), args.artifact.resolve(strict=True)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -124,6 +127,7 @@ def main() -> None:
         execution_policy=args.execution_policy,
         cache_budget_gib=args.cache_budget_gib,
         cache_reserve_gib=args.cache_reserve_gib,
+        root_linear_mode=args.root_linear_mode,
     )
     missing = set(options) - set(inspect.signature(EngineArgs).parameters)
     if missing or not hasattr(LLM, "collective_rpc"):
@@ -142,7 +146,7 @@ def main() -> None:
                 "execution_policy": args.execution_policy,
                 "expert_device": args.device,
                 "expert_load_path": "cpu_validate_then_device_cache",
-                "root_linear_execution": "bf16_diagnostic_not_original_online_fp8",
+                "root_linear_execution": args.root_linear_mode,
                 "native_fp8_dot": False,
             }
         ),
@@ -163,6 +167,8 @@ def main() -> None:
             raise ValueError("The short offline request did not finish normally.")
         tokens = list(generated[0].outputs[0].token_ids)
         evidence = single_worker_result(llm.collective_rpc(capture_worker_trace))
+        if evidence.get("root_fp8", {}).get("mode", "bf16") != args.root_linear_mode:
+            raise ValueError("Requested root mode was not installed on the executing model.")
         result = validate_offline_evidence(evidence, prompt, tokens, config["num_hidden_layers"], config["vocab_size"])
         logits = evidence["logits"]
         path = output / f"run-{run}-logits.safetensors"
@@ -216,6 +222,9 @@ def main() -> None:
                 "layers": len(artifact.layers),
                 "native_fp8_dot": False,
                 "repeat_exact": True,
+                "root_linear_mode": args.root_linear_mode,
+                "native_fp8_root_matmul": args.root_linear_mode == "online_fp8_sm90",
+                "root_fp8_execution_verified": args.root_linear_mode == "online_fp8_sm90",
                 "baseline_exact": True if previous_runs is not None else None,
                 "offline_execution_verified": True,
                 "logits_reference_verified": False,

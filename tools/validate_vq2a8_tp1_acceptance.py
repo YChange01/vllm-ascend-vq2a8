@@ -41,6 +41,7 @@ _RESULT_PREFIXES = (
     "MOE_RESULT ",
     "MODEL_PLAN ",
     "MODEL_LOAD_RESULT ",
+    "MODEL_ROOT_FP8_RESULT ",
     "MODEL_RESULT ",
     "MODEL_REPEAT_FAILURE ",
     "MODEL_BASELINE_RESULT ",
@@ -107,6 +108,14 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                 lines.append(
                     f"PEAK_ALLOCATED_GIB={latest['peak_allocated_bytes'] / 1024**3:.3f} "
                     f"PEAK_RESERVED_GIB={latest['peak_reserved_bytes'] / 1024**3:.3f}"
+                )
+            if summary.get("root_linear_mode") == "online_fp8_sm90":
+                lines.append(
+                    "ROOT_LINEAR_MODE=online_fp8_sm90 "
+                    f"ROOT_FP8_EXECUTION_VERIFIED={gate.get('root_fp8_execution_verified', False)}"
+                )
+                lines.append(
+                    f"NATIVE_FP8_ROOT_MATMUL={gate.get('native_fp8_root_matmul', False)} NATIVE_FP8_EXPERT_DOT=False"
                 )
             if summary.get("baseline_report"):
                 comparisons = [r["data"] for r in result.get("records", []) if r["type"] == "MODEL_BASELINE_RESULT"]
@@ -326,6 +335,7 @@ def main() -> int:
     )
     parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="Model packed cache: 0 = auto.")
     parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
+    parser.add_argument("--root-linear-mode", choices=["bf16", "online_fp8_sm90"], default="bf16")
     parser.add_argument(
         "--allow-partial-artifact", action="store_true", help="Developer checks only; never serving readiness."
     )
@@ -340,6 +350,8 @@ def main() -> int:
         parser.error("--execution-policy applies to --stage moe/model only.")
     if args.baseline_report and (args.stage != "model" or args.execution_policy == "baseline"):
         parser.error("--baseline-report requires the cached model stage.")
+    if args.root_linear_mode != "bf16" and (args.stage != "model" or args.baseline_report):
+        parser.error("Online root FP8 requires --stage model and cannot use the phase-1 exact BF16 baseline.")
     if (
         not math.isfinite(args.cache_budget_gib)
         or args.cache_budget_gib < 0
@@ -401,6 +413,7 @@ def main() -> int:
         "serving_integration_verified": False,
         "device_kernel_performance_verified": False,
         "baseline_report": str(frozen_baseline) if frozen_baseline else None,
+        "root_linear_mode": args.root_linear_mode,
     }
     summary_path = output / "summary.json"
     short_path = output / "summary.txt"
@@ -473,6 +486,8 @@ def main() -> int:
                 str(args.cache_budget_gib),
                 "--cache-reserve-gib",
                 str(args.cache_reserve_gib),
+                "--root-linear-mode",
+                args.root_linear_mode,
             ]
             if frozen_baseline:
                 command.extend(["--baseline-report", str(frozen_baseline)])

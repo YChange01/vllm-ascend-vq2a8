@@ -216,6 +216,49 @@ def test_model_evidence_requires_all_layers_real_steps_and_greedy_logits():
 
 
 @pytest.mark.parametrize(
+    "bad", [None, "missing", "profile_count", "unprocessed", "bf16", "scale", "duplicate", "native"]
+)
+def test_online_root_evidence_requires_real_fp8_and_per_request_calls(bad):
+    data = evidence()
+    records = [
+        {
+            "name": f"model.layers.{i}.self_attn.{name}",
+            "calls": 4,
+            "processed": True,
+            "weight_dtype": "torch.float8_e4m3fn",
+            "scale_dtype": "torch.float32",
+        }
+        for i in range(2)
+        for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b")
+    ]
+    data["root_fp8"] = {
+        "mode": "online_fp8_sm90",
+        "layers": records,
+        "all_processed": True,
+        "native_fp8_root_matmul": True,
+    }
+    if bad == "missing":
+        records.pop()
+    elif bad == "profile_count":
+        records[0]["calls"] += 1
+    elif bad == "unprocessed":
+        records[0]["processed"] = False
+    elif bad == "bf16":
+        records[0]["weight_dtype"] = "torch.bfloat16"
+    elif bad == "scale":
+        records[0]["scale_dtype"] = "torch.int32"
+    elif bad == "duplicate":
+        records.append(records[0])
+    elif bad == "native":
+        data["root_fp8"]["native_fp8_root_matmul"] = False
+    if bad:
+        with pytest.raises(ValueError, match="Root FP8"):
+            validate_offline_evidence(data, [0, 1, 2], [7] * 4, 2, 8)
+    else:
+        assert validate_offline_evidence(data, [0, 1, 2], [7] * 4, 2, 8)["root_fp8"] is data["root_fp8"]
+
+
+@pytest.mark.parametrize(
     "failure",
     ["missing_layer", "missing_step", "wrong_position", "cache_overflow", "nan", "shape", "not_loaded", "sampler"],
 )
@@ -334,13 +377,15 @@ def test_decoder_hook_preserves_default_and_threads_hash_ids_without_importing_n
     assert "input_ids=input_ids" in ast.unparse(model)
 
 
-def construct_meta_root(hf_config):
+def construct_meta_root(hf_config, root_linear_mode="bf16"):
     """Execute model/adapter constructors, substituting device primitives only.
 
     Usable for real checkpoint HEADER comparison without allocating its weights.
     This does not test CANN, attention execution, or vLLM worker compatibility.
     """
     from enum import Enum
+
+    from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, RootFP8State, root_linear_kind
 
     class DeviceType(Enum):
         A5 = 1
@@ -349,6 +394,9 @@ def construct_meta_root(hf_config):
         def __init__(self, input_size, output_size, **kwargs):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.empty(output_size, input_size, dtype=torch.bfloat16, device="meta"))
+            self.tp_size = 1
+            self.quant_method = object()
+            self.custom_op = NS(update_attrs=lambda: setattr(self.custom_op, "updated", True), updated=False)
 
     class Embedding(Linear):
         def __init__(self, vocab, hidden, **kwargs):
@@ -368,6 +416,7 @@ def construct_meta_root(hf_config):
         def __init__(self, *args):
             self.layers = {}
             self.calls = {}
+            self.options = {"root_linear_mode": root_linear_mode}
 
         def create_layer(self, index):
             self.layers[index] = NS()
@@ -408,6 +457,10 @@ def construct_meta_root(hf_config):
         "default_weight_loader": copy_weight,
         "DSAModules": NS,
         "_dsv4_block_sizes": lambda: {128: ([128] * 4,)},
+        "LinearMethodBase": object,
+        "ROOT_FP8_POLICY": ROOT_FP8_POLICY,
+        "RootFP8State": RootFP8State,
+        "root_linear_kind": root_linear_kind,
     }
     for name in ("ReplicatedLinear", "ColumnParallelLinear", "RowParallelLinear"):
         scope[name] = Linear
@@ -446,12 +499,14 @@ def construct_meta_root(hf_config):
     cfg = config()
     cfg.model_config.hf_config = hf_config
     cfg.model_config.model = "/model"
+    cfg.additional_config["vq2a8_offline"]["root_linear_mode"] = root_linear_mode
     cfg.cache_config.block_size = 128
     with torch.device("meta"):
         return scope["VQ2A8TP1OfflineForCausalLM"](vllm_config=cfg)
 
 
-def test_real_constructor_seams_allocate_no_fused_experts_and_preserve_parameter_names():
+@pytest.mark.parametrize("root_mode", ["bf16", "online_fp8_sm90"])
+def test_real_constructor_seams_allocate_no_fused_experts_and_preserve_parameter_names(root_mode):
     hf = NS(
         vocab_size=8,
         hidden_size=16,
@@ -477,7 +532,7 @@ def test_real_constructor_seams_allocate_no_fused_experts_and_preserve_parameter
         n_routed_experts=4,
         n_shared_experts=1,
     )
-    model = construct_meta_root(hf)
+    model = construct_meta_root(hf, root_mode)
     params = dict(model.named_parameters())
     assert "model.layers.1.self_attn.compressor.norm.weight" in params
     assert params["model.layers.1.self_attn.compressor.norm.weight"].dtype == torch.float32
@@ -485,3 +540,12 @@ def test_real_constructor_seams_allocate_no_fused_experts_and_preserve_parameter
     assert not any(".mlp." in name for name in params)
     assert set(model.model.offline_owner.layers) == {0, 1, 2}
     assert len(model.moe_mlp_layers) == 3 and not model.moe_layers
+    from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, root_linear_kind
+
+    for name, module in model.named_modules():
+        if hasattr(module, "custom_op"):
+            selected = root_mode == ROOT_FP8_POLICY and root_linear_kind(name) is not None
+            assert module.custom_op.updated == selected
+            assert (getattr(module.quant_method, "vq2a8_root_mode", None) == ROOT_FP8_POLICY) == selected
+    # Quantization runs after the canonical checkpoint load, never in constructor.
+    assert all(p.dtype in (torch.bfloat16, torch.float32) for p in params.values())

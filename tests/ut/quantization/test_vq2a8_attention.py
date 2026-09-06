@@ -12,6 +12,8 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
+from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, inverse_rope_fp32
+
 
 class Unquantized:
     pass
@@ -30,6 +32,7 @@ def projection_method(device_type="A5", npu=None):
         "get_ascend_device_type": lambda: device_type,
         "AscendDeviceType": NS(A5="A5"),
         "AscendUnquantizedLinearMethod": Unquantized,
+        "ROOT_FP8_POLICY": ROOT_FP8_POLICY,
         "oproj_tp_enable": lambda: False,
         "olora_tp_enable": lambda: False,
     }
@@ -92,3 +95,47 @@ def test_non_a5_grouped_weight_path_unchanged():
     owner = NS(n_local_groups=2, wo_a=NS(weight=torch.zeros(2, 8, 3)), wo_b=lambda x: x)
     projection_method(device_type="A3", npu=npu)(owner, torch.zeros(1, 2, 8), torch.empty(1, 6))
     assert calls[0]["scale"] is None and calls[0]["batch_split_factor"] == 1
+
+
+def test_offline_fp8_dispatches_grouped_contract_not_existing_mx_branch():
+    calls = []
+    method = NS(
+        vq2a8_root_mode=ROOT_FP8_POLICY,
+        apply_grouped=lambda *a: calls.append(a) or torch.ones(3, 256, dtype=torch.bfloat16),
+    )
+    owner = NS(n_local_groups=2, o_lora_rank=128, wo_a=NS(quant_method=method), wo_b=lambda x: 2 * x)
+    output = torch.empty(3, 256, dtype=torch.bfloat16)
+    result = projection_method()(owner, torch.ones(3, 4, 128), output)
+    assert result is output and bool((output == 2).all())
+    assert calls[0][0] is owner.wo_a and calls[0][1].shape == (3, 2, 256)
+    assert calls[0][2:] == (2, 128)
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_actual_inverse_rope_seam_avoids_bf16_rounding_only_in_opt_in_mode(online):
+    path = Path(__file__).resolve().parents[3] / "vllm_ascend/attention/dsa_v1.py"
+    branch = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.If)
+        and any(
+            isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id == "inverse_rope_fp32"
+            for c in ast.walk(n)
+        )
+    )
+    old_calls = []
+    proxy = NS(ops=NS(_C_ascend=NS(inplace_partial_rotary_mul=lambda *a, **kw: old_calls.append((a, kw)))))
+    method = NS(vq2a8_root_mode=ROOT_FP8_POLICY) if online else object()
+    x = torch.ones(1, 2, 8, dtype=torch.bfloat16)
+    scope = dict(
+        torch=proxy,
+        self=NS(wo_a=NS(quant_method=method), nope_head_dim=4, head_dim=8),
+        o_proj_input=x,
+        cos=torch.full((1, 1, 1, 4), 0.97),
+        sin=torch.full((1, 1, 1, 4), 0.1234),
+        ROOT_FP8_POLICY=ROOT_FP8_POLICY,
+        inverse_rope_fp32=inverse_rope_fp32,
+    )
+    exec(compile(ast.Module(body=[branch], type_ignores=[]), str(path), "exec"), scope)
+    assert len(old_calls) == (0 if online else 1)
+    assert scope["o_proj_input"].dtype == (torch.float32 if online else torch.bfloat16)

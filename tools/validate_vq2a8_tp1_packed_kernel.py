@@ -118,6 +118,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_reference.py",
         "vq2a8_runtime.py",
         "vq2a8_repack.py",
+        "vq2a8_root_fp8.py",
         "vq2a8_moe.py",
         "vq2a8_offline.py",
         "vq2a8_execution.py",
@@ -136,6 +137,8 @@ def environment_report() -> dict[str, Any]:
         "tools/vq2a8_baseline.py",
         "tools/benchmark_vq2a8_host_load.py",
         "tools/validate_vq2a8_tp1_phase1.py",
+        "tools/validate_vq2a8_tp1_phase3.py",
+        "tools/validate_vq2a8_root_fp8.py",
     ):
         source_hashes[name] = hashlib.sha256((repo / name).read_bytes()).hexdigest()
     return {

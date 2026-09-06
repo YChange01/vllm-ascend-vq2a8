@@ -33,6 +33,7 @@ from vllm_ascend.ops.cv_linear import CVLinearWrapper
 from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa, get_full_cos_and_sin_dsa
 from vllm_ascend.quantization.methods.w8a8_dynamic import AscendW8A8DynamicLinearMethod
+from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, inverse_rope_fp32
 from vllm_ascend.utils import (
     AscendDeviceType,
     get_ascend_device_type,
@@ -1558,7 +1559,10 @@ class AscendDSAImpl(DSAAttentionImpl):
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
         is_a5 = get_ascend_device_type() == AscendDeviceType.A5
-        if is_a5 and isinstance(self.wo_a.quant_method, AscendUnquantizedLinearMethod):
+        if is_a5 and getattr(self.wo_a.quant_method, "vq2a8_root_mode", None) == ROOT_FP8_POLICY:
+            o = self.wo_a.quant_method.apply_grouped(self.wo_a, o_proj_input, self.n_local_groups, self.o_lora_rank)
+            output[...] = self.wo_b(o)
+        elif is_a5 and isinstance(self.wo_a.quant_method, AscendUnquantizedLinearMethod):
             # A5 is a hardware capability, not a checkpoint quantization mode.
             # Its unquantized loader retains [G * R, K], unlike the grouped
             # FP8 post-load layout below and the non-A5 wo_a loader. Use views
@@ -1733,13 +1737,16 @@ class AscendDSAImpl(DSAAttentionImpl):
         cos = attn_metadata[0].cos[layer_name]
         sin = attn_metadata[0].sin[layer_name]
 
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o_proj_input.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
+        if getattr(self.wo_a.quant_method, "vq2a8_root_mode", None) == ROOT_FP8_POLICY:
+            o_proj_input = inverse_rope_fp32(o_proj_input, cos, sin, self.nope_head_dim)
+        else:
+            torch.ops._C_ascend.inplace_partial_rotary_mul(
+                o_proj_input.unsqueeze(1),
+                cos,
+                -sin,
+                rotary_mode="interleave",
+                partial_slice=[self.nope_head_dim, self.head_dim],
+            )
 
         # o
         self._forward_o_proj(o_proj_input, output)

@@ -603,8 +603,8 @@ Four real CPU payloads (layers 0/3, gate-up/down, 96 CPU threads,
 torch 2.13.0+cu129) retained identical bytes. Five-sample validation medians
 were 1.88-4.70 ms for legacy-work replay versus 0.41-0.54 ms for retained
 checks. These warm CPU measurements do not predict the user's 1520 s
-Ascend host total or warm NPU decode speed. The disconnected Ascend950
-must still return the new phase-1 report before hardware acceptance.
+Ascend host total or warm NPU decode speed. Hardware acceptance subsequently
+arrived in the user report described below.
 
 The phase-1 VQ2A8 unit suite passes 330 tests. The real CUDA checks for
 layers 0/3 pass all 12 accepted deterministic/zero, M=1/3/10 cases with
@@ -619,13 +619,14 @@ have `pre-commit`; this is not reported as a repository-wide CI pass.
 
 ### Explicit remaining plan (user decision)
 
-1. Phase 1: execute CPU loading/validation optimization and exact regression
-   against the accepted offline run; keep all valid corruption checks.
+1. Phase 1: complete; actual Ascend950 exact regression passed. Retain the
+   accepted baseline and all valid corruption checks.
 2. Phase 2: **skipped by user request**. Do not generate an independent
    full-model reference or mark independent logits/quality as verified.
-3. Phase 3, deferred: adapt the original online FP8 root-linear semantics,
-   with focused operator/attention regression. Skipping phase 2 does not
-   supply evidence of original full-model equivalence.
+3. Phase 3: active by user request. Implement opt-in online FP8 root
+   projections with focused operator/attention regression; real Ascend950
+   acceptance is still required. Skipping phase 2 does not supply evidence
+   of original full-model equivalence.
 4. Phase 4, deferred: profile and optimize packed NPU execution. Keep the
    accepted Vector baseline; isolate Cube/FP8, alignment and CV/fixpipe
    experiments in microkernels before integration. No new kernel in phase 1.
@@ -633,3 +634,128 @@ have `pre-commit`; this is not reported as a repository-wide CI pass.
    residency tests, then normal vLLM/HTTP streaming and request lifecycle.
    Report unverified quality explicitly rather than treating service success
    as quality evidence. TP4 and further repacking are not current tasks.
+
+### Phase 1 hardware result (2026-09-06)
+
+The user report `/tmp/vq2a8-phase1-m2nu1ipf` at `69d5b0b3` (dirty worktree)
+shows `PHASE1_REGRESSION=PASS` and `BASELINE_EXACT=PASS completed=2/2`.
+Both requests retain exactly the old tokens and full logits (maximum
+absolute error zero). This is not an independent reference.
+
+Completed host load/validation fell from 1520.473 s to 115.762 s;
+the new breakdown is 1.378 s read and 114.326 s validation. Total prefill
+time over two requests fell from 1499.837 s to 282.465 s. However, packed
+projection totals were effectively unchanged, 465.214 s versus 465.273 s,
+and the last warm decode was 8.845 s versus 8.920 s. Thus phase 1 removed
+cold host work, not the steady-state expert-compute bottleneck. Peak
+allocated/reserved memory remained 24.955/25.113 GiB. These are the user's
+measurements, not developer access to the Ascend machine.
+
+### Phase 3: original online FP8 root projections
+
+The target is the pinned NVIDIA source
+`2d75468d44857582f9d21c983d451d69bea50ad7`, specifically its SM90/Cutlass
+per-token activation policy and SM90 `wo_a` recipe `(1,128,128)`.
+BF16 is the root checkpoint's storage format; online FP8 is a load-time
+conversion followed by runtime activation quantization. Neither changes
+the existing VQ2 expert artifact or its E4M3 codebooks.
+
+| Root module | Weight conversion | Activation / execution |
+| --- | --- | --- |
+| `wq_a`, `wq_b`, `wkv`, `wo_b`, `indexer.wq_b` | E4M3, per-tensor FP32 scale | E4M3 per token; CANN FP8 matmul, BF16 output |
+| `wo_a` | E4M3, 128x128 FP32 scales | FP32 inverse RoPE, 1x128 power-of-two activation scales; independent output groups |
+| Compressor projections, `indexer.weights_proj`, embedding/head, norms/router | Unchanged | Not implicitly quantized by the root allowlist |
+
+This is **not** the existing A5 MXFP8 32-element recipe. `wo_a` weight scales
+stay FP32 and are not rounded to powers of two. The inverse RoPE partner
+product is rounded in FP32 before `addcmul`; there is no intermediate
+BF16 cast. The changed multiply-add order fixed a real CUDA
+`wo_a`, M=10, small-input FP8 rounding mismatch against the original fused
+inverse-RoPE kernel. No new expert kernel or CV scope experiment is used.
+
+The native backend calls `torch_npu.npu_quant_matmul`. Its block-scale
+transpose **strides** must match the transposed weight; making only the
+scale contiguous is incorrect. This contract is visible in the official
+[op-plugin implementation](https://github.com/Ascend/op-plugin/blob/master/op_plugin/ops/opapi/QuantMatmulKernelNpuOpApi.cpp).
+The documented FP32 scale shapes and G-B grouping are described in
+[aclnnQuantMatmulV5](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/82RC1alpha003/API/aolapi/context/aclnnQuantMatmulV5.md).
+Public documentation/source is not verification of the user's exact
+torch-npu/CANN wheel. The isolated native smoke gate must run on that wheel.
+
+Implementation boundaries:
+
+- Only `--root-linear-mode online_fp8_sm90` installs the new methods on the
+  offline inheritance adapter. Default `bf16` and unrelated A5/non-A5
+  attention branches are retained. The custom linear wrapper's cached
+  quantization-method reference is updated too.
+- Canonical BF16 parameters are allocated and strictly loaded first.
+  vLLM's per-module post-load hook converts only the allowlist; FP32 scale
+  buffers do not masquerade as checkpoint parameters. Cache budgeting runs
+  after conversion, against actual root FP8 residency. Conversion rejects
+  nonfinite, wrong-dtype, noncontiguous or unsupported block shapes.
+- Forward evidence requires processed FP8 weights/FP32 scales and one
+  call per main root projection per real model step, with counters reset
+  after profiling. Indexer weights must be processed, but short sequences
+  may not exercise index selection; the separate real indexer projection
+  probe does not certify long-context indexer behavior.
+- `NATIVE_FP8_ROOT_MATMUL` is separate from
+  `NATIVE_FP8_EXPERT_DOT=False`. The legacy `NATIVE_FP8_DOT=False` remains
+  the expert-kernel claim. No silent BF16 or eager reference fallback is
+  provided for unsupported NPU FP8 matmul.
+- The historical BF16 model report is preserved, not used as a bit-exact
+  FP8 oracle. Full-model independent logits, quality and serving remain
+  unverified because phase 2 was skipped and phase 5 remains deferred.
+
+Operator gates compare FP8 bytes/scales between CPU and the NPU preparation
+path exactly, then native output against explicit FP32 dequantized math
+with one final BF16 cast. Limits are `rtol=0.01`, `atol=0.03125`, relative
+L2 <= 0.01, plus three bitwise-identical output executions. These are new
+root-operator limits, not relaxed expert gates or a full-model tolerance.
+Cases cover deterministic, zero, impulse and small inputs at M=1/3/10/32.
+The seven real projections cover layer-0 primary linears, layer-2 indexer
+`wq_b`, and layer-42 `wo_a`; grouped `wo_a` exercises all eight groups.
+
+The developer CUDA reference tool verifies referenced Python functions
+against the pinned source and compares original FP8 preparation separately
+from output accuracy. In the real layer-0/layer-42 `wo_a` matrices,
+compiled upstream quantization and eager preparation differ at 82/147
+of 33,554,432 FP8 bytes respectively, maximum quantized-value difference
+0.001953125, despite identical scales. Therefore **upstream weight byte
+equivalence is not claimed**. The five per-tensor probe weights match
+exactly. This distinction remains visible in developer output.
+
+Development validation passes 381 VQ2A8 unit tests and the 196-check CPU
+synthetic operator gate. On the remote NVIDIA L20X, all seven real roots
+pass 112 cases against original Cutlass/DeepGEMM output. FP8 activation
+bytes/scales match the original per-token quantizer and fused inverse-RoPE
+quantizer exactly for these cases. The successful native CUDA log is
+`/tmp/vq2a8-phase3-dev-0hs3gJ/cuda-reference.log`. CPU/CUDA eager weight and
+activation bytes/scales also match exactly. Block weight scale calculation
+explicitly multiplies the FP32 reciprocal of 448 to reproduce the pinned
+CUDA scalar-division behavior; CPU scalar division otherwise differs by
+one FP32 ULP. A unit test pins this boundary. This developer check needs
+the installed CUDA toolkit (`CUDA_HOME=/mnt/miniconda3/envs/gyc` on that
+host); no CUDA setting belongs in the Ascend command. Ruff and Markdown
+checks pass. Required `bash format.sh ci` was attempted but cannot run
+without the local `pre-commit` executable, so full repository CI is not
+claimed. No actual NPU phase-3 execution has been performed by the agent.
+
+On the disconnected Ascend950, run this single command sequence; no
+repack, old-report argument, TP4, HTTP server or environment upgrade is needed:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only origin ascend950-vq2a8
+python3 tools/validate_vq2a8_tp1_phase3.py --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 4
+```
+
+The driver creates a new `/tmp/vq2a8-phase3-*` directory and runs
+`smoke -> roots -> model`. Operator children have a 1800-second limit;
+the model acceptance supervisor owns its existing 3600-second timeout.
+Any abort, timeout, missing result or backend mismatch stops the sequence.
+Exit zero alone cannot pass. Logs stream to the terminal and are also
+retained in `smoke.log`, `roots.log`, `model.log` and model child logs.
+`summary.txt` is short; `phase3.json`, operator JSON and model evidence
+retain details. On a failure, provide the short summary and the first
+error block from the failed step; another full model run is not required
+to diagnose a smoke/real-projection failure.

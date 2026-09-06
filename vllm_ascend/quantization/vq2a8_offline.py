@@ -22,7 +22,13 @@ OFFLINE_RUNS = 2
 
 
 def offline_engine_options(
-    model_root: Path, artifact: Path, *, execution_policy="cached", cache_budget_gib=0.0, cache_reserve_gib=16.0
+    model_root: Path,
+    artifact: Path,
+    *,
+    execution_policy="cached",
+    cache_budget_gib=0.0,
+    cache_reserve_gib=16.0,
+    root_linear_mode="bf16",
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     return {
@@ -60,6 +66,7 @@ def offline_engine_options(
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
+                "root_linear_mode": root_linear_mode,
             },
         },
     }
@@ -78,6 +85,7 @@ def validate_offline_config(config) -> dict:
         "execution_policy",
         "cache_budget_gib",
         "cache_reserve_gib",
+        "root_linear_mode",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
         raise ValueError("Invalid vq2a8_offline options/artifact path.")
@@ -92,7 +100,9 @@ def validate_offline_config(config) -> dict:
         if getattr(parallel, name, False):
             raise ValueError(f"Offline VQ2A8 does not support {name}.")
     if not model.enforce_eager or config.quant_config is not None or model.quantization is not None:
-        raise ValueError("Offline adapter requires eager execution and unquantized root layers.")
+        raise ValueError(
+            "Offline adapter requires eager execution and canonical BF16 root allocation (no global quantizer)."
+        )
     if model.dtype != torch.bfloat16 or config.scheduler_config.max_num_seqs != 1:
         raise ValueError("Offline adapter requires BF16 and max_num_seqs=1.")
     if not 1 <= model.max_model_len <= 128 or config.scheduler_config.max_num_batched_tokens > 128:
@@ -123,6 +133,8 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
     if options.get("execution_policy", "baseline") not in ("baseline", "cached"):
         raise ValueError("execution_policy must be baseline or cached.")
+    if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
+        raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
     for key, default, upper in (("cache_experts", 2, 256), ("token_chunk", 2, 8)):
         value = options.get(key, default)
         if type(value) is not int or not 1 <= value <= upper:
@@ -328,6 +340,31 @@ def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list
     selected = logits[torch.arange(len(generated)), torch.tensor(generated)]
     if not torch.equal(selected, logits.max(-1).values):
         raise ValueError("Sampled tokens disagree with greedy captured logits.")
+    root = evidence.get("root_fp8", {"mode": "bf16"})
+    if root.get("mode") not in ("bf16", "online_fp8_sm90"):
+        raise ValueError("Unknown root linear evidence mode.")
+    if root.get("mode") == "online_fp8_sm90":
+        expected = {
+            f"model.layers.{i}.self_attn.{name}"
+            for i in range(layers)
+            for name in ("wq_a", "wq_b", "wkv", "wo_a", "wo_b")
+        }
+        records = root.get("layers", [])
+        by_name = {r["name"]: r for r in records}
+        if (
+            len(by_name) != len(records)
+            or not root.get("all_processed")
+            or not root.get("native_fp8_root_matmul")
+            or any(
+                not r.get("processed")
+                or r.get("weight_dtype") != "torch.float8_e4m3fn"
+                or r.get("scale_dtype") != "torch.float32"
+                for r in records
+            )
+            or not expected.issubset(by_name)
+            or any(by_name[name].get("calls") != len(expected_steps) for name in expected)
+        ):
+            raise ValueError("Root FP8 projection coverage/calls incomplete; profile calls cannot count.")
     return {
         "prefill_tokens": len(prompt),
         "decode_steps": len(generated) - 1,
@@ -339,4 +376,5 @@ def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list
         "load": evidence["load"],
         "peak_allocated_bytes": evidence["peak_allocated_bytes"],
         "peak_reserved_bytes": evidence["peak_reserved_bytes"],
+        "root_fp8": root,
     }

@@ -13,11 +13,38 @@ from pathlib import Path
 import torch
 from torch import nn
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4 import AscendDeepseekV4ForCausalLM, DeepseekV2DecoderLayer, DeepseekV4Model
 from vllm_ascend.quantization.vq2a8_offline import OfflineMoEOwner, validate_offline_config
+from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, RootFP8State, root_linear_kind
+
+
+class OfflineRootFP8Method(LinearMethodBase):
+    """Installed only on the opt-in offline model, before strict BF16 loading."""
+
+    vq2a8_root_mode = ROOT_FP8_POLICY
+
+    def __init__(self, kind):
+        self.state = RootFP8State(kind)
+
+    def create_weights(self, *args, **kwargs):
+        raise RuntimeError("Offline root FP8 must use the existing canonical BF16 allocation.")
+
+    def process_weights_after_loading(self, layer):
+        print(f"MODEL stage=root_fp8_quantize_start prefix={layer.prefix} kind={self.state.kind}", flush=True)
+        self.state.process(layer)
+        print(f"MODEL stage=root_fp8_quantize_done prefix={layer.prefix}", flush=True)
+
+    def apply(self, layer, x, bias=None):
+        if bias is not None:
+            raise ValueError("The pinned root FP8 projections are bias-free.")
+        return self.state.apply(layer, x)
+
+    def apply_grouped(self, layer, x, groups, rank):
+        return self.state.apply_grouped(layer, x, groups, rank)
 
 
 class OfflineMoEAdapter(nn.Module):
@@ -41,6 +68,26 @@ class OfflineDecoderLayer(DeepseekV2DecoderLayer):
     def __init__(self, vllm_config, prefix, topk_indices_buffer, owner):
         self._offline_owner = owner
         super().__init__(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer)
+        if owner.options.get("root_linear_mode", "bf16") == ROOT_FP8_POLICY:
+            selected = []
+            for name, module in self.self_attn.named_modules():
+                kind = root_linear_kind(f"{prefix}.self_attn.{name}")
+                if kind is None:
+                    continue
+                if not hasattr(module, "weight") or getattr(module, "tp_size", 1) != 1:
+                    raise ValueError(f"Unsupported offline FP8 root module {name}.")
+                method = OfflineRootFP8Method(kind)
+                module.quant_method = method
+                # Ascend custom communication wrappers cache the method during
+                # construction. Update the cached reference as well.
+                if getattr(module, "custom_op", None) is not None:
+                    module.custom_op.update_attrs()
+                selected.append(name)
+            required = {"wq_a", "wq_b", "wkv", "wo_a", "wo_b"}
+            if self.self_attn.indexer is not None:
+                required.add("indexer.wq_b")
+            if set(selected) != required:
+                raise ValueError(f"Root FP8 coverage mismatch: {selected} != {sorted(required)}.")
 
     def forward(self, *args, **kwargs):
         print(f"MODEL layer={self.layer_idx} stage=decoder_start", flush=True)
@@ -84,6 +131,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_steps = []
         self._offline_load_report = {}
         self._offline_memory_fraction = vllm_config.cache_config.gpu_memory_utilization
+        self._offline_root_mode = validate_offline_config(vllm_config).get("root_linear_mode", "bf16")
+        self._offline_root_verified = False
 
     def set_moe_parameters(self):
         # No FusedMoE allocation, expert extraction, EPLB or TP reduction.
@@ -104,7 +153,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             dict(self.named_parameters()), weights, default_weight_loader
         )
         self._offline_load_report = report
-        self.model.offline_owner.configure_cache(self._offline_memory_fraction)
+        if self._offline_root_mode == "bf16":
+            self.model.offline_owner.configure_cache(self._offline_memory_fraction)
         self._offline_loaded = True
         print("MODEL_LOAD_RESULT " + json.dumps(report), flush=True)
         return loaded
@@ -116,6 +166,10 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_steps = []
         for index in self.model.offline_owner.calls:
             self.model.offline_owner.calls[index] = 0
+        for module in self.modules():
+            method = getattr(module, "quant_method", None)
+            if isinstance(method, OfflineRootFP8Method):
+                method.state.calls = 0
         self._offline_trace = True
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
@@ -123,6 +177,15 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError(
                 "Offline forward requires loaded weights and real token IDs; inputs_embeds are unsupported."
             )
+        if self._offline_root_mode == ROOT_FP8_POLICY and not self._offline_root_verified:
+            report = self.root_fp8_evidence()
+            if not report["all_processed"]:
+                raise ValueError("Root FP8 post-load conversion incomplete before forward.")
+            # The vLLM loader has now processed the root modules. Plan against
+            # their actual FP8 residency, not the temporary BF16 allocation.
+            self.model.offline_owner.configure_cache(self._offline_memory_fraction)
+            self._offline_root_verified = True
+            print("MODEL_ROOT_FP8_RESULT " + json.dumps(report), flush=True)
         if self._offline_trace and not get_forward_context().attn_metadata:
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
         phase = ("prefill" if not self._offline_steps else "decode") if self._offline_trace else "profile"
@@ -180,4 +243,37 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "logits": torch.cat(self._offline_logits),
             "peak_allocated_bytes": torch.npu.max_memory_allocated(),
             "peak_reserved_bytes": torch.npu.max_memory_reserved(),
+            "root_fp8": self.root_fp8_evidence(),
+        }
+
+    def root_fp8_evidence(self):
+        records = []
+        for name, module in self.named_modules():
+            method = getattr(module, "quant_method", None)
+            if not isinstance(method, OfflineRootFP8Method):
+                continue
+            state = method.state
+            scale = getattr(module, "vq2a8_root_scale", None)
+            records.append(
+                {
+                    "name": name,
+                    "kind": state.kind,
+                    "calls": state.calls,
+                    "weight_dtype": str(module.weight.dtype),
+                    "weight_shape": list(module.weight.shape),
+                    "scale_dtype": str(scale.dtype) if scale is not None else None,
+                    "processed": state.ready
+                    and module.weight.dtype == torch.float8_e4m3fn
+                    and scale is not None
+                    and scale.dtype == torch.float32,
+                }
+            )
+        return {
+            "mode": self._offline_root_mode,
+            "layers": records,
+            "all_processed": bool(records) and all(r["processed"] for r in records),
+            "native_fp8_root_matmul": bool(records)
+            and all(r["processed"] and r["calls"] > 0 for r in records if not r["name"].endswith("indexer.wq_b")),
+            "native_fp8_expert_dot": False,
+            "independent_reference": False,
         }
