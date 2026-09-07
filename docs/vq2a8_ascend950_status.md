@@ -1940,3 +1940,63 @@ new batch-supervisor tests. Changed-file Ruff, Markdown and spelling checks
 pass. The required `bash format.sh ci` was attempted but still cannot start
 without local `pre-commit`. No new NPU execution is claimed for this harness
 update; run the command above on the hardware machine.
+
+### Hardware batch result and public objdump limitation
+
+The user supplied `/tmp/vq2a8-ascendc-suite-qltvpdfb`: all 11 scheduled
+children passed for probes `0:0,3:0,23:127,42:0`. This covers 256 numerical
+cases and 18 resident-projection timing records, not every layer/expert.
+For probe `0:0`, gate_up/down wall medians are 15.325/7.714 ms at M=1,
+versus 39.329/9.973 ms for the accepted baseline. At M=32 they are
+15.333/7.711 ms versus 1252.946/313.861 ms. The other timed probes have
+similar measurements. The large batched ratios are against the existing
+per-row projection baseline and are not end-to-end model speedups.
+
+The library hash in the supplied binary report is
+`c8e7dfee8676dd52c5ba1882ffd7a265b53febaa7fa483b1753dea878e446677`.
+Both AIC and AIV object dumps identify `elf64-hiipu`, including fused
+entry symbols, but their address lines have no instruction bodies. This is
+consistent with the official CANN 9.1.0-beta.3
+[BiSheng companion-tool documentation](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/compiler/BishengCompiler/atlas_bisheng_10_0009.html):
+public `llvm-objdump` exposes function names and offsets for diagnostics,
+not assembly instructions. Empty bodies therefore do not prove missing
+FP8 computation, a compiler failure, or an incorrect selected architecture.
+The earlier instruction-text collection assumption was wrong.
+
+The old collector incorrectly counted address-only lines as instructions:
+the supplied 2494/3324 counts must be read as offsets, not decoded opcodes.
+The corrected collector reports `address_lines`, `empty_address_lines`,
+`undecoded_address_lines` and actual mnemonic-text `instruction_lines`
+separately. Offset-only output becomes `symbols_and_offsets_only` and the
+binary summary becomes `incomplete_review_pending`; partial/unknown opcode
+output is also not a complete instruction-text collection. Symbol names
+containing FP8/MMAD no longer count as instruction hits. None of these
+text classifications automatically certifies an ISA, FP8 execution or
+on-chip-only dataflow. Existing reports are not overwritten and their
+numerical/timing evidence remains valid within the original scope.
+
+Do not rerun the numerical campaign, clear caches, change `--mcpu`, or
+recompile merely to get different output from this documented tool. The
+next supported evidence route to evaluate is the official
+[msOpProf simulator instruction timeline](https://github.com/Ascend/msopprof/blob/master/docs/zh/user_guide/msopprof_simulator_user_guide.md).
+It can report per-core instruction/timeline data and memory-transfer
+information. The installed profiler/simulator version must be checked
+before constructing an invocation. Its current documentation also requires
+an Ascend950 simulator `lib/config.json` logging setting of `flush_level=2`;
+do not silently modify the user's global toolkit configuration. Simulation
+timings must not replace the already collected hardware timings, and
+simulated artifacts must be bound to the tested binary before claiming
+anything about that build. Instruction types and decoded-weight transfers
+still require inspection; merely seeing Cube activity is insufficient.
+
+The source path remains an FP8 `AscendC::Mmad` and bounded UB-to-L1 handoff,
+but source inspection is not machine-instruction verification. Native
+instruction/on-chip flags and default model backend are unchanged. Model
+integration is not advanced past the requested verification gate while
+the required instruction/dataflow evidence is unavailable.
+
+The collector correction adds nine regression cases; the development-host
+VQ2A8 suite passes **828 tests**. Changed-file Ruff, Markdown and spelling
+checks pass. The required `bash format.sh ci` remains blocked by missing
+local `pre-commit`. No C++ kernel or model dispatch changes are included;
+this correction requires neither a library rebuild nor a numerical rerun.

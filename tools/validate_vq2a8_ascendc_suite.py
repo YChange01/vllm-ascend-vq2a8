@@ -94,6 +94,58 @@ def discover_device_objects(build_dir):
     return found
 
 
+def inspect_instruction_text(path):
+    """Classify objdump text, not the executable ISA or its correctness.
+
+    CANN's public objdump can deliberately print only symbols and offsets.
+    Empty address lines, raw bytes and unknown opcodes are NOT instructions.
+    Even mnemonic text and FP8 keyword hits still require human ISA review.
+    """
+    addresses, empty, unknown, instructions, hits = 0, 0, 0, 0, 0
+    symbols, excerpt = [], []
+    with path.open(errors="replace") as source:
+        for line in source:
+            symbol = re.match(r"\s*[0-9a-f]+\s+<(.+)>:\s*$", line, re.I)
+            if symbol:
+                symbols.append(symbol.group(1))
+                continue
+            address = re.match(r"\s*[0-9a-f]+:\s*(.*)$", line, re.I)
+            if not address:
+                continue
+            addresses += 1
+            body = address.group(1).strip()
+            if not body:
+                empty += 1
+                continue
+            # Discard any leading encoding bytes/words. This is deliberately
+            # conservative: a raw .word or <unknown> is not an ISA decode.
+            tokens = body.split()
+            while tokens and re.fullmatch(r"(?:[0-9a-f]{2}|[0-9a-f]{4}|[0-9a-f]{8}|[0-9a-f]{16})", tokens[0], re.I):
+                tokens.pop(0)
+            if not tokens or not re.fullmatch(r"[a-z_][a-z0-9_.]*", tokens[0], re.I) or tokens[0].lower() == "unknown":
+                unknown += 1
+                continue
+            instructions += 1
+            if re.search(
+                r"\b(?:mad\w*|mmad\w*|fp8|e4m3\w*|copy_ubuf\w*|copy_cbuf\w*|set_intra\w*|wait_intra\w*)\b",
+                " ".join(tokens),
+                re.I,
+            ):
+                hits += 1
+                if len(excerpt) < 12:
+                    excerpt.append(line.strip()[:400])
+    return {
+        "address_lines": addresses,
+        "empty_address_lines": empty,
+        "undecoded_address_lines": unknown,
+        "instruction_lines": instructions,
+        "signal_line_count": hits,
+        "symbol_count": len(symbols),
+        "fused_symbols": [s for s in symbols if "vq2a8_ascendc_fused" in s],
+        "excerpt": excerpt,
+    }
+
+
 def collect_binary_evidence(library, directory):
     """Disassemble bounded native-target artifacts; opcode hits are NOT proof."""
     directory.mkdir()
@@ -130,24 +182,15 @@ def collect_binary_evidence(library, directory):
             obj.update(exit=child.returncode, status="disassembled" if child.returncode == 0 else "disassembly_failed")
         except (OSError, subprocess.TimeoutExpired) as exc:
             obj.update(status="disassembly_failed", error=str(exc))
-        hits, excerpt, instructions = 0, [], 0
-        with log.open(errors="replace") as stream:
-            for line in stream:
-                if re.match(r"\s*[0-9a-f]+:\s", line, re.I):
-                    instructions += 1
-                if re.search(
-                    r"\b(?:mad\w*|mmad\w*|fp8|e4m3\w*|copy_ubuf\w*|copy_cbuf\w*|set_intra\w*|wait_intra\w*)\b",
-                    line,
-                    re.I,
-                ):
-                    hits += 1
-                    if len(excerpt) < 12:
-                        excerpt.append(line.strip()[:400])
-        obj.update(
-            signal_line_count=hits, instruction_lines=instructions, excerpt=excerpt, disassembly_sha256=sha256(log)
-        )
-        if obj["status"] == "disassembled" and not instructions:
-            obj["status"] = "no_instructions"
+        obj.update(inspect_instruction_text(log), disassembly_sha256=sha256(log))
+        if obj["status"] == "disassembled":
+            if obj["address_lines"] and obj["empty_address_lines"] == obj["address_lines"]:
+                obj["status"] = "symbols_and_offsets_only"
+                obj["note"] = "CANN public objdump does not expose assembly; do not count offsets as instructions."
+            elif not obj["instruction_lines"]:
+                obj["status"] = "no_instructions"
+            elif obj["empty_address_lines"] or obj["undecoded_address_lines"]:
+                obj["status"] = "partial_instruction_text"
         print("ASCENDC_BINARY_RESULT " + json.dumps(obj), flush=True)
     report["status"] = (
         "collected_review_pending"

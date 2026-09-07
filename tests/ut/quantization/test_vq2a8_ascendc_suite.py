@@ -230,7 +230,7 @@ def test_campaign_continues_only_after_numeric_failures(failure, tmp_path, monke
     assert report["all_layers_sampled"] is False  # explicit subset is labelled
 
 
-@pytest.mark.parametrize("mode", ["success", "missing_tool", "timeout", "no_instructions"])
+@pytest.mark.parametrize("mode", ["success", "missing_tool", "timeout", "no_instructions", "offsets_only", "partial"])
 def test_binary_evidence_is_bounded_and_never_auto_certified(mode, tmp_path, monkeypatch):
     build = tmp_path / "build"
     objects = build / "auto_gen/vq2a8_ascendc_kernel"
@@ -250,7 +250,12 @@ def test_binary_evidence_is_bounded_and_never_auto_certified(mode, tmp_path, mon
         assert command[0] == str(tool)
         if mode == "timeout":
             raise subprocess.TimeoutExpired(command, 60)
-        kwargs["stdout"].write("header only\n" if mode == "no_instructions" else "0000: aa bb mad.fp8 mock\n")
+        text = {
+            "no_instructions": "header only\n",
+            "offsets_only": "0000 <vq2a8_ascendc_fused_2_mix_aic$local>:\n 0: \n 4:\n",
+            "partial": "0000: aa bb mad.fp8 mock\n 4: ff ff <unknown>\n",
+        }.get(mode, "0000: aa bb mad.fp8 mock\n")
+        kwargs["stdout"].write(text)
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr(suite.subprocess, "run", disassemble)
@@ -261,3 +266,21 @@ def test_binary_evidence_is_bounded_and_never_auto_certified(mode, tmp_path, mon
     assert report["native_instruction_verified"] is False
     assert report["on_chip_decode_verified"] is False
     assert report["object_linkage_to_loaded_library_verified"] is False
+    if mode == "offsets_only":
+        obj = report["objects"][0]
+        assert obj["status"] == "symbols_and_offsets_only"
+        assert obj["instruction_lines"] == obj["signal_line_count"] == 0
+        assert obj["address_lines"] == obj["empty_address_lines"] == 2
+        assert obj["fused_symbols"] == ["vq2a8_ascendc_fused_2_mix_aic$local"]
+    if mode == "partial":
+        assert report["objects"][0]["status"] == "partial_instruction_text"
+
+
+@pytest.mark.parametrize("body", ["", "  ", "00 00 00 00", "deadbeef", "00 00 <unknown>", ".word 0", "unknown"])
+def test_address_lines_are_not_instruction_evidence(body, tmp_path):
+    path = tmp_path / "object.asm.txt"
+    path.write_text(f"0000 <vq2a8_ascendc_fused_fp8_mmad>:\n    0: {body}\n")
+    result = suite.inspect_instruction_text(path)
+    assert result["address_lines"] == 1
+    assert result["instruction_lines"] == 0
+    assert result["signal_line_count"] == 0  # a symbol containing FP8 is not an opcode
