@@ -161,6 +161,35 @@ def _clone_payload(payload: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: tensor.clone() for name, tensor in payload.items()}
 
 
+def test_cpu_payload_validation_checks_every_e4m3_byte_pattern():
+    spec = _spec()
+    payload = repack_matrix_tp1(_canonical_payload(spec), spec)
+    for byte in range(256):
+        payload["codebooks"].view(torch.uint8).fill_(byte)
+        finite = bool(torch.isfinite(payload["codebooks"].float()).all())
+        if finite:
+            validate_repacked_matrix(payload, spec)
+        else:
+            with pytest.raises(ValueError, match="non-finite"):
+                validate_repacked_matrix(payload, spec)
+
+
+def test_cpu_payload_validation_avoids_torch_reductions_and_thread_mutation(monkeypatch):
+    spec = _spec(columns=512, group_size=2, rht_block_size=128)
+    payload = repack_matrix_tp1(_canonical_payload(spec), spec)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Payload validation must not create a torch reduction thread team")
+
+    monkeypatch.setattr(torch, "isfinite", forbidden)
+    monkeypatch.setattr(torch, "bincount", forbidden)
+    monkeypatch.setattr(torch, "set_num_threads", forbidden)
+    validate_repacked_matrix(payload, spec)  # includes all 256 tile IDs
+    payload["weight_scale"][-1] = float("inf")
+    with pytest.raises(ValueError, match="non-finite"):
+        validate_repacked_matrix(payload, spec)
+
+
 def _manual_repacked_codebook_weight(
     tensors: dict[str, torch.Tensor],
     spec: VQ2MatrixSpec,

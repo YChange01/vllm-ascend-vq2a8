@@ -127,6 +127,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_moe.py",
         "vq2a8_offline.py",
         "vq2a8_execution.py",
+        "vq2a8_activation.py",
     ):
         source = repo / "vllm_ascend/quantization" / name
         source_hashes[name] = hashlib.sha256(source.read_bytes()).hexdigest()

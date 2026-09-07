@@ -87,6 +87,86 @@ def freeze_fixture(tmp_path, monkeypatch):
     return model, artifact, report, frozen, environment, logits
 
 
+def native_fixture(tmp_path, monkeypatch):
+    repo, model, artifact, report, environment, logits = write_fixture(tmp_path, monkeypatch)
+    library = tmp_path / "known-good.so"
+    library.write_bytes(b"host fixture, not a device binary")
+    identity = {"path": str(library), "sha256": baseline.file_sha256(library)}
+    path = report / "summary.json"
+    summary = json.loads(path.read_text())
+    summary["execution_policy"] = "ascendc"
+    for record in summary["results"][0]["records"]:
+        data = record["data"]
+        if record["type"] == "MODEL_RESULT":
+            data.update(
+                execution_policy="ascendc",
+                expert_backend={"policy": "ascendc", "library": identity, "fallback_enabled": False},
+            )
+        elif record["type"] == "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS":
+            data.update(ascendc_model_execution_verified=True, root_linear_mode="bf16")
+    path.write_text(json.dumps(summary))
+    return repo, model, artifact, report, environment, logits, library
+
+
+def test_native_baseline_is_frozen_without_loading_or_overwriting_library(tmp_path, monkeypatch):
+    repo, model, artifact, report, environment, logits, library = native_fixture(tmp_path, monkeypatch)
+    frozen = baseline.freeze_baseline(report, tmp_path / "frozen", repo, model, artifact, 4, execution_policy="ascendc")
+    assert (frozen.parent / "native-baseline/libvq2a8_ascendc.so").read_bytes() == library.read_bytes()
+    # Offline option plumbing can change; reference and router cannot.
+    environment["source_sha256"]["vq2a8_offline.py"] = "candidate-options"
+    runs, values = baseline.load_baseline(frozen, environment, model, artifact, execution_policy="ascendc")
+    assert runs[0]["execution_policy"] == "ascendc" and torch.equal(values[0], logits)
+    environment["source_sha256"]["vq2a8_moe.py"] = "changed-router"
+    with pytest.raises(ValueError, match="compute source changed"):
+        baseline.load_baseline(frozen, environment, model, artifact, execution_policy="ascendc")
+
+
+@pytest.mark.parametrize("change", ["fallback", "library", "gate", "root", "policy", "mixed-library"])
+def test_native_baseline_rejects_missing_or_mixed_execution_evidence(tmp_path, monkeypatch, change):
+    _, _, _, report, _, _, _ = native_fixture(tmp_path, monkeypatch)
+    path = report / "summary.json"
+    summary = json.loads(path.read_text())
+    records = summary["results"][0]["records"]
+    backend = records[1]["data"]["expert_backend"]
+    if change == "fallback":
+        backend["fallback_enabled"] = True
+    elif change == "library":
+        backend["library"]["sha256"] = "unknown"
+    elif change == "mixed-library":
+        backend["library"]["sha256"] = "f" * 64
+    elif change == "gate":
+        records[-1]["data"]["ascendc_model_execution_verified"] = False
+    elif change == "root":
+        records[-1]["data"]["root_linear_mode"] = "online_fp8_sm90"
+    else:
+        records[1]["data"]["execution_policy"] = "cached"
+    path.write_text(json.dumps(summary))
+    with pytest.raises(ValueError):
+        baseline.baseline_records(report, "ascendc")
+
+
+def test_native_baseline_requires_unchanged_original_binary_and_matching_policy(tmp_path, monkeypatch):
+    repo, model, artifact, report, _, _, library = native_fixture(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="cached execution policy"):
+        baseline.baseline_records(report)
+    library.write_bytes(b"overwritten")
+    with pytest.raises(ValueError, match="missing or changed"):
+        baseline.freeze_baseline(report, tmp_path / "frozen", repo, model, artifact, 4, execution_policy="ascendc")
+
+
+def test_generation_comparison_requires_numeric_pass_and_does_not_claim_serving():
+    data = dict(run=1, baseline_exact=True, baseline_generation_s=60.0, candidate_generation_s=20.0)
+    summary = {
+        "stage": "model",
+        "baseline_report": "frozen",
+        "results": [{"records": [{"type": "MODEL_BASELINE_RESULT", "data": data}]}],
+    }
+    text = format_compact_summary(summary)
+    assert "observed_ratio=3.000 SCOPE=offline_validation_not_serving" in text
+    data["baseline_exact"] = False
+    assert "observed_ratio" not in format_compact_summary(summary)
+
+
 def test_freeze_is_copy_only_with_explicit_historical_identity_limits(tmp_path, monkeypatch):
     model, artifact, report, frozen, environment, logits = freeze_fixture(tmp_path, monkeypatch)
     assert (report / "probe-full_model.log").read_bytes() == (frozen / "probe-full_model.log").read_bytes()

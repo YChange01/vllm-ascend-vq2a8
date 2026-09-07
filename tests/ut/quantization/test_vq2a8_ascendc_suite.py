@@ -38,6 +38,7 @@ def evidence(stage, probe="0:0"):
             "oracle": {"allclose": True},
             "accepted_baseline": {"allclose": True},
             "independent_chain": {"allclose": True},
+            "row_preparation_exact": True,
         }
         if stage == "timing":
             row["timings"] = {

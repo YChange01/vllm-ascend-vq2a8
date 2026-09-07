@@ -121,8 +121,9 @@ def run_expert(args, device, emit):
     import torch
     from safetensors.torch import save_file
 
-    from tools.validate_vq2a8_phase4_kernel import accepted_rows, benchmark, prepare_rows
+    from tools.validate_vq2a8_phase4_kernel import accepted_rows, benchmark, bitwise_equal, prepare_rows
     from tools.validate_vq2a8_tp1_packed_kernel import _comparison_summary, activation_case, parse_probes
+    from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
     from vllm_ascend.quantization.vq2a8_ascendc import vq2a8_ascendc
     from vllm_ascend.quantization.vq2a8_reference import (
         decode_repacked_vq2a8_codebook_weight,
@@ -143,6 +144,7 @@ def run_expert(args, device, emit):
         dense[kind] = decode_repacked_vq2a8_codebook_weight(host, spec, compute_dtype=torch.float64)
         payloads[kind] = ({name: value.to(device) for name, value in host.items()}, spec)
     timed = args.stage == "timing"
+    row_preparation = RowwiseVQ2A8Preparation()
     for m in TIMING_ROWS if timed else ROWS:
         for case in ("deterministic",) if timed else CASES:
             spec = payloads["gate_up"][1]
@@ -152,10 +154,14 @@ def run_expert(args, device, emit):
                 key = f"{kind}:m{m}:{case}"
                 print(f"ASCENDC_START stage={args.stage} key={key}", flush=True)
                 payload, spec = payloads[kind]
-                prepared = prepare_rows(hidden, payload, spec)
+                prepared = row_preparation.rows(hidden, payload, spec)
+                original_prepared = prepare_rows(hidden, payload, spec)
+                if not all(bitwise_equal(actual, expected) for actual, expected in zip(prepared, original_prepared)):
+                    raise AssertionError("Optimized row preparation differs bitwise from the independent reference.")
                 accepted_prepared = prepare_rows(accepted_hidden, payload, spec)
                 packed = tuple(payload[name] for name in ("packed_indices", "codebooks", "codebook_tile_ids"))
                 result, actual = check_projection((*prepared, *packed), dense[kind])
+                result["row_preparation_exact"] = True
                 accepted = accepted_rows((*accepted_prepared, *packed))
                 try:
                     result["independent_chain"] = _comparison_summary(
@@ -359,6 +365,7 @@ def evidence_passed(path, stage, digest, probe="0:0"):
                 if stage in ("fused", "boundaries", "expert", "timing")
             )
             and all(r["independent_chain"]["allclose"] is True for r in rows if stage in ("expert", "timing"))
+            and all(r.get("row_preparation_exact") is True for r in rows if stage in ("expert", "timing"))
             and all(timing_evidence_passed(r) for r in rows if stage == "timing")
             and all(
                 evidence[name] is False

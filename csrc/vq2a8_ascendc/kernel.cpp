@@ -133,17 +133,21 @@ class ProjectionKernel {
     DataCopy(words, packed_[PackedOffset(group * kN + half * kHalf, start, k_)], p);
     DataCopy(ids, ids_[start], kK);
     Fence<HardEvent::MTE2_S>();
-    auto table = bookUb_.Get<uint8_t>();
-    auto dst = bUb_.Get<uint8_t>();
-    for (uint32_t row = 0; row < kHalf; ++row) {
-      for (uint32_t col = 0; col < kK; ++col) {
-        uint32_t tile = ids.GetValue(col);
-        uint32_t code = Code(words.GetValue(PackedOffset(row, col, kK)), col);
-        uint8_t value = kInvalidFp8;
-        if (tile < tiles_) {
-          value = table.GetValue(BookOffset(tile, code, row));
+    auto table = bookUb_.Get<uint16_t>();
+    auto dst = bUb_.Get<uint32_t>();
+    auto tileWords = ids.ReinterpretCast<uint32_t>();
+    // Reuse each packed word for both rows and all eight columns. Lookup
+    // both FP8 bytes together and write four adjacent NZ bytes at a time.
+    // Still scalar UB decode, but no longer a GetValue/SetValue per byte.
+    for (uint32_t row = 0; row < kHalf; row += 2) {
+      for (uint32_t col = 0; col < kK; col += 8) {
+        uint32_t codes = words.GetValue(PackedOffset(row, col, kK));
+        for (uint32_t offset = 0; offset < 8; offset += 4) {
+          uint32_t even, odd;
+          DecodeFour(codes >> (offset * 4), tileWords.GetValue((col + offset) / 4), tiles_, table, even, odd);
+          dst.SetValue(HalfNz(row, col + offset) / 4, even);
+          dst.SetValue(HalfNz(row + 1, col + offset) / 4, odd);
         }
-        dst.SetValue(HalfNz(row, col), value);
       }
     }
     Fence<HardEvent::S_MTE2>();  // packed/IDs can be overwritten next iteration

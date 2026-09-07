@@ -15,6 +15,7 @@ import time
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
 from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
 from vllm_ascend.quantization.vq2a8_reference import prepare_repacked_vq2a8_activation_reference
 from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_TORCH_DTYPES
@@ -301,24 +302,14 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
 
         if self.device.type != "npu":
             raise ValueError("AscendC projections never fall back to CPU/CUDA.")
+        # Lazily owned by this layer, not a process-global cache; no per-expert
+        # transformed weight copies and no cached input-validity decisions.
+        if not hasattr(self, "_row_preparation"):
+            self._row_preparation = RowwiseVQ2A8Preparation()
         outputs = []
         for chunk in hidden.split(ASCENDC_MAX_ROWS):
             start = time.perf_counter()
-            prepared = []
-            for row in chunk.split(1):
-                if spec.columns != spec.rht_true_columns:
-                    row = F.pad(row, (0, spec.columns - spec.rht_true_columns))
-                with torch.device("cpu"):
-                    prepared.append(
-                        prepare_repacked_vq2a8_activation_reference(
-                            row,
-                            payload["weight_scale"],
-                            payload["weight_bias"],
-                            payload["rht_sign"],
-                            spec.rht_block_size,
-                        )
-                    )
-            quantized, scale, bias = (torch.cat(values, dim=0).contiguous() for values in zip(*prepared))
+            quantized, scale, bias = self._row_preparation.rows(chunk, payload, spec)
             synchronize_execution(self.device)
             self.timing["prepare_s"] += time.perf_counter() - start
             self.prepare_batches += chunk.shape[0]
@@ -338,7 +329,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
             self.projection_rows += chunk.shape[0]
             self.native_calls += 1
             self.native_rows += chunk.shape[0]
-        return torch.cat(outputs, dim=0)
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
     def expert(self, expert_id, hidden):
         output = super().expert(expert_id, hidden)

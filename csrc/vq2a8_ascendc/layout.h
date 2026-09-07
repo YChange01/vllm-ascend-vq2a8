@@ -43,6 +43,27 @@ VQ2A8_LAYOUT_FN constexpr uint32_t BookOffset(uint32_t tile, uint32_t code, uint
 VQ2A8_LAYOUT_FN constexpr uint32_t PackedOffset(uint32_t row, uint32_t col, uint32_t k) {
   return (row / 2) * (k / 8) + col / 8;
 }
+
+// Four columns from one packed word, two output rows per codebook entry.
+// Reader.GetValue() returns a little-endian uint16_t pair, not a converted
+// FP8 value. This same implementation is exercised by the host layout test.
+// Invalid tile IDs produce NaNs without reading beyond the compact UB table.
+template <typename Reader>
+VQ2A8_LAYOUT_FN void DecodeFour(uint32_t codes, uint32_t tileIds, uint32_t tiles,
+                              const Reader& table, uint32_t& even, uint32_t& odd) {
+  even = 0;
+  odd = 0;
+  for (uint32_t lane = 0; lane < 4; ++lane) {
+    uint32_t tile = (tileIds >> (lane * 8)) & 255u;
+    uint32_t code = (codes >> (lane * 4)) & 15u;
+    uint32_t pair = uint32_t(kInvalidFp8) * 0x101u;
+    if (tile < tiles) {
+      pair = table.GetValue(tile * 16 + code);
+    }
+    even |= (pair & 255u) << (lane * 8);
+    odd |= (pair >> 8) << (lane * 8);
+  }
+}
 VQ2A8_LAYOUT_FN constexpr bool ValidDimensions(int64_t m, int64_t n, int64_t k, int64_t tiles) {
   return m > 0 && m <= kM && n > 0 && n <= kMaxDimension && n % kN == 0 && k > 0 && k <= kMaxDimension &&
          k % 512 == 0 && tiles > 0 && tiles <= kMaxTiles;

@@ -10,6 +10,14 @@
 
 using namespace vq2a8_ascendc;
 
+struct PairReader {
+  const std::vector<uint8_t>& bytes;
+  uint16_t GetValue(uint32_t offset) const {
+    assert(offset * 2 + 1 < bytes.size());
+    return uint16_t(bytes[offset * 2]) | (uint16_t(bytes[offset * 2 + 1]) << 8);
+  }
+};
+
 int main() {
   static_assert(HalfRows(0, 0) == 0);
   static_assert(HalfRows(1, 0) == 1);
@@ -72,10 +80,23 @@ int main() {
             std::copy_n(packed.begin() + PackedOffset(group * 32 + half * 16 + pair * 2, start, k), kK / 8,
                         words.begin() + pair * (kK / 8));
           }
-          for (uint32_t row = 0; row < 16; ++row) {
-            for (uint32_t col = 0; col < kK; ++col) {
-              auto code = Code(words[PackedOffset(row, col, kK)], col);
-              ub[HalfNz(row, col)] = compact[BookOffset(ids[start + col], code, row)];
+          // Exercise the actual shared word decoder, including word byte
+          // order, row-pair sharing and writes across every NZ block.
+          for (uint32_t row = 0; row < 16; row += 2) {
+            for (uint32_t col = 0; col < kK; col += 8) {
+              uint32_t codes = words[PackedOffset(row, col, kK)];
+              for (uint32_t offset = 0; offset < 8; offset += 4) {
+                uint32_t idWord = 0;
+                for (uint32_t lane = 0; lane < 4; ++lane) {
+                  idWord |= uint32_t(ids[start + col + offset + lane]) << (lane * 8);
+                }
+                uint32_t even, odd;
+                DecodeFour(codes >> (offset * 4), idWord, tiles, PairReader{compact}, even, odd);
+                for (uint32_t lane = 0; lane < 4; ++lane) {
+                  ub[HalfNz(row, col + offset + lane)] = (even >> (lane * 8)) & 255;
+                  ub[HalfNz(row + 1, col + offset + lane)] = (odd >> (lane * 8)) & 255;
+                }
+              }
             }
           }
           // Four 512-byte UB->L1 blocks, 512-byte destination gaps.
@@ -97,6 +118,25 @@ int main() {
             assert(writes[offset] == 1);
             assert(l1[offset] == expected);
           }
+        }
+      }
+    }
+  }
+  // Every possible FP8 byte, nibble and tile ID, including invalid IDs.
+  // This also asserts that invalid IDs never issue out-of-bounds lookups.
+  for (uint32_t tiles : {1u, 3u, 32u, 256u}) {
+    std::vector<uint8_t> book(tiles * 32);
+    for (uint32_t byte = 0; byte < 256; ++byte) {
+      for (uint32_t i = 0; i < book.size(); i += 2) {
+        book[i] = byte;
+        book[i + 1] = 255 - byte;
+      }
+      for (uint32_t tile = 0; tile < 256; ++tile) {
+        for (uint32_t code = 0; code < 16; ++code) {
+          uint32_t even, odd;
+          DecodeFour(code * 0x1111u, tile * 0x01010101u, tiles, PairReader{book}, even, odd);
+          assert(even == (tile < tiles ? byte : kInvalidFp8) * 0x01010101u);
+          assert(odd == (tile < tiles ? 255 - byte : kInvalidFp8) * 0x01010101u);
         }
       }
     }

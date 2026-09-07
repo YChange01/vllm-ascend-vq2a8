@@ -97,6 +97,7 @@ def good_evidence(stage):
                 "oracle": {"allclose": True},
                 "accepted_baseline": {"allclose": True},
                 "independent_chain": {"allclose": True},
+                "row_preparation_exact": True,
             }
             for key in sorted(gate.expected_keys(stage))
         ],
@@ -134,6 +135,18 @@ def test_evidence_is_fail_closed(stage, tmp_path):
         changed["results"][0][field]["allclose"] = False
         path.write_text(json.dumps(changed))
         assert not gate.evidence_passed(path, stage, "abc")
+
+
+@pytest.mark.parametrize("value", [None, False])
+def test_expert_preflight_requires_new_row_preparation_bitwise_evidence(tmp_path, value):
+    evidence = good_evidence("expert")
+    if value is None:
+        evidence["results"][0].pop("row_preparation_exact")
+    else:
+        evidence["results"][0]["row_preparation_exact"] = value
+    path = tmp_path / "expert.json"
+    path.write_text(json.dumps(evidence))
+    assert not gate.evidence_passed(path, "expert", "abc")
 
 
 @pytest.mark.parametrize("contents", ["null", "{}", "[]", "not-json"])

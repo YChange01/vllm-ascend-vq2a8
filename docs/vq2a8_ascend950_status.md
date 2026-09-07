@@ -2267,8 +2267,9 @@ The model gate then checks two independent short greedy runs for finite,
 repeat-exact logits and sampler agreement, recording timing and peak memory.
 
 Native Cube accumulation is not required to match the old serial-vector
-model bit-for-bit; `--baseline-report` remains an exact-only cached-policy
-gate and cannot be combined with AscendC. The new model report distinguishes
+model bit-for-bit; the initial integration kept `--baseline-report` as a
+cached-only gate. The optimization regression below now also permits an
+AscendC-to-AscendC exact baseline (never a cross-policy oracle). The model report distinguishes
 AscendC model **execution** from native-instruction/on-chip forensic acceptance,
 independent logits reference, quality and serving acceptance. None of those
 remaining claims is inferred merely from a short generation PASS.
@@ -2305,3 +2306,100 @@ retained layer timings/cache statistics/errors, configuration propagation
 and unchanged native routed-chain results and call coverage. Changed-file
 Ruff checks pass. The repository `format.sh ci` check remains blocked by
 missing local `pre-commit`; no new NPU performance result is claimed.
+
+### 198 full-model PASS and first performance optimization
+
+The user reported `/tmp/vq2a8-acceptance-tf_5tnxt` on **Ascend950PR_958b**,
+physical NPU 0, at code `6108258dc05bf6d35ed10b076ce84af8ac7e7fa1`.
+Library `build/vq2a8-ascendc-198/libvq2a8_ascendc.so` has SHA256
+`a7f78b6a416307a5a48282ec0aa2fb249eaa0a0bb44d1437704fc78801fa7f0f`.
+Both runs executed 43 layers, ten prefill tokens and three decode steps;
+logits were finite and repeat-exact, with AscendC expert coverage and no
+fallback. Generated IDs were `223,20,16,1` (a space, `2.` and EOS).
+This establishes short offline model execution, not general quality,
+independent-reference agreement, serving or complete native-ISA forensics.
+
+Observed last decode forward was **5.354 s**. Its layer 42 MoE took
+129.90 ms, including 110.68 ms in packed projection and 13.70 ms preparation,
+with no expert load/transfer misses in that layer call. Across the recorded
+completed calls, host validation took 116.863 s versus 1.774 s reading.
+These are synchronous diagnostic timings, not isolated device-kernel times
+or a steady-state serving benchmark. Peak allocated memory was 24.859 GiB
+with about 9 GiB of packed experts actually resident; the 61.541 GiB full
+packed-cache plan is not an observed fully resident peak.
+
+The first optimization keeps kernel synchronization, buffer sizes, FP8
+arithmetic, router, token chunks and the default backend unchanged:
+
+- The AscendC UB decoder loads one packed word per eight columns and two
+  output rows. A uint16 codebook read supplies both FP8 bytes; uint32 stores
+  write four contiguous NZ bytes. Per 16x128 tile, source-level packed-word
+  reads fall from 2048 to 128, tile-ID reads from 2048 to 256, codebook reads
+  from 2048 to 1024, and output stores from 2048 to 512. These are algorithmic
+  access counts, **not measured instruction counts or a speedup claim**.
+  Invalid tile IDs still produce NaNs without reading outside UB. This is
+  word-oriented scalar decoding, not completed vector gather/pipelining.
+- CPU payload validation still checks every codebook byte, tile population,
+  sign and normalization value. NumPy scans avoid FP32 codebook expansion
+  and PyTorch reduction thread-team overhead; no process-wide thread setting
+  changes and no validation checks are disabled. Exhaustive testing compares
+  all 256 E4M3FN byte encodings with the original torch finite predicate.
+- AscendC activation preparation reuses one bounded FP32 Hadamard constant
+  per layer runtime (replaced if device/block size changes), combines all
+  four validity decisions into one host scalar read, and avoids singleton
+  concatenation copies. **Every input is still checked on every call**;
+  there is no cached validity decision. The accepted row-wise RHT and FP8
+  rounding geometry and the independent reference implementation are unchanged.
+
+The local-tensor word views use the existing
+[AscendC LocalTensor interface](https://www.hiascend.com/document/detail/zh/canncommercial/81RC1/apiref/ascendcopapi/atlasascendc_api_07_0006.html);
+CPU FP32 finite checks use
+[NumPy isfinite](https://numpy.org/doc/stable/reference/generated/numpy.isfinite.html).
+The exact shared C++ decoder is host-tested over row halves, NZ boundaries,
+all codebook byte patterns, all nibbles/tile IDs, and invalid IDs. These host
+checks do not replace an AscendC compile and execution on 198.
+
+The short hardware preflight now also compares the optimized preparation's
+FP8 bytes, FP32 scales and biases **bit-for-bit** against the unchanged
+reference on the same device. Missing preparation evidence fails the gate.
+The existing `--baseline-report` option now accepts a matching AscendC PASS,
+copies its report/logits and hash-checked original library without changing
+them, and requires exact model logits and tokens across both new runs.
+Packages and reference/router/attention sources remain pinned; the candidate
+cache/preparation integration may differ. Historical dirty source hashes
+remain recorded facts, not reconstructed historical source files. The report
+prints per-run generation time comparisons explicitly scoped to offline
+validation, never as serving throughput or an independent quality oracle.
+
+Run this once on 198. It builds only the standalone native library into a
+**new directory**, checks 34 short cases, and continues to the two model runs
+and frozen-baseline comparison. No simulator or editable reinstall is needed.
+Keep the original report, library and build manifest intact.
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8 &&
+git pull --ff-only &&
+/usr/local/python3.11.10/bin/python3 -u tools/build_vq2a8_ascendc.py --soc Ascend950PR_958b --build-dir build/vq2a8-ascendc-opt1-198 &&
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_tp1_acceptance.py --stage model --execution-policy ascendc --ascendc-library build/vq2a8-ascendc-opt1-198/libvq2a8_ascendc.so --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 0 --baseline-report /tmp/vq2a8-acceptance-tf_5tnxt
+```
+
+Do not overwrite `build/vq2a8-ascendc-198`: the baseline snapshot checks that
+its original SHA256 still matches. `BASELINE_EXACT=PASS` is required alongside
+`ACCEPTANCE=PASS`. An old cached/Triton report is intentionally not accepted
+as an exact AscendC baseline. Wider vectorization, overlapping Cube/vector
+work and grouped expert scheduling remain subsequent performance work;
+independent quality and serving acceptance remain separate delivery gates.
+
+New native build, physical-device correctness and speedup are **pending**.
+No new NPU result is claimed from CPU tests or operation-count reductions.
+
+All **1000 VQ2A8 host tests pass** (19.50 s on the Linux development host).
+A synthetic 4096x4096 payload validation benchmark replayed the prior
+`58281b76` validator against the new validator on identical resident CPU
+data, alternating order for ten samples after three warmups. Median times
+were 0.375/0.068 ms (old/new, four torch threads) and 0.386/0.066 ms (32
+threads). This is a CPU-only microbenchmark, not a measurement of the user's
+384-thread host, disk loading, native kernel speed or model generation.
+Changed-file Ruff, Markdown and spelling checks pass; the full
+`bash format.sh ci` hook runner remains unavailable because local
+`pre-commit` is not installed.

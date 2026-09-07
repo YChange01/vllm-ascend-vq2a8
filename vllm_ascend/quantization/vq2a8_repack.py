@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 
 from vllm_ascend.quantization.vq2a8_artifact import (
@@ -217,7 +218,11 @@ def validate_repacked_matrix(
             f"shape={tuple(codebooks.shape)}; expected dtype={torch.float8_e4m3fn}, "
             f"shape={expected_codebook_shape}."
         )
-    if not bool(torch.isfinite(codebooks.float()).all()):
+    # E4M3FN has exactly two non-finite byte patterns, 0x7f and 0xff.
+    # Inspect every byte without an FP32 expansion or a large PyTorch
+    # intra-op thread team (the target host was using 384 threads).
+    book_bytes = codebooks.view(torch.uint8).numpy()
+    if np.any((book_bytes & 0x7F) == 0x7F):
         raise ValueError(f"{spec.name}.codebooks contains non-finite values.")
 
     tile_ids = tensors["codebook_tile_ids"]
@@ -227,17 +232,17 @@ def validate_repacked_matrix(
             f"shape={tuple(tile_ids.shape)}; expected dtype={torch.uint8}, "
             f"shape=({spec.columns},)."
         )
-    tile_ids_int64 = tile_ids.to(torch.int64)
-    if bool((tile_ids_int64 >= spec.column_tiles).any()):
+    tile_ids_array = tile_ids.numpy()
+    if np.any(tile_ids_array >= spec.column_tiles):
         raise ValueError(f"{spec.name}.codebook_tile_ids contains a value outside [0, {spec.column_tiles}).")
-    actual_tile_counts = torch.bincount(tile_ids_int64, minlength=spec.column_tiles)
-    expected_tile_counts = torch.full(
+    actual_tile_counts = np.bincount(tile_ids_array, minlength=spec.column_tiles)
+    expected_tile_counts = np.full(
         (spec.column_tiles,),
         spec.group_size,
-        dtype=torch.int64,
+        dtype=np.int64,
     )
     expected_tile_counts[-1] = spec.columns - (spec.column_tiles - 1) * spec.group_size
-    if not torch.equal(actual_tile_counts, expected_tile_counts):
+    if not np.array_equal(actual_tile_counts, expected_tile_counts):
         raise ValueError(
             f"{spec.name}.codebook_tile_ids has counts {actual_tile_counts.tolist()}, "
             f"expected {expected_tile_counts.tolist()}."
@@ -250,7 +255,7 @@ def validate_repacked_matrix(
                 f"{spec.name}.{name}: dtype={tensor.dtype}, shape={tuple(tensor.shape)}; "
                 f"expected dtype={torch.float32}, shape=({spec.columns},)."
             )
-        if not bool(torch.isfinite(tensor).all()):
+        if not np.isfinite(tensor.detach().numpy()).all():
             raise ValueError(f"{spec.name}.{name} contains non-finite values.")
 
     rht_sign = tensors["rht_sign"]
@@ -259,8 +264,8 @@ def validate_repacked_matrix(
             f"{spec.name}.rht_sign: dtype={rht_sign.dtype}, shape={tuple(rht_sign.shape)}; "
             f"expected dtype={torch.int8}, shape=({spec.columns},)."
         )
-    signs = rht_sign.to(torch.int16)
-    if not bool(((signs == -1) | (signs == 1)).all()):
+    signs = rht_sign.numpy()
+    if not ((signs == -1) | (signs == 1)).all():
         raise ValueError(f"{spec.name}.rht_sign contains values other than -1 and 1.")
 
 

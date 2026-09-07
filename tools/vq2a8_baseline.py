@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from datetime import datetime, timezone
@@ -22,8 +23,10 @@ def file_sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def baseline_records(report: Path) -> tuple[dict, list[dict], dict]:
+def baseline_records(report: Path, execution_policy: str = "cached") -> tuple[dict, list[dict], dict]:
     """Fail before model construction if the previous gate/evidence is incomplete."""
+    if execution_policy not in ("cached", "ascendc"):
+        raise ValueError("Exact regression requires a cached or ascendc baseline.")
     summary = json.loads((report / "summary.json").read_text(encoding="utf-8"))
     results = summary.get("results", [])
     if (
@@ -55,8 +58,23 @@ def baseline_records(report: Path) -> tuple[dict, list[dict], dict]:
         path = report / "model-evidence" / f"run-{run['run']}-logits.safetensors"
         if path.is_symlink() or not path.is_file() or file_sha256(path) != run.get("logits_sha256"):
             raise ValueError(f"Baseline logits missing or SHA256 mismatch: {path}")
-        if run.get("finite_logits") is not True or run.get("execution_policy") != "cached":
-            raise ValueError("Baseline must have finite logits and the cached execution policy.")
+        if run.get("finite_logits") is not True or run.get("execution_policy") != execution_policy:
+            raise ValueError(f"Baseline must have finite logits and the {execution_policy} execution policy.")
+        if execution_policy == "ascendc":
+            backend = run.get("expert_backend", {})
+            digest = backend.get("library", {}).get("sha256", "")
+            if (
+                gates[0].get("ascendc_model_execution_verified") is not True
+                or gates[0].get("root_linear_mode") != "bf16"
+                or backend.get("policy") != "ascendc"
+                or backend.get("fallback_enabled") is not False
+                or not isinstance(digest, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or backend.get("library") != runs[0].get("expert_backend", {}).get("library")
+            ):
+                raise ValueError(
+                    "Native baseline lacks verified no-fallback execution and a consistent library identity."
+                )
     return summary, runs, environments[0]
 
 
@@ -78,13 +96,20 @@ def capture_input_identity(model: Path, artifact: Path) -> dict:
 
 
 def freeze_baseline(
-    report: Path, destination: Path, repo: Path, model: Path, artifact: Path, physical_npu: int
+    report: Path,
+    destination: Path,
+    repo: Path,
+    model: Path,
+    artifact: Path,
+    physical_npu: int,
+    *,
+    execution_policy: str = "cached",
 ) -> Path:
     report = report.resolve(strict=True)
     destination = destination.resolve()
     if destination == report or report in destination.parents:
         raise ValueError("Baseline destination must be outside the original report.")
-    summary, _, environment = baseline_records(report)
+    summary, runs, environment = baseline_records(report, execution_policy)
     if (
         summary.get("device") != "npu:0"
         or summary.get("physical_npu") != physical_npu
@@ -100,7 +125,21 @@ def freeze_baseline(
     destination.mkdir(parents=True, exist_ok=False)
     frozen = destination / "report"
     shutil.copytree(report, frozen)
-    baseline_records(frozen)
+    baseline_records(frozen, execution_policy)
+    if execution_policy == "ascendc":
+        library = runs[0]["expert_backend"]["library"]
+        source = Path(library["path"])
+        if not source.is_file() or file_sha256(source) != library["sha256"]:
+            raise ValueError("Original AscendC baseline library is missing or changed; preserve the known-good build.")
+        binary = destination / "native-baseline"
+        binary.mkdir()
+        frozen_library = binary / "libvq2a8_ascendc.so"
+        shutil.copy2(source, frozen_library)
+        if file_sha256(frozen_library) != library["sha256"]:
+            raise ValueError("AscendC baseline library changed while being copied.")
+        manifest = source.parent / "build-manifest.json"
+        if manifest.is_file():
+            shutil.copy2(manifest, binary / manifest.name)
     snapshot = {
         "captured_utc": datetime.now(timezone.utc).isoformat(),
         "original_report": str(report),
@@ -140,12 +179,14 @@ def freeze_baseline(
     return frozen
 
 
-def load_baseline(report: Path, environment: dict, model: Path, artifact: Path) -> tuple[list[dict], list]:
+def load_baseline(
+    report: Path, environment: dict, model: Path, artifact: Path, *, execution_policy: str = "cached"
+) -> tuple[list[dict], list]:
     """CPU-only preflight, after importing torch in the supervised child."""
     import torch
     from safetensors.torch import load_file
 
-    _, runs, previous_environment = baseline_records(report)
+    _, runs, previous_environment = baseline_records(report, execution_policy)
     for name in ("torch", "torch-npu", "triton", "triton-ascend", "vllm", "safetensors"):
         if previous_environment.get("packages", {}).get(name) != environment.get("packages", {}).get(name):
             raise ValueError(f"Baseline package changed: {name}; same-environment exact regression required.")
@@ -160,6 +201,11 @@ def load_baseline(report: Path, environment: dict, model: Path, artifact: Path) 
         "vllm_ascend/attention/dsa_v1.py",
         "vllm_ascend/ops/linear.py",
     ):
+        # The native candidate can change cache/preparation integration, but
+        # not the independent reference, router/shared math or attention.
+        # All source changes are still recorded in the frozen snapshot.
+        if execution_policy == "ascendc" and name == "vq2a8_offline.py":
+            continue
         expected = previous_environment.get("source_sha256", {}).get(name)
         if not expected or environment.get("source_sha256", {}).get(name) != expected:
             raise ValueError(f"Phase-1 compute source changed or identity absent: {name}")
@@ -203,4 +249,8 @@ def compare_baseline_run(previous: dict, expected, current: dict, actual) -> dic
         "logits_equal": logits_equal,
         "max_abs_error": float((actual - expected).abs().max()) if shape_dtype_equal else None,
         "independent_reference": False,
+        "baseline_library_sha256": previous.get("expert_backend", {}).get("library", {}).get("sha256"),
+        "candidate_library_sha256": current.get("expert_backend", {}).get("library", {}).get("sha256"),
+        "baseline_generation_s": previous.get("generation_s"),
+        "candidate_generation_s": current.get("generation_s"),
     }

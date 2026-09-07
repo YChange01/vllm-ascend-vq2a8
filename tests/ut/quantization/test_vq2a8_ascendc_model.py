@@ -43,6 +43,7 @@ def child_evidence(stage):
                 "oracle": {"allclose": True},
                 "accepted_baseline": {"allclose": True},
                 "independent_chain": {"allclose": True},
+                "row_preparation_exact": True,
                 "timings": {
                     "candidate": stats,
                     "accepted_baseline": stats,

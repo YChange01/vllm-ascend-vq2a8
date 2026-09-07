@@ -133,6 +133,16 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                     f"BASELINE_EXACT={'PASS' if exact else 'NOT_PASSED'} "
                     f"completed={len(comparisons)}/2 INDEPENDENT_REFERENCE=False"
                 )
+                for comparison in comparisons:
+                    old = comparison.get("baseline_generation_s")
+                    new = comparison.get("candidate_generation_s")
+                    if comparison.get("baseline_exact") is True and all(
+                        type(v) in (int, float) and math.isfinite(v) and v > 0 for v in (old, new)
+                    ):
+                        lines.append(
+                            f"BASELINE_GENERATION run={comparison['run']} baseline_s={old:.3f} candidate_s={new:.3f} "
+                            f"observed_ratio={old / new:.3f} SCOPE=offline_validation_not_serving"
+                        )
             if not result.get("passed"):
                 lines.append(
                     f"  exit={result.get('returncode')} timeout={result.get('timed_out', False)} "
@@ -372,8 +382,8 @@ def main() -> int:
             parser.error("AscendC preflight/model must use the same canonical model/experts_vq_ascend_v2 artifact.")
     elif args.ascendc_library is not None:
         parser.error("--ascendc-library requires explicit --execution-policy ascendc.")
-    if args.baseline_report and (args.stage != "model" or args.execution_policy in ("baseline", "ascendc")):
-        parser.error("--baseline-report requires the cached model stage.")
+    if args.baseline_report and (args.stage != "model" or args.execution_policy == "baseline"):
+        parser.error("--baseline-report requires the cached or ascendc model stage, using a matching-policy PASS.")
     if args.root_linear_mode != "bf16" and (args.stage != "model" or args.baseline_report):
         parser.error("Online root FP8 requires --stage model and cannot use the phase-1 exact BF16 baseline.")
     if (
@@ -419,7 +429,13 @@ def main() -> int:
     frozen_baseline = None
     if args.baseline_report:
         frozen_baseline = freeze_baseline(
-            args.baseline_report, output / "baseline", repo, model, artifact, args.physical_npu
+            args.baseline_report,
+            output / "baseline",
+            repo,
+            model,
+            artifact,
+            args.physical_npu,
+            execution_policy=args.execution_policy,
         )
     child_env = acceptance_environment(repo, args.physical_npu, args.device)
     summary: dict[str, Any] = {

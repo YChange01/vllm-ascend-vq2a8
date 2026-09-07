@@ -57,7 +57,7 @@ def main() -> None:
             parser.error("AscendC requires --ascendc-library and the short --ascendc-preflight receipt.")
     elif args.ascendc_library or args.ascendc_preflight:
         parser.error("Native library/preflight options require execution-policy ascendc.")
-    if args.baseline_report and (args.root_linear_mode != "bf16" or args.execution_policy == "ascendc"):
+    if args.baseline_report and args.root_linear_mode != "bf16":
         parser.error("The phase-1 BF16 baseline is not an exact oracle for online FP8; do not mix these gates.")
     model_root, artifact_root = args.model.resolve(strict=True), args.artifact.resolve(strict=True)
     output = args.output_dir.resolve()
@@ -103,7 +103,9 @@ def main() -> None:
     previous_runs, previous_logits = None, None
     if args.baseline_report:
         print("MODEL stage=baseline_preflight", flush=True)
-        previous_runs, previous_logits = load_baseline(args.baseline_report, environment, model_root, artifact_root)
+        previous_runs, previous_logits = load_baseline(
+            args.baseline_report, environment, model_root, artifact_root, execution_policy=args.execution_policy
+        )
         print("BASELINE_PREFLIGHT=PASS INDEPENDENT_REFERENCE=False", flush=True)
     print("MODEL stage=device_init_start", flush=True)
     print("DEVICE " + json.dumps(_initialize_device(torch.device(args.device))), flush=True)
@@ -227,7 +229,7 @@ def main() -> None:
             print("MODEL_BASELINE_RESULT " + json.dumps(comparison), flush=True)
             if not comparison["baseline_exact"]:
                 raise AssertionError(
-                    "Offline logits/tokens differ from the frozen phase-1 baseline; evidence retained."
+                    "Offline logits/tokens differ from the frozen same-policy baseline; evidence retained."
                 )
         if baseline_logits is not None:
             if tokens != baseline_tokens or not torch.equal(logits, baseline_logits):
