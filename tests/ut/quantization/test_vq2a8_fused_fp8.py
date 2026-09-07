@@ -255,6 +255,30 @@ def test_save_codegen_rejects_silent_fp16_mma(tmp_path):
     assert (tmp_path / "codegen/kernel.ptx").is_file()
 
 
+def test_direct_retains_codegen_before_an_oracle_failure(tmp_path, monkeypatch):
+    import tools.validate_vq2a8_fused_fp8 as driver
+    import tools.validate_vq2a8_phase4_kernel as checks
+    import tools.validate_vq2a8_tp1_packed_kernel as runtime
+    import vllm_ascend.quantization.vq2a8_fused_fp8 as kernel
+
+    compiled = SimpleNamespace(asm={"ttir": "diagnostic IR"}, metadata="unreviewed")
+    monkeypatch.setattr(runtime, "environment_report", lambda: {})
+    monkeypatch.setattr(runtime, "_initialize_device", lambda device: {"type": "host-test"})
+    monkeypatch.setattr(kernel, "launch_cube_control", lambda *args, **kwargs: (None, compiled))
+
+    def reject(*args):
+        assert (tmp_path / "direct-codegen/direct-m32/kernel.ttir").read_text() == "diagnostic IR"
+        raise AssertionError("oracle mismatch")
+
+    monkeypatch.setattr(checks, "compare", reject)
+    args = argparse.Namespace(device="cpu", stage="direct", probe="0:0", output=tmp_path / "direct.json")
+    with pytest.raises(AssertionError, match="oracle mismatch"):
+        driver.run_child(args)
+    report = json.loads(args.output.read_text())
+    assert report["status"] == "failed" and report["results"] == []
+    assert report["native_instruction_verified"] is False
+
+
 def test_cuda_report_must_have_actual_native_instruction(tmp_path):
     path = tmp_path / "report.json"
     report = valid_evidence("fused", "cuda:0")

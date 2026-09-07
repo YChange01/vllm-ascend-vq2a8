@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.quantization.vq2a8_fp8_cube import ascend_fp8_dot_unit_scale
 from vllm_ascend.quantization.vq2a8_kernel_contract import validate_vq2a8_tp1_m1_inputs
 
 BLOCK_M = 32
@@ -103,16 +104,7 @@ def _vq_decode_cube_kernel(
         # The decoded E4M3 tensor is the actual dot operand, not a diagnostic
         # side branch. No FP32 Vector multiply/reduce or dense GM fallback.
         if ASCEND:
-            accumulator = tl.dot_scaled(
-                activation,
-                None,
-                "e4m3",
-                tl.trans(weights),
-                None,
-                "e4m3",
-                acc=accumulator,
-                out_dtype=tl.float32,
-            )
+            accumulator = ascend_fp8_dot_unit_scale(activation, tl.trans(weights), accumulator)
         else:
             # SM90 WGMMA's default permits long reduced-precision partial
             # accumulation. Bound it before adding partials in FP32; otherwise
@@ -179,9 +171,7 @@ def _cube_bridge_kernel(
         if BRIDGE:
             b = (b.to(tl.uint8, bitcast=True) ^ 128).to(tl.float8e4nv, bitcast=True)
         if ASCEND:
-            accumulator = tl.dot_scaled(
-                a, None, "e4m3", tl.trans(b), None, "e4m3", acc=accumulator, out_dtype=tl.float32
-            )
+            accumulator = ascend_fp8_dot_unit_scale(a, tl.trans(b), accumulator)
         else:
             accumulator = tl.dot(a, tl.trans(b), acc=accumulator, out_dtype=tl.float32, max_num_imprecise_acc=32)
     tl.store(Y + rows[:, None] * 32 + outputs[None, :], accumulator, mask=rows[:, None] < M)

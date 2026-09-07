@@ -123,6 +123,7 @@ def environment_report() -> dict[str, Any]:
         "vq2a8_vector_gather.py",
         "vq2a8_phase4_micro.py",
         "vq2a8_fused_fp8.py",
+        "vq2a8_fp8_cube.py",
         "vq2a8_moe.py",
         "vq2a8_offline.py",
         "vq2a8_execution.py",

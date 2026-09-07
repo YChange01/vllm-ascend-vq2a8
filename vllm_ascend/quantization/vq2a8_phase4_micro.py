@@ -9,6 +9,8 @@ with MTE alignment errors; a PASS here does not certify packed expert GEMM.
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.quantization.vq2a8_fp8_cube import ascend_fp8_dot_unit_scale
+
 
 @triton.jit
 def _fp8_cube_micro(A, B, Y, BRIDGE: tl.constexpr, ASCEND: tl.constexpr):
@@ -20,7 +22,7 @@ def _fp8_cube_micro(A, B, Y, BRIDGE: tl.constexpr, ASCEND: tl.constexpr):
         # No packed decode, dynamic GM gather or tiny unaligned transfer.
         b = (b.to(tl.uint8, bitcast=True) ^ 128).to(tl.float8e4nv, bitcast=True)
     if ASCEND:
-        result = tl.dot_scaled(a, None, "e4m3", tl.trans(b), None, "e4m3")
+        result = ascend_fp8_dot_unit_scale(a, tl.trans(b), tl.zeros((32, 32), tl.float32))
     else:
         result = tl.dot(a, tl.trans(b), out_dtype=tl.float32)
     tl.store(Y + rows[:, None] * 32 + rows[None, :], result)

@@ -217,6 +217,7 @@ def run_child(args):
 
     from tools.validate_vq2a8_phase4_kernel import bitwise_equal, compare, synthetic_dense_oracle, synthetic_inputs
     from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device, environment_report
+    from vllm_ascend.quantization.vq2a8_fp8_cube import ascend_fp8_unit_scale_contract
     from vllm_ascend.quantization.vq2a8_fused_fp8 import launch_cube_control
 
     device = torch.device(args.device)
@@ -226,6 +227,7 @@ def run_child(args):
         "device": args.device,
         "probe": args.probe,
         "environment": environment_report(),
+        "dot_scale_contract": ascend_fp8_unit_scale_contract() if device.type == "npu" else None,
         "results": [],
         "npu_execution_verified": False,
         "native_instruction_verified": False,
@@ -255,6 +257,7 @@ def run_child(args):
 
     save()
     print("ENVIRONMENT " + json.dumps(report["environment"]), flush=True)
+    print("FUSED_DOT_SCALE_CONTRACT " + json.dumps(report["dot_scale_contract"]), flush=True)
     codegen_root = args.output.parent / f"{args.output.stem}-codegen"
     try:
         report["device_info"] = _initialize_device(device)
@@ -268,6 +271,7 @@ def run_child(args):
                 expected = (a.double() @ b.double().T * (-1 if args.stage == "bridge" else 1)).bfloat16()
                 da, db = a.to(device), b.to(device)
                 actual, compiled = launch_cube_control(da, db, bridge=args.stage == "bridge")
+                codegen = save_codegen(compiled, codegen_root / key.replace(":", "-"))
                 comparison = compare(expected, actual)
                 for _ in range(3):
                     if not bitwise_equal(actual, launch_cube_control(da, db, bridge=args.stage == "bridge")[0]):
@@ -278,7 +282,7 @@ def run_child(args):
                         "oracle": comparison,
                         "repeat_exact": True,
                         "synthetic_only": True,
-                        "codegen": save_codegen(compiled, codegen_root / key.replace(":", "-")),
+                        "codegen": codegen,
                     },
                 )
         elif args.stage == "fused":

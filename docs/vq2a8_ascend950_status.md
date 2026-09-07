@@ -1417,8 +1417,9 @@ The K=128 FP32 accumulation is checked numerically, not declared bit-exact
 to the accepted K=512 Vector reduction. There is no FP32 Vector MAC
 fallback in this prototype.
 
-Ascend uses `tl.dot_scaled` with E4M3 operands and no microscale tensors;
-the existing row scale/bias is applied once after accumulation. The
+Ascend uses `tl.dot_scaled` with E4M3 operands and explicit byte-encoded
+unit microscale tensors for the installed 3.2.2/A5 contract; the existing
+row scale/bias is applied once after accumulation. The
 [official dot_scaled reference](https://triton-ascend.readthedocs.io/en/latest/python-api/generated/triton.language.dot_scaled.html)
 lists Ascend 950 FP8 support and a K multiple-of-64 restriction. That
 documentation does not certify this CV pipeline on the user's installed
@@ -1522,3 +1523,63 @@ establish Ascend direct/CV/VQ-dot execution and inspect its generated
 memory plan and FP8 instructions. Real-chain numerical convergence,
 broader expert coverage and opt-in model integration remain required work,
 not postponed checks that may be marked PASS. Phase 2 stays skipped.
+
+### Ascend direct control: explicit unit-scale frontend fix
+
+The user's first fused-prototype run at `5b9a897b` failed in `direct`,
+before any Cube execution, at
+`/tmp/vq2a8-fused-fp8-s8zu7t1c`. Triton-Ascend
+`3.2.2+dev20260729205041` rejected `lhs_scale=None` with
+`lhs_scale must be int8 or uint8 tensor`. The original assumption that
+this frontend accepts omitted scales was incorrect. This is not a C++
+extension, packed-artifact, device-memory-capacity or numerical-gate error.
+
+`vq2a8_fp8_cube.py` supplies both sides explicitly for all three Ascend
+callers: fused VQ projection, matching-geometry direct/bridge control and
+the older optional Cube microtest. The constants are produced inside the
+kernel, with no extra wrapper allocation, CPU transfer or scale GM input.
+For the prototype's K=128 dot tile, both scale tensors are uint8 `[32,8]`;
+the older K=512 control uses `[32,32]`. The RHS scale remains N-major even
+though its matrix operand is transposed to `[K,N]`.
+
+The encoding and version-specific shape are deliberately separated:
+
+- The [official A5 FP8 test](https://github.com/triton-lang/triton-ascend/blob/c747daae7f67fb7acd1013bf9793505aec1dc9e2/third_party/ascend/unittest/pytest_ut/test_dot_scaled_fp4_fp8.py)
+  decodes scale bytes as `2**(byte-127)`, so byte `127` is one. This is not
+  the signed-exponent convention used by its older BF16 tests.
+- The [Ascend API restriction](https://triton-ascend.readthedocs.io/en/latest/python-api/generated/triton.language.dot_scaled.html)
+  specifies FP8 scale shapes `[M,K/16]` and `[N,K/16]` on 950. This patch
+  targets the user's 3.2.2/A5 build. Newer main-branch FP8 tests use K/32;
+  their layout must not be substituted without revalidating the compiler.
+- The [3.2.2 frontend](https://github.com/triton-lang/triton-ascend/blob/2deb5df0254e23ec750443f175340b38a196097e/python/triton/language/semantic.py)
+  requires a byte tensor for the LHS. Both scales are now explicit, without
+  relying on the backend's implicit RHS handling.
+
+These are identity controls only: packed bytes, FP8 activation and weight
+values, the FP32 accumulator, A8 row-scale/bias epilogue and tolerances
+remain unchanged. CUDA still uses its existing native `tl.dot` branch.
+The new `FUSED_DOT_SCALE_CONTRACT` record and helper source hash are saved
+even when compilation fails. Direct-control compiler artifacts are now
+retained before numerical comparison, including on a subsequent oracle
+failure. They are still not marked as reviewed native/CV evidence.
+
+Host regressions execute the real helper and each actual Ascend call
+branch against a strict byte-scale recorder, checking dtype, shapes,
+RHS orientation, E8M0 identity and nonzero chained accumulation. They
+explicitly do not execute an Ascend compiler or emulate Cube arithmetic.
+An NPU rerun of the synthetic-only supervisor is still required; no
+Ascend PASS, real-chain convergence or phase-4 completion is claimed.
+
+This fix passes **746 VQ2A8 development tests** (17.67 seconds) on the
+NVIDIA/host development system, including 11 new scale-contract tests and
+a regression for codegen retention on direct-oracle failure. The CUDA
+synthetic supervisor also passes 4 direct, 4 bridge and 20 fused cases at
+`/tmp/vq2a8-fused-fp8-xknkh9yd`, with native E4M3 PTX checks intact. The
+previous real-expert chain FAIL remains unresolved and is not overwritten
+by these synthetic checks. Ruff check/format, Markdown lint and
+`git diff --check` pass; required `bash format.sh ci` was attempted but
+remains blocked by missing local `pre-commit`.
+
+Pull this Python/Triton update and use the same synthetic-only command
+above. Do not rebuild C++, repack weights, clear caches or run the full
+model to diagnose this frontend failure.
