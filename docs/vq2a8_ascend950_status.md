@@ -1851,3 +1851,92 @@ is no need to delete the build directory or reinstall the package. Run the
 standalone validation only after `ASCENDC_BUILD=PASS`. Passing this source
 regression test does not establish successful CANN compilation or NPU
 execution; both remain awaiting the next hardware-machine build/run.
+
+### AscendC hardware progress and one-command batch validation
+
+The subsequent user-machine build reports `ASCENDC_BUILD=PASS` and produces
+`build/vq2a8-ascendc/libvq2a8_ascendc.so`. The user supplied standalone
+synthetic PASS evidence in `/tmp/vq2a8-ascendc-g1ewqxdd`, followed by real
+selected-expert gate_up/down-chain PASS evidence in
+`/tmp/vq2a8-ascendc-7ldsczv6`. Those reports include oracle/baseline checks,
+bitwise repetition and row-chunk invariance. This establishes progress beyond
+the earlier build failure, but not all-expert coverage or model integration.
+Native instruction, on-chip decode and performance flags remain false.
+
+To avoid another manual run/paste cycle for each probe, the batch supervisor
+now schedules the remaining standalone coverage in one command:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_ascendc_suite.py --physical-npu 4 --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256
+```
+
+This update changes validation tools only: **reuse the successfully built
+native library; no C++ rebuild is needed**. Library and native-source hashes
+are still checked against the successful build manifest. No Triton backend
+replacement, model dispatch change, compiler patch, cache removal or repack
+is performed.
+
+The default plan for the 43-layer, 3-hash-layer, 256-routed-expert checkpoint:
+
+| Coverage | Work scheduled |
+| --- | --- |
+| Shared controls | Direct FP8, Vector-to-Cube sign-bit bridge and synthetic packed gates once |
+| Additional boundaries | M=2/15/31, 29 output groups exceeding 28 AICs, N=65536 and K=65536 |
+| Real experts | One stored expert per layer; first/middle/last routed layers also sample IDs 0/127/135/255 |
+| Numerical total | 54 distinct probes, 64 shared cases plus 2592 expert projection cases: 2656 cases |
+| Timing samples | First/middle/last selected probes, gate_up and down at M=1/17/32: 18 measurements |
+| Native binary evidence | Bounded native-target ELF object discovery, hashes and CANN llvm-objdump output |
+
+There are 61 isolated child processes. All 43 layers are sampled, **not all
+10,243 stored experts**; this is not a 43-layer model forward. Expert cases
+retain deterministic/zero/impulse/small inputs, same-FP8 CPU oracle,
+accepted projection baseline, independent accepted chain, three exact
+repeats and exact row-chunk checks. Existing tolerances are unchanged.
+Boundary shapes are tested independently, not as a maximum-N by maximum-K
+allocation. Optional `--probes 0:0,3:135,42:255` selects a smaller explicit
+subset and labels its limited layer coverage in the report.
+
+Correctness children retain launch blocking. Timing uses separate children
+with `ASCEND_LAUNCH_BLOCKING=0`, at least 3 warmups and 10 repeats. It records
+synchronized wall and device-event min/median/p95 for identically prepared,
+resident candidate and accepted-baseline projection inputs. First projection
+call time and Torch allocator peak delta are also recorded; the latter does
+not include all CANN internal allocations. Preparation, expert loading,
+routing and the full model are outside warm projection timings. Observed
+wall-time ratios are measurements for review, not an accepted inference
+speedup. `--warmups` and `--repeats` can increase the samples.
+
+Only confirmed numerical assertion failures in an expert/timing child allow
+later probes to continue. A shared-control failure, device/runtime error,
+timeout or missing/incomplete evidence stops subsequent NPU work. Failed
+expert probes are not timed; skipped work remains visible. Different probe
+failures have distinct tensor artifact filenames. Per-child timeout defaults
+to 3600 seconds and is configurable with `--timeout`; the suite has no
+promised wall-clock duration.
+
+The supervisor prints its report directory immediately, updates `summary.txt`
+and `summary.json` after each child, and prints the compact summary at the end.
+Send that summary, not an archive or thousands of result lines. It includes
+per-stage failures and representative timings. The `binary/` subdirectory
+contains native object metadata, disassembly and short instruction excerpts.
+Missing disassembly tools or failed object inspection are explicitly recorded
+as incomplete evidence and do not suppress numerical testing.
+
+Instruction name matches alone never certify FP8 execution or on-chip decode:
+review operand types, UB/L1/L0 transfers and object-to-loaded-library linkage.
+Successful numerical/timing completion is labelled `COMPLETED_REVIEW_PENDING`,
+not full acceptance. Native instruction, on-chip decode, performance, model
+integration, quality and serving flags stay false pending their own evidence.
+Full-model testing with this backend requires integration work first; rerunning
+the old backend's phase 3 would not validate this AscendC implementation.
+
+The new host tests exercise probe planning, complete receipts, timing validation,
+failure continuation/abort rules and bounded binary collection with mocked
+device subprocesses. They do not substitute for the user-machine batch run.
+The updated VQ2A8 development-host suite passes **819 tests**, including 36
+new batch-supervisor tests. Changed-file Ruff, Markdown and spelling checks
+pass. The required `bash format.sh ci` was attempted but still cannot start
+without local `pre-commit`. No new NPU execution is claimed for this harness
+update; run the command above on the hardware machine.

@@ -13,10 +13,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -41,6 +44,15 @@ SHAPES = (
     (17, 64, 1024, 256),
     (32, 96, 512, 3),
 )
+BOUNDARY_SHAPES = (
+    (2, 32, 512, 1),
+    (15, 64, 1024, 3),
+    (31, 96, 4096, 32),
+    (32, 928, 512, 3),  # 29 output groups: exceeds this 950's 28 AICs
+    (1, 65536, 512, 1),
+    (1, 32, 65536, 256),
+)
+TIMING_ROWS = (1, 17, 32)
 
 
 def library_evidence(library):
@@ -60,9 +72,21 @@ def check_projection(inputs, dense, *, baseline=True):
     from tools.validate_vq2a8_phase4_kernel import accepted_rows, bitwise_equal, compare, same_fp8_oracle
     from vllm_ascend.quantization.vq2a8_ascendc import vq2a8_ascendc
 
+    torch.npu.synchronize()
+    before = torch.npu.memory_allocated()
+    torch.npu.reset_peak_memory_stats()
+    started = time.perf_counter()
     actual = vq2a8_ascendc(*inputs)
     torch.npu.synchronize()
-    result = {"oracle": compare(same_fp8_oracle(inputs[:3], dense), actual)}
+    first_call_ms = (time.perf_counter() - started) * 1000
+    peak_delta = torch.npu.max_memory_allocated() - before
+    result = {
+        "oracle": compare(same_fp8_oracle(inputs[:3], dense), actual),
+        "first_projection_call_ms": first_call_ms,
+        # Native CANN internal allocations are not covered by this counter.
+        "torch_allocator_peak_delta_bytes": peak_delta,
+        "output_bytes": actual.numel() * actual.element_size(),
+    }
     if baseline:
         result["accepted_baseline"] = compare(accepted_rows(inputs), actual)
     for _ in range(3):
@@ -82,8 +106,9 @@ def run_expert(args, device, emit):
     import torch
     from safetensors.torch import save_file
 
-    from tools.validate_vq2a8_phase4_kernel import accepted_rows, prepare_rows
+    from tools.validate_vq2a8_phase4_kernel import accepted_rows, benchmark, prepare_rows
     from tools.validate_vq2a8_tp1_packed_kernel import _comparison_summary, activation_case, parse_probes
+    from vllm_ascend.quantization.vq2a8_ascendc import vq2a8_ascendc
     from vllm_ascend.quantization.vq2a8_reference import (
         decode_repacked_vq2a8_codebook_weight,
         deepseek_v4_swiglu_reference,
@@ -102,14 +127,15 @@ def run_expert(args, device, emit):
         # The full decoded expert weight is CPU oracle data ONLY.
         dense[kind] = decode_repacked_vq2a8_codebook_weight(host, spec, compute_dtype=torch.float64)
         payloads[kind] = ({name: value.to(device) for name, value in host.items()}, spec)
-    for m in ROWS:
-        for case in CASES:
+    timed = args.stage == "timing"
+    for m in TIMING_ROWS if timed else ROWS:
+        for case in ("deterministic",) if timed else CASES:
             spec = payloads["gate_up"][1]
             hidden = torch.cat([activation_case(spec.rht_true_columns, i, 0, case) for i in range(m)]).to(device)
             accepted_hidden = hidden
             for kind in ("gate_up", "down"):
                 key = f"{kind}:m{m}:{case}"
-                print(f"ASCENDC_START stage=expert key={key}", flush=True)
+                print(f"ASCENDC_START stage={args.stage} key={key}", flush=True)
                 payload, spec = payloads[kind]
                 prepared = prepare_rows(hidden, payload, spec)
                 accepted_prepared = prepare_rows(accepted_hidden, payload, spec)
@@ -130,12 +156,29 @@ def run_expert(args, device, emit):
                     for i, name in enumerate(("activation", "scale", "bias")):
                         tensors[f"candidate_{name}"] = prepared[i]
                         tensors[f"accepted_{name}"] = accepted_prepared[i]
-                    failure = args.output.parent / f"ascendc-{key.replace(':', '-')}-failure.safetensors"
+                    failure = args.output.parent / f"{args.output.stem}-{key.replace(':', '-')}-failure.safetensors"
                     save_file(
                         {name: t.detach().cpu().contiguous().clone() for name, t in tensors.items()}, str(failure)
                     )
                     emit(key, {**result, "passed": False, "failure_tensors": str(failure)})
                     raise
+                if timed:
+                    inputs = (*prepared, *packed)
+                    print(f"ASCENDC_TIMING_START key={key}", flush=True)
+                    candidate = benchmark(
+                        lambda inputs=inputs: vq2a8_ascendc(*inputs), device, args.warmups, args.repeats
+                    )
+                    baseline = benchmark(
+                        lambda inputs=inputs: accepted_rows(inputs), device, args.warmups, args.repeats
+                    )
+                    result["timings"] = {
+                        "candidate": candidate,
+                        "accepted_baseline": baseline,
+                        "wall_median_ratio_baseline_over_candidate": baseline["wall_ms"]["median"]
+                        / candidate["wall_ms"]["median"],
+                        "launch_blocking": False,
+                        "scope": "resident_prepared_projection_only",
+                    }
                 emit(key, result)
                 if kind == "gate_up":
                     hidden = deepseek_v4_swiglu_reference(actual, limit)
@@ -199,11 +242,11 @@ def run_child(args):
                     if not bitwise_equal(actual, cube_control(da, db, bridge=bridge)):
                         raise AssertionError("Native Cube control is not bitwise repeatable.")
                 emit(f"m{m}", result)
-        elif args.stage == "fused":
-            for m, n, k, tiles in SHAPES:
+        elif args.stage in ("fused", "boundaries"):
+            for m, n, k, tiles in SHAPES if args.stage == "fused" else BOUNDARY_SHAPES:
                 for case in CASES:
                     key = f"m{m}:n{n}:k{k}:t{tiles}:{case}"
-                    print(f"ASCENDC_START stage=fused key={key}", flush=True)
+                    print(f"ASCENDC_START stage={args.stage} key={key}", flush=True)
                     inputs = list(synthetic_inputs(m, n, k, tiles))
                     if case != "deterministic":
                         x = inputs[0].float()
@@ -219,7 +262,9 @@ def run_child(args):
                     dense = synthetic_dense_oracle(*inputs[3:])
                     result, _ = check_projection(tuple(t.to(device) for t in inputs), dense)
                     emit(key, result)
-        elif args.stage == "expert":
+        elif args.stage in ("expert", "timing"):
+            if args.stage == "timing" and os.environ.get("ASCEND_LAUNCH_BLOCKING") != "0":
+                raise RuntimeError("Timing requires a separate child with ASCEND_LAUNCH_BLOCKING=0.")
             run_expert(args, device, emit)
         report["status"] = "passed"
         save()
@@ -233,11 +278,42 @@ def run_child(args):
 def expected_keys(stage):
     if stage in ("direct", "bridge"):
         return {f"m{m}" for m in ROWS}
-    if stage == "fused":
-        return {f"m{m}:n{n}:k{k}:t{t}:{case}" for m, n, k, t in SHAPES for case in CASES}
-    if stage == "expert":
-        return {f"{kind}:m{m}:{case}" for kind in ("gate_up", "down") for m in ROWS for case in CASES}
+    if stage in ("fused", "boundaries"):
+        shapes = SHAPES if stage == "fused" else BOUNDARY_SHAPES
+        return {f"m{m}:n{n}:k{k}:t{t}:{case}" for m, n, k, t in shapes for case in CASES}
+    if stage in ("expert", "timing"):
+        rows, cases = (TIMING_ROWS, ("deterministic",)) if stage == "timing" else (ROWS, CASES)
+        return {f"{kind}:m{m}:{case}" for kind in ("gate_up", "down") for m in rows for case in cases}
     raise ValueError("Unknown stage")
+
+
+def timing_evidence_passed(record):
+    timing = record["timings"]
+    if timing["launch_blocking"] is not False or timing["scope"] != "resident_prepared_projection_only":
+        return False
+    for name in ("candidate", "accepted_baseline"):
+        stats = timing[name]
+        if (
+            type(stats["warmups"]) is not int
+            or type(stats["repeats"]) is not int
+            or stats["warmups"] < 3
+            or stats["repeats"] < 10
+        ):
+            return False
+        for clock in ("event_ms", "wall_ms"):
+            values = [stats[clock][key] for key in ("min", "median", "p95")]
+            if not all(type(v) in (float, int) and math.isfinite(v) and v > 0 for v in values) or values != sorted(
+                values
+            ):
+                return False
+    ratio = timing["wall_median_ratio_baseline_over_candidate"]
+    return (
+        type(ratio) in (float, int)
+        and math.isfinite(ratio)
+        and math.isclose(
+            ratio, timing["accepted_baseline"]["wall_ms"]["median"] / timing["candidate"]["wall_ms"]["median"]
+        )
+    )
 
 
 def evidence_passed(path, stage, digest, probe="0:0"):
@@ -257,9 +333,16 @@ def evidence_passed(path, stage, digest, probe="0:0"):
             and {r["key"] for r in rows} == keys
             and all(r["passed"] is True and r["repeat_exact"] is True for r in rows)
             and all(r["oracle"]["allclose"] is True for r in rows)
-            and all(r.get("row_chunk_exact") is True for r in rows if stage in ("fused", "expert"))
-            and all(r["accepted_baseline"]["allclose"] is True for r in rows if stage in ("fused", "expert"))
-            and all(r["independent_chain"]["allclose"] is True for r in rows if stage == "expert")
+            and all(
+                r.get("row_chunk_exact") is True for r in rows if stage in ("fused", "boundaries", "expert", "timing")
+            )
+            and all(
+                r["accepted_baseline"]["allclose"] is True
+                for r in rows
+                if stage in ("fused", "boundaries", "expert", "timing")
+            )
+            and all(r["independent_chain"]["allclose"] is True for r in rows if stage in ("expert", "timing"))
+            and all(timing_evidence_passed(r) for r in rows if stage == "timing")
             and all(
                 evidence[name] is False
                 for name in (
@@ -364,12 +447,18 @@ def main():
     parser.add_argument("--probe", default="0:0")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--output-dir", type=Path)
-    parser.add_argument("--stage", choices=("direct", "bridge", "fused", "expert"), help=argparse.SUPPRESS)
+    parser.add_argument("--warmups", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument(
+        "--stage", choices=("direct", "bridge", "fused", "boundaries", "expert", "timing"), help=argparse.SUPPRESS
+    )
     parser.add_argument("--output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.physical_npu < 0 or args.timeout <= 0 or not re.fullmatch(r"[0-9]+:[0-9]+", args.probe):
         parser.error("Require nonnegative physical NPU, positive timeout and a layer:expert probe.")
-    if args.stage == "expert" and not args.model:
+    if args.warmups < 3 or args.repeats < 10:
+        parser.error("Timing requires --warmups >= 3 and --repeats >= 10.")
+    if args.stage in ("expert", "timing") and not args.model:
         parser.error("Expert validation requires --model.")
     if args.stage and (args.output is None or args.output.exists()):
         parser.error("Child stage requires a new --output file.")
