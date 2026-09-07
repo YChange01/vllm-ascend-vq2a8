@@ -2000,3 +2000,63 @@ VQ2A8 suite passes **828 tests**. Changed-file Ruff, Markdown and spelling
 checks pass. The required `bash format.sh ci` remains blocked by missing
 local `pre-commit`. No C++ kernel or model dispatch changes are included;
 this correction requires neither a library rebuild nor a numerical rerun.
+
+### Single-call simulator evidence collection
+
+The user confirmed that `msprof op simulator --help` exposes the required
+application/kernel/launch-count/timeout options. The installed
+`Ascend950PR_957d` simulator resolves to `dav_3510`, and its global
+`lib/config.json` has `flush_level=3`. Do not edit this global file.
+The official profiler's
+[CreateCamodelConfig implementation](https://github.com/Ascend/msopprof/blob/master/csrc/op_profiling/profiling/op_prof_task.cpp)
+uses a private config directory via `CAMODEL_CONFIG_PATH`; its 950 branch
+also changes `flush_level` from 3 to 2 there. The installed binary may differ
+from that source, so the application verifies its effective config before
+importing Torch or initializing a device.
+
+Run the new minimal capture entry, using the existing successful suite:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only
+/usr/local/python3.11.10/bin/python3 -u tools/profile_vq2a8_ascendc.py --suite-report /tmp/vq2a8-ascendc-suite-qltvpdfb
+```
+
+This does not rebuild the library or rerun the standalone campaign. It:
+
+- Checks the library against its build manifest and the supplied suite hash.
+- Copies only the simulator config into a fresh private report directory,
+  sets its `flush_level=2`, and verifies the global config hash after running.
+- Launches `msprof op simulator` with the fused kernel prefix and
+  `--launch-count=1`; default metrics retain synchronization-event details.
+- Requires a mapped `libruntime_camodel.so` before importing Torch, refusing
+  a bare-Python/hardware fallback. Device 0 here is the simulator's logical
+  device, not a request to run on physical NPU 0.
+- Invokes one synthetic M=32, N=32, K=512, tiles=3 projection (one AIC block,
+  two AIVs, four K tiles). Both decode halves and multiple codebooks execute.
+  There are no candidate warmups, repeats, dense oracles or model loads.
+- Uses a five-minute simulation limit plus two minutes for parsing. The
+  outer deadline terminates only the newly owned profiler process group.
+- Prints bounded instruction CSV samples, including operand/transfer details,
+  and an output-file inventory. Full files remain in the printed report path.
+
+The application records the actual config path/hash, simulator runtime paths,
+library hash and completion receipt. Existing numerical/timing reports are
+left untouched. Simulator CSV rows may aggregate multiple instruction calls;
+the summary counts rows, not dynamic instruction executions. Source maps and
+hotspot information may be absent because this uses the original release
+binary without adding `-g` or recompiling.
+
+Successful collection remains `collected_review_pending`, not native or
+model acceptance. Missing AIC/AIV CSVs, unsupported columns, profiler failure,
+timeout or an incomplete application receipt remain incomplete. Review FP8
+operand types and the decoded-weight UB/L1/L0 transfers against the tested
+binary; neither CSV filenames nor Cube activity alone certify them. This small
+simulation does not establish all-shape dataflow, hardware timing or complete
+embedded-object linkage. No model backend or verification flag is promoted.
+
+The development-host VQ2A8 suite passes **861 tests**, including 33 new
+profiler-harness tests. Ruff, Markdown and spelling checks pass for changed
+files. `bash format.sh ci` was attempted but cannot start without the local
+`pre-commit` dependency. The actual CANN simulator capture remains unverified
+until the user runs the command above; no new hardware result is claimed.
