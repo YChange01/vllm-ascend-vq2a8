@@ -25,6 +25,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -40,6 +41,9 @@ MAX_CSV_FILES = 32
 MAX_CSV_BYTES = 128 * 1024 * 1024
 MAX_SAMPLES_PER_KIND = 6
 MAX_INVENTORY_FILES = 80
+MAX_TIMEOUT_MINUTES = 60
+PROGRESS_SECONDS = 30
+PROGRESS_TAIL_BYTES = 4096
 
 
 def digest(path):
@@ -216,16 +220,56 @@ def collect_instruction_csv(root):
 
 def inspect_profiler_log(path):
     """Profiler exit 0 may mean partial traces parsed after an application abort."""
-    result = {"application_timeout_reported": False, "runtime_error_count": 0, "errors": []}
+    result = {
+        "application_timeout_reported": False,
+        "runtime_error_count": 0,
+        "errors": [],
+        "shutdown_notice_seen": False,
+    }
     with path.open(errors="replace") as stream:
         for number, line in enumerate(stream, 1):
+            if "SigIntHandler received signal" in line or "Model is terminating" in line:
+                result["shutdown_notice_seen"] = True
             if "The timeout has reached" in line or "application will be forcibly killed" in line:
                 result["application_timeout_reported"] = True
-            if "[ERROR]" in line:
+                result["shutdown_notice_seen"] = True
+            if re.search(r"\[error\]", line, re.I):
                 result["runtime_error_count"] += 1
                 if len(result["errors"]) < 12:
-                    result["errors"].append({"line": number, "text": line.strip()[:800]})
+                    result["errors"].append(
+                        {
+                            "line": number,
+                            "text": line.strip()[:800],
+                            "after_shutdown_notice": result["shutdown_notice_seen"],
+                        }
+                    )
     return result
+
+
+def instruction_progress(directory):
+    """Bounded raw-tail observation, not an automatic liveness or ISA verdict.
+
+    CCU logs can grow while waiting, so observe instruction logs separately.
+    A buffered log can also stay unchanged while simulation advances.
+    """
+    rows = []
+    for core in ("cubecore0", "veccore0", "veccore1"):
+        matches = sorted((directory / "profile").glob(f"OPPROF*/dump/core0.{core}.instr_log.dump"))
+        if not matches:
+            continue
+        path = matches[-1]
+        if path.is_symlink() or not path.resolve().is_relative_to(directory.resolve()):
+            continue
+        try:
+            with path.open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                size = stream.tell()
+                stream.seek(max(0, size - PROGRESS_TAIL_BYTES))
+                tail = stream.read(PROGRESS_TAIL_BYTES).decode("utf-8", errors="replace").splitlines()
+            rows.append({"core": core, "bytes": size, "tail": [line[:600] for line in tail[-2:]]})
+        except OSError:
+            continue  # profiler may not have created/flushed the dump yet
+    return rows
 
 
 def profiler_command(msprof, args, directory, library_sha):
@@ -257,8 +301,30 @@ def run_profiler(command, directory, environment, timeout_seconds):
         child = subprocess.Popen(
             command, env=environment, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True
         )
+        started = time.monotonic()
+        deadline = started + timeout_seconds
         try:
-            return {"exit": child.wait(timeout=timeout_seconds), "timeout": False}
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                try:
+                    return {"exit": child.wait(timeout=min(PROGRESS_SECONDS, remaining)), "timeout": False}
+                except subprocess.TimeoutExpired:
+                    # Lost console/dump access must not abandon the live child
+                    # or alter the bounded execution/cleanup contract.
+                    with contextlib.suppress(OSError):
+                        print(
+                            "ASCENDC_SIM_PROGRESS "
+                            + json.dumps(
+                                {
+                                    "elapsed_s": round(time.monotonic() - started, 1),
+                                    "instruction_logs": instruction_progress(directory),
+                                    "note": "raw observations; log growth alone does not prove forward progress",
+                                }
+                            ),
+                            flush=True,
+                        )
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(child.pid, signal.SIGKILL)
@@ -373,12 +439,17 @@ def main():
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc/libvq2a8_ascendc.so")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann-9.1.0"))
     parser.add_argument("--soc", default="Ascend950PR_957d")
-    parser.add_argument("--timeout-minutes", type=int, default=5)
+    parser.add_argument(
+        "--timeout-minutes",
+        type=int,
+        default=5,
+        help="Simulator limit, 1..60 minutes (default: 5); scalar decode may need a longer explicit limit.",
+    )
     parser.add_argument("--application-report", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--expected-library-sha256", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not 1 <= args.timeout_minutes <= 5 or not re.fullmatch(r"Ascend950[A-Za-z0-9_]+", args.soc):
-        parser.error("Require Ascend950 SOC and 1..5 simulator timeout minutes.")
+    if not 1 <= args.timeout_minutes <= MAX_TIMEOUT_MINUTES or not re.fullmatch(r"Ascend950[A-Za-z0-9_]+", args.soc):
+        parser.error(f"Require Ascend950 SOC and 1..{MAX_TIMEOUT_MINUTES} simulator timeout minutes.")
     if args.application_report:
         return run_application(args)
     if not args.suite_report and not args.diagnostic_build:

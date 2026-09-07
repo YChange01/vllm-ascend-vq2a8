@@ -205,6 +205,58 @@ def test_profiler_log_keeps_bounded_errors_despite_successful_parsing(tmp_path):
     assert "0x10d0f488" in result["errors"][0]["text"]
 
 
+@pytest.mark.parametrize("marker", ["[error]", "[ERROR]", "[Error]"])
+def test_shutdown_errors_are_counted_without_claiming_their_cause(tmp_path, marker):
+    path = tmp_path / "profiler.log"
+    path.write_text(
+        marker
+        + " an earlier error\n"
+        + "Model SignalHandler: SigIntHandler received signal: 2\n"
+        + marker
+        + " [core0.veccore0] [su_ccu_illegal_instr_t0] ZEROEXT\n"
+        + "[INFO] The timeout has reached and the application will be forcibly killed.\n"
+    )
+    review = profile.inspect_profiler_log(path)
+    assert review["runtime_error_count"] == 2
+    assert review["application_timeout_reported"] is True
+    assert review["shutdown_notice_seen"] is True
+    assert [row["after_shutdown_notice"] for row in review["errors"]] == [False, True]
+
+
+def test_instruction_progress_reads_only_bounded_instruction_tails(tmp_path):
+    dump = tmp_path / "profile/OPPROF_mock/dump"
+    dump.mkdir(parents=True)
+    for core in ("cubecore0", "veccore0", "veccore1"):
+        (dump / f"core0.{core}.instr_log.dump").write_text("old\n" * 2000 + "PC: last1\nPC: last2\n")
+    (dump / "core0.cubecore0.ccu_log.dump").write_text("not instruction progress\n")
+    rows = profile.instruction_progress(tmp_path)
+    assert len(rows) == 3
+    assert all(row["bytes"] > profile.PROGRESS_TAIL_BYTES for row in rows)
+    assert all(row["tail"] == ["PC: last1", "PC: last2"] for row in rows)
+
+
+def test_instruction_progress_handles_missing_and_empty_logs(tmp_path):
+    assert profile.instruction_progress(tmp_path) == []
+    dump = tmp_path / "profile/OPPROF_mock/dump"
+    dump.mkdir(parents=True)
+    (dump / "core0.cubecore0.instr_log.dump").touch()
+    assert profile.instruction_progress(tmp_path) == [{"core": "cubecore0", "bytes": 0, "tail": []}]
+
+
+@pytest.mark.parametrize("minutes", [0, 5, 30, 45, 60, 61])
+def test_explicit_simulator_deadline_is_bounded(monkeypatch, minutes):
+    monkeypatch.setattr(profile.sys, "argv", ["profile", "--diagnostic-build", "--timeout-minutes", str(minutes)])
+    received = []
+    monkeypatch.setattr(profile, "run", lambda args: received.append(args.timeout_minutes) or 0)
+    if 1 <= minutes <= 60:
+        assert profile.main() == 0
+        assert received == [minutes]
+    else:
+        with pytest.raises(SystemExit):
+            profile.main()
+        assert received == []
+
+
 @pytest.mark.parametrize("mode", ["empty", "unknown_schema", "large"])
 def test_csv_missing_or_unreadable_instruction_contract(tmp_path, mode, monkeypatch):
     path = tmp_path / "core0_instr_exe.csv"
@@ -230,6 +282,7 @@ def test_csv_missing_or_unreadable_instruction_contract(tmp_path, mode, monkeypa
         "missing_vector",
         "inner_timeout",
         "runtime_error",
+        "shutdown_error",
     ],
 )
 def test_profiler_supervision_preserves_gate_flags(tmp_path, monkeypatch, mode):
@@ -266,6 +319,8 @@ def test_profiler_supervision_preserves_gate_flags(tmp_path, monkeypatch, mode):
             if mode == "inner_timeout"
             else "[ERROR] pem_ccu.cc:2270 execute_set_flag already has same set_flag! pc:0x10d0f488.\n"
             if mode == "runtime_error"
+            else "Model SignalHandler: SigIntHandler received signal: 2\n[error] illegal_instr\n"
+            if mode == "shutdown_error"
             else "[INFO] Profiling running finished. All task success.\n"
         )
         if mode != "missing_app":
@@ -331,6 +386,52 @@ def test_profiler_timeout_kills_only_owned_process_group(tmp_path, monkeypatch):
 
     monkeypatch.setattr(profile.subprocess, "Popen", spawn)
     monkeypatch.setattr(profile.os, "killpg", lambda pid, sig: killed.append(pid))
+    ticks = iter([0, 0, 0.5, 1])
+    monkeypatch.setattr(profile, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
     result = profile.run_profiler(["msprof"], tmp_path, {}, 1)
     assert result == {"exit": -9, "timeout": True}
     assert killed == [123]
+
+
+def test_progress_poll_does_not_reset_deadline_or_kill_running_child(tmp_path, monkeypatch, capsys):
+    timeouts = []
+
+    class Child:
+        def wait(self, timeout):
+            timeouts.append(timeout)
+            if len(timeouts) == 1:
+                raise subprocess.TimeoutExpired("msprof", timeout)
+            return 0
+
+    ticks = iter([0, 0, 30, 30])
+    monkeypatch.setattr(profile, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(profile.subprocess, "Popen", lambda *a, **kw: Child())
+    monkeypatch.setattr(profile.os, "killpg", lambda *a: pytest.fail("Progress poll is not the overall deadline"))
+    result = profile.run_profiler(["msprof"], tmp_path, {}, 45)
+    assert result == {"exit": 0, "timeout": False}
+    assert timeouts == [30, 15]
+    assert "ASCENDC_SIM_PROGRESS" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("failure", ["console", "dump"])
+def test_progress_io_failure_does_not_abandon_owned_child(tmp_path, monkeypatch, failure):
+    waits = []
+
+    class Child:
+        def wait(self, timeout):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise subprocess.TimeoutExpired("msprof", timeout)
+            return 0
+
+    def unavailable(*args, **kwargs):
+        raise OSError("Progress channel unavailable")
+
+    ticks = iter([0, 0, 30, 30])
+    monkeypatch.setattr(profile, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(profile.subprocess, "Popen", lambda *a, **kw: Child())
+    monkeypatch.setattr(
+        profile, "print" if failure == "console" else "instruction_progress", unavailable, raising=False
+    )
+    assert profile.run_profiler(["msprof"], tmp_path, {}, 45) == {"exit": 0, "timeout": False}
+    assert len(waits) == 2

@@ -2143,3 +2143,65 @@ execution. Changed-file Ruff, Markdown and spelling checks pass; the required
 `bash format.sh ci` was attempted but still cannot start without local
 `pre-commit`. The corrected kernel still needs a CANN build and the bounded
 simulator rerun on the user's machine; no new hardware PASS is claimed.
+
+### Sync-fix build succeeds; the five-minute trace is still incomplete
+
+The user built `build/vq2a8-ascendc-syncfix/libvq2a8_ascendc.so` successfully,
+with SHA256 `022bbb8ccd39e0de0a193199027ba2e935e87967c8d49f1a9f251ddcdf6b1518`.
+The capture `/tmp/vq2a8-ascendc-sim-igxi9yba` loads this exact new library
+and the same isolated simulator config. No duplicate SetFlag is reported,
+but this is not yet execution verification of the corrected post-MMAD fence.
+
+The new trace records 1780/1777 executions of the decoded-byte store on the
+two AIVs. The source has 16 * 128 = 2048 such stores per AIV per K tile,
+and this call requires four K tiles (8192 stores per AIV). The ND word-store
+sample also records only 512 calls, consistent with one activation tile.
+The printed samples contain neither MMAD nor UB-to-L1 handoff. Taken together,
+these observations are consistent with interruption during the first decode
+tile, before the corrected fence is reached. They do not establish a new
+deadlock, a hardware regression, or guaranteed completion given more time.
+The 1.96/81.64/81.63 microsecond core durations are partial simulation data.
+
+The `su_ccu_illegal_instr_t0` messages naming ZEROEXT/AND/SHL appear after
+`SigIntHandler received signal: 2` and `Model is terminating`. This ordering
+does not establish whether they are shutdown artifacts or independent faults.
+Do not suppress the errors or change arithmetic based on their names alone.
+The old log scanner missed their lowercase `[error]` tag; it now counts tags
+case-insensitively and records whether each error followed a shutdown notice.
+Errors in either phase still prevent successful collection status.
+
+The initial five-minute harness cap was too restrictive for this scalar
+decode instruction trace. The native contract already uses minimum N=32,
+K=512; reducing M does not reduce the decoded B tile, and shortening K to
+128 would change the supported contract rather than validate this binary.
+The official [simulator timeout documentation](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_simulator_user_guide.md)
+describes timeout as terminating simulation and parsing only the partial
+data; its range is 1..2880 minutes. The harness now permits an explicit
+1..60 minutes while keeping the default at five. A rough linear extrapolation
+from this partial capture suggests tens of minutes, not a completion-time
+guarantee. No kernel/library rebuild is part of this harness correction.
+
+Use the same new library with one explicitly longer, bounded capture:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only
+/usr/local/python3.11.10/bin/python3 -u tools/profile_vq2a8_ascendc.py --diagnostic-build --library build/vq2a8-ascendc-syncfix/libvq2a8_ascendc.so --timeout-minutes 45
+```
+
+Every 30 seconds `ASCENDC_SIM_PROGRESS` prints the size and bounded last
+instruction-log lines for AIC and both AIVs. It does not stream the large
+CCU dumps or read device values. Changing PCs/operands provide evidence for
+manual progress inspection; file growth alone cannot prove liveness and
+unchanged buffered files cannot prove deadlock. The outer deadline remains
+the requested simulation limit plus two parsing minutes, never reset by a
+progress poll. Ctrl-C/expiry still kills only the owned profiler process group.
+This adds no repeat campaign, no unbounded automatic retry, no new NPU work,
+and no promotion of native/on-chip/model acceptance flags.
+
+The development-host VQ2A8 suite passes **882 tests**, including 15 new
+deadline, progress-observation and error-classification regressions. Ruff,
+Markdown and repository-configured spelling checks pass for changed files.
+The required `bash format.sh ci` was attempted and remains blocked by missing
+local `pre-commit`. The native source and library are unchanged by this patch;
+the longer simulator capture has not been run on the development host.
