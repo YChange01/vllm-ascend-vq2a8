@@ -11,6 +11,22 @@
 using namespace vq2a8_ascendc;
 
 int main() {
+  static_assert(HalfRows(0, 0) == 0);
+  static_assert(HalfRows(1, 0) == 1);
+  static_assert(HalfRows(1, 16) == 0);
+  static_assert(HalfRows(16, 16) == 0);
+  static_assert(HalfRows(17, 16) == 1);
+  static_assert(HalfRows(32, 0) == 16);
+  static_assert(HalfRows(32, 16) == 16);
+  for (uint32_t rows = 0; rows <= 32; ++rows) {
+    for (uint32_t first = 0; first <= 32; ++first) {
+      uint32_t expected = 0;
+      for (uint32_t row = first; row < first + 16; ++row) {
+        expected += row < rows;
+      }
+      assert(HalfRows(rows, first) == expected);
+    }
+  }
   assert(ValidDimensions(1, 32, 512, 1));
   assert(ValidDimensions(32, 65536, 65536, 256));
   for (auto shape : std::vector<std::array<int64_t, 4>>{{0, 32, 512, 1},
@@ -89,8 +105,9 @@ int main() {
   for (uint32_t m = 1; m <= 32; ++m) {
     for (uint32_t half = 0; half < 2; ++half) {
       std::array<uint32_t, kHalfTileBytes / 4> ndTile{}, nz{};
+      auto rows = HalfRows(m, half * 16);
       for (uint32_t row = 0; row < 16; ++row) {
-        if (half * 16 + row < m) {
+        if (row < rows) {
           for (uint32_t word = 0; word < kK / 4; ++word) {
             ndTile[row * (kK / 4) + word] = row * 1000 + word + 1;
           }

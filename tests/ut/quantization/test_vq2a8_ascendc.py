@@ -205,6 +205,15 @@ def test_wrapper_loads_once_and_forwards_to_native_dispatch(tmp_path, monkeypatc
         module.load_library(other)
 
 
+def test_device_tail_rows_use_shared_scalar_helper():
+    kernel = (build.SOURCE / "kernel.cpp").read_text()
+    # The executed C++ layout test exercises this exact helper for both AIVs,
+    # including M<=16 where subtracting 16 without a guard would underflow.
+    assert "HalfRows(m_, firstRow)" in kernel
+    assert "Min(" not in kernel
+    assert "Max(" not in kernel
+
+
 def test_native_path_has_no_dense_workspace_or_triton():
     kernel = (build.SOURCE / "kernel.cpp").read_text()
     binding = (build.SOURCE / "torch_binding.cpp").read_text()

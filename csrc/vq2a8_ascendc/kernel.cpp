@@ -159,7 +159,7 @@ class ProjectionKernel {
   __aicore__ inline void Vector(uint32_t group) {
     uint32_t half = GetSubBlockIdx();
     uint32_t firstRow = half * kHalf;
-    uint32_t rows = m_ > firstRow ? Min(m_ - firstRow, kHalf) : 0;
+    uint32_t rows = HalfRows(m_, firstRow);
     if constexpr (Mode == 2) {
       DataCopyParams p;
       p.blockCount = tiles_;

@@ -18,6 +18,16 @@ constexpr uint32_t kMaxTiles = 256;
 constexpr uint32_t kMaxDimension = 65536;
 constexpr uint8_t kInvalidFp8 = 0x7f;  // fail closed on an invalid tile ID
 
+// Scalar row clipping, shared with host tests. AscendC::Min is a vector
+// tensor API, not a two-scalar overload. Guard before unsigned subtraction.
+VQ2A8_LAYOUT_FN constexpr uint32_t HalfRows(uint32_t rows, uint32_t firstRow) {
+  if (rows <= firstRow) {
+    return 0;
+  }
+  uint32_t remaining = rows - firstRow;
+  return remaining < kHalf ? remaining : kHalf;
+}
+
 // Local [16,K] -> NZ [K/32,16,32]. The two AIVs interleave their
 // halves into L1 [K/32,32,32], never into a dense GM weight tensor.
 VQ2A8_LAYOUT_FN constexpr uint32_t HalfNz(uint32_t row, uint32_t col) {

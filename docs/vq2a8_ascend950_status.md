@@ -1823,3 +1823,31 @@ Triton/CUDA PASS is promoted to an AscendC PASS. Even after standalone
 numerical success, instruction and on-chip flags stay false until the
 generated native binary/dataflow is reviewed. Model integration, full-model
 reference logits, quality, serving, and phase 5 remain separate acceptance.
+
+### First AscendC build: scalar row clipping fix
+
+The first CANN 9.1 build at `4b915644` completed CMake configuration and
+source precompilation, then failed while compiling the AIC/AIV preprocessing
+objects at `kernel.cpp:162`. The blocking error was the prototype's scalar
+`Min(m_ - firstRow, kHalf)` call: the visible `AscendC::Min` overloads operate
+on `LocalTensor` values, not two scalar integers. This is a source bug, not
+the earlier Triton GraphSyncSolver problem. The nonfatal Kineto warning is
+not the failing step.
+
+Row clipping now uses a shared constexpr `HalfRows` helper containing only
+scalar comparisons, guarded subtraction and a conditional expression. It
+preserves zero rows for AIV1 when M <= 16, avoiding unsigned underflow. The
+host C++ test checks all 1,089 combinations of M and starting row from 0
+through 32, plus compile-time boundary assertions and activation-padding
+checks using the same helper. No layouts, synchronization, FP8 arithmetic,
+validation tolerances or model dispatch are changed.
+
+The updated development-host VQ2A8 suite passes **783 tests** (including
+19 AscendC host/harness tests). Changed-file lint checks pass; the unified
+format script is still unavailable because local `pre-commit` is missing.
+
+Rebuild with `tools/build_vq2a8_ascendc.py` after pulling this change; there
+is no need to delete the build directory or reinstall the package. Run the
+standalone validation only after `ASCENDC_BUILD=PASS`. Passing this source
+regression test does not establish successful CANN compilation or NPU
+execution; both remain awaiting the next hardware-machine build/run.
