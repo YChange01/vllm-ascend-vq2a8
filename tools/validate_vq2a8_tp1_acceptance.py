@@ -337,6 +337,9 @@ def main() -> int:
     )
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument(
+        "--verbose-experts", action="store_true", help="Model only: print per-expert load/execution diagnostics."
+    )
+    parser.add_argument(
         "--execution-policy",
         choices=["baseline", "cached", "ascendc"],
         default=None,
@@ -358,6 +361,8 @@ def main() -> int:
         return 0
     if args.model is None:
         parser.error("--model is required unless --summarize is used.")
+    if args.verbose_experts and args.stage != "model":
+        parser.error("--verbose-experts applies to --stage model only.")
     if args.stage == "expert" and args.execution_policy is not None:
         parser.error("--execution-policy applies to --stage moe/model only.")
     if args.execution_policy == "ascendc":
@@ -434,6 +439,7 @@ def main() -> int:
         "baseline_report": str(frozen_baseline) if frozen_baseline else None,
         "root_linear_mode": args.root_linear_mode,
         "execution_policy": args.execution_policy,
+        "verbose_experts": args.verbose_experts,
     }
     summary_path = output / "summary.json"
     short_path = output / "summary.txt"
@@ -533,6 +539,8 @@ def main() -> int:
                 command.extend(
                     ["--ascendc-library", str(args.ascendc_library), "--ascendc-preflight", str(native_preflight)]
                 )
+            if args.verbose_experts:
+                command.append("--verbose-experts")
         if index == 0:
             command.append("--audit-model")
             if args.verify_tensor_hashes:

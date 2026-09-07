@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import sys
 from collections import OrderedDict
 from pathlib import Path
@@ -89,11 +90,66 @@ def cache_only_runtime(limit=3):
     runtime.cache_hits = runtime.cache_loads = runtime.cache_peak_bytes = 0
     runtime._resident_bytes = runtime.evictions = 0
     runtime.progress = False
+    runtime.verbose_experts = False
     runtime.timing = dict.fromkeys(
         ("host_load_validate_s", "host_read_s", "host_validate_s", "h2d_s", "prepare_s", "packed_projection_s"), 0.0
     )
     runtime.prepare_batches = runtime.projection_rows = 0
     return runtime
+
+
+def test_expert_verbosity_defaults_to_off_even_with_layer_progress(monkeypatch):
+    monkeypatch.setattr(execution.VQ2TP1MoE, "__init__", lambda *args, **kwargs: None)
+    runtime = execution.CachedVQ2TP1MoE(progress=True)
+    assert runtime.progress is True and runtime.verbose_experts is False
+
+
+@pytest.mark.parametrize("verbose_experts", [False, True])
+def test_expert_verbosity_keeps_layer_timing_cache_stats_and_errors(monkeypatch, capsys, verbose_experts):
+    runtime = cache_only_runtime()
+    runtime.progress = True
+    runtime.verbose_experts = verbose_experts
+    runtime.artifact = NS(load_expert=lambda *args, **kwargs: ({"packed": torch.ones(4)}, None))
+
+    def expert(self, expert_id, hidden):
+        self._get_expert(expert_id)
+        return hidden
+
+    def forward(self, hidden, input_ids):
+        self.expert(0, hidden)
+        return self.expert(0, hidden)
+
+    monkeypatch.setattr(execution.VQ2TP1MoE, "expert", expert)
+    monkeypatch.setattr(execution.VQ2TP1MoE, "forward", forward)
+    hidden = torch.ones(3, 4)
+    assert runtime.forward(hidden) is hidden
+    lines = capsys.readouterr().out.splitlines()
+    assert any("stage=expert_start" in line for line in lines) is verbose_experts
+    assert any("stage=expert_done" in line for line in lines) is verbose_experts
+    assert any("stage=expert_load_start" in line for line in lines) is verbose_experts
+    assert any("stage=expert_load_done" in line for line in lines) is verbose_experts
+    reports = [
+        json.loads(line.removeprefix("MODEL_MOE_TIMING ")) for line in lines if line.startswith("MODEL_MOE_TIMING ")
+    ]
+    assert len(reports) == 1
+    assert reports[0]["cache_loads"] == reports[0]["cache_hits"] == 1
+    assert reports[0]["tokens"] == 3 and reports[0]["resident_bytes"] == 32
+    if not verbose_experts:
+        assert len(lines) == 1
+    with pytest.raises(ValueError, match="no stored expert"):
+        runtime.expert(999, hidden)
+
+
+@pytest.mark.parametrize("verbose_experts", [False, True])
+def test_owner_keeps_layer_progress_and_propagates_expert_verbosity(monkeypatch, verbose_experts):
+    monkeypatch.setattr(execution.VQ2TP1MoE, "__init__", lambda *args, **kwargs: None)
+    owner = OfflineMoEOwner.__new__(OfflineMoEOwner)
+    owner.options = {"execution_policy": "cached", "verbose_experts": verbose_experts}
+    owner.layers, owner.calls = {}, {}
+    owner.artifact = None
+    owner.device = torch.device("cpu")
+    layer = owner.create_layer(23)
+    assert layer.progress is True and layer.verbose_experts is verbose_experts
 
 
 def test_cached_weights_validate_only_on_misses_and_survive_repeated_passes():
@@ -273,7 +329,8 @@ def test_native_trace_reset_excludes_profile_and_preserves_cache(monkeypatch):
 
 
 @pytest.mark.parametrize("hashed", [True, False])
-def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monkeypatch, hashed):
+@pytest.mark.parametrize("verbose_experts", [False, True])
+def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monkeypatch, hashed, verbose_experts):
     """Real scheduler/preparation/SwiGLU with a CPU projection stand-in, not NPU evidence."""
     monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
 
@@ -289,6 +346,8 @@ def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monk
     candidate.reset_native_trace()
     for runtime, device in ((baseline, "cuda"), (candidate, "npu")):
         runtime.device = NS(type=device)
+        runtime.progress = True
+        runtime.verbose_experts = verbose_experts
         runtime.token_chunk = 2
         runtime.config = NS(
             hidden_size=512, top_k=2, renormalize=True, num_shared=1, routed_scale=1.5, swiglu_limit=None

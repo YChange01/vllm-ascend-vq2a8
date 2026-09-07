@@ -2280,3 +2280,28 @@ coverage checks. These are not NPU model results. Changed-file Ruff, Markdown
 and repository-configured spelling checks pass. `bash format.sh ci` remains
 blocked by missing local `pre-commit`. The native C++ sources are unchanged;
 the user's NPU run above is the next required result.
+
+### Offline model: compact expert diagnostics by default
+
+The cached and AscendC model policies now suppress per-expert
+`expert_start`, `expert_done`, `expert_load_start` and `expert_load_done`
+prints by default, including their forced stdout flushes. Layer progress,
+`MODEL_MOE_TIMING`, forward summaries, errors and final acceptance results
+remain enabled. Cache statistics, native call/row coverage, numerical checks
+and device synchronization are unchanged; logging is not the evidence store.
+
+Add `--verbose-experts` to `validate_vq2a8_tp1_acceptance.py --stage model`
+when detailed expert diagnostics are needed. The supervisor forwards the
+flag through the offline worker configuration and records it in the report.
+No new environment variable or model backend default is introduced.
+
+This is Python-only: after the current run finishes, pull and use the same
+command in a new process. No editable reinstall, C++ rebuild or simulator
+run is needed. A running process is not reconfigured. Reduced host/output
+overhead has not been quantified on NPU and is not a model speedup claim.
+
+All **944 VQ2A8 host tests pass**, including quiet/verbose output checks,
+retained layer timings/cache statistics/errors, configuration propagation
+and unchanged native routed-chain results and call coverage. Changed-file
+Ruff checks pass. The repository `format.sh ci` check remains blocked by
+missing local `pre-commit`; no new NPU performance result is claimed.

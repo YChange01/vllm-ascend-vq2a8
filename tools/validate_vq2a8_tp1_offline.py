@@ -42,6 +42,7 @@ def main() -> None:
     parser.add_argument("--device", choices=["npu:0"], default="npu:0")
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
+    parser.add_argument("--verbose-experts", action="store_true", help="Print per-expert load/execution diagnostics.")
     parser.add_argument("--execution-policy", choices=["baseline", "cached", "ascendc"], default="cached")
     parser.add_argument("--ascendc-library", type=Path)
     parser.add_argument("--ascendc-preflight", type=Path)
@@ -152,6 +153,7 @@ def main() -> None:
         root_linear_mode=args.root_linear_mode,
         ascendc_library=native_library["path"] if native_library else None,
         ascendc_sha256=native_library["sha256"] if native_library else None,
+        verbose_experts=args.verbose_experts,
     )
     missing = set(options) - set(inspect.signature(EngineArgs).parameters)
     if missing or not hasattr(LLM, "collective_rpc"):

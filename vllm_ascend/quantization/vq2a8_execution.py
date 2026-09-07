@@ -107,9 +107,10 @@ def device_cache_budget(device, *, reserve_gib=16.0, budget_gib=0.0, memory_frac
 class CachedVQ2TP1MoE(VQ2TP1MoE):
     """Reuse packed payloads without changing M=1 preparation or reduction."""
 
-    def __init__(self, *args, progress=False, **kwargs):
+    def __init__(self, *args, progress=False, verbose_experts=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.progress = progress
+        self.verbose_experts = verbose_experts
         self.evictions = 0
         self._resident_bytes = 0
         self.timing = dict.fromkeys(
@@ -119,7 +120,7 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         self.prepare_batches = 0
 
     def _emit(self, stage, **values):
-        if self.progress:
+        if self.progress and self.verbose_experts:
             fields = " ".join(f"{key}={value}" for key, value in values.items())
             print(f"MODEL layer={self.layer_index} stage={stage} {fields}", flush=True)
 
@@ -179,17 +180,18 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         self._resident_bytes += self._payload_bytes(expert)
         self.cache_peak_bytes = max(self.cache_peak_bytes, self._resident_bytes)
         self.cache_loads += 1
-        self._emit(
-            "expert_load_done",
-            expert=expert_id,
-            host_s=f"{host_s:.3f}",
-            read_s=f"{host_timings.get('host_read_s', 0.0):.3f}",
-            validate_s=f"{host_timings.get('host_validate_s', 0.0):.3f}",
-            h2d_s=f"{h2d_s:.3f}",
-            resident=len(self._cache),
-            limit=self.cache_experts,
-            evictions=self.evictions,
-        )
+        if self.progress and self.verbose_experts:
+            self._emit(
+                "expert_load_done",
+                expert=expert_id,
+                host_s=f"{host_s:.3f}",
+                read_s=f"{host_timings.get('host_read_s', 0.0):.3f}",
+                validate_s=f"{host_timings.get('host_validate_s', 0.0):.3f}",
+                h2d_s=f"{h2d_s:.3f}",
+                resident=len(self._cache),
+                limit=self.cache_experts,
+                evictions=self.evictions,
+            )
         return expert
 
     def _projection(self, hidden, payload, spec):
@@ -231,6 +233,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         return torch.cat(outputs, dim=0)
 
     def expert(self, expert_id, hidden):
+        if not (self.progress and self.verbose_experts):
+            return super().expert(expert_id, hidden)
         self._emit("expert_start", expert=expert_id, tokens=hidden.shape[0], cached=expert_id in self._cache)
         start = time.perf_counter()
         result = super().expert(expert_id, hidden)

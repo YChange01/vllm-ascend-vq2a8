@@ -36,6 +36,7 @@ def offline_engine_options(
     root_linear_mode="bf16",
     ascendc_library=None,
     ascendc_sha256=None,
+    verbose_experts=False,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     return {
@@ -74,6 +75,7 @@ def offline_engine_options(
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
                 "root_linear_mode": root_linear_mode,
+                "verbose_experts": verbose_experts,
                 **(
                     {"ascendc_library": str(ascendc_library), "ascendc_sha256": ascendc_sha256}
                     if execution_policy == "ascendc"
@@ -100,6 +102,7 @@ def validate_offline_config(config) -> dict:
         "root_linear_mode",
         "ascendc_library",
         "ascendc_sha256",
+        "verbose_experts",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
         raise ValueError("Invalid vq2a8_offline options/artifact path.")
@@ -157,6 +160,8 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Native library options require explicit execution_policy=ascendc.")
     if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
         raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
+    if type(options.get("verbose_experts", False)) is not bool:
+        raise ValueError("verbose_experts must be a boolean.")
     for key, default, upper in (("cache_experts", 2, 256), ("token_chunk", 2, 8)):
         value = options.get(key, default)
         if type(value) is not int or not 1 <= value <= upper:
@@ -245,7 +250,11 @@ class OfflineMoEOwner:
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
-                **({"progress": True} if issubclass(runtime_class, CachedVQ2TP1MoE) else {}),
+                **(
+                    {"progress": True, "verbose_experts": self.options.get("verbose_experts", False)}
+                    if issubclass(runtime_class, CachedVQ2TP1MoE)
+                    else {}
+                ),
             )
         self.layers[index] = layer
         self.calls[index] = 0

@@ -45,6 +45,20 @@ def test_plan_preserves_model_type_and_selects_only_explicit_offline_architectur
     assert plan["max_num_seqs"] == 1 and plan["max_model_len"] == plan["max_num_batched_tokens"] == 32
     assert not plan["enable_prefix_caching"] and not plan["async_scheduling"]
     assert validate_offline_config(config())["enabled"] is True
+    assert plan["additional_config"]["vq2a8_offline"]["verbose_experts"] is False
+
+
+@pytest.mark.parametrize("verbose_experts", [False, True, None, 1, "false"])
+def test_expert_verbosity_is_an_explicit_boolean(verbose_experts):
+    cfg = config()
+    cfg.additional_config = offline_engine_options(Path("/m"), Path("/a"), verbose_experts=verbose_experts)[
+        "additional_config"
+    ]
+    if type(verbose_experts) is bool:
+        assert validate_offline_config(cfg)["verbose_experts"] is verbose_experts
+    else:
+        with pytest.raises(ValueError, match="verbose_experts"):
+            validate_offline_config(cfg)
 
 
 @pytest.mark.parametrize("bad", [None, "path", "sha", "policy"])

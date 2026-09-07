@@ -126,7 +126,8 @@ def test_worker_pins_library_before_registration(tmp_path, monkeypatch, identity
 
 
 @pytest.mark.parametrize("failed", [False, True])
-def test_supervisor_preflight_precedes_model_and_failure_stops_loading(tmp_path, monkeypatch, failed):
+@pytest.mark.parametrize("verbose_experts", [False, True])
+def test_supervisor_preflight_precedes_model_and_failure_stops_loading(tmp_path, monkeypatch, failed, verbose_experts):
     library = tmp_path / "lib.so"
     library.touch()
     (tmp_path / "experts_vq_ascend_v2").mkdir()
@@ -145,6 +146,7 @@ def test_supervisor_preflight_precedes_model_and_failure_stops_loading(tmp_path,
             str(library),
             "--output-dir",
             str(tmp_path / "out"),
+            *(["--verbose-experts"] if verbose_experts else []),
         ],
     )
     order = []
@@ -161,6 +163,7 @@ def test_supervisor_preflight_precedes_model_and_failure_stops_loading(tmp_path,
         assert command[command.index("--execution-policy") + 1] == "ascendc"
         assert command[command.index("--ascendc-library") + 1] == str(library)
         assert "--ascendc-preflight" in command
+        assert ("--verbose-experts" in command) is verbose_experts
         assert kwargs["env"]["ASCEND_RT_VISIBLE_DEVICES"] == "4"
         # An incomplete model must still fail; never promote the preflight.
         return NS(returncode=1)
@@ -169,6 +172,14 @@ def test_supervisor_preflight_precedes_model_and_failure_stops_loading(tmp_path,
     monkeypatch.setattr(acceptance.subprocess, "run", child)
     assert acceptance.main() == 1
     assert order == (["preflight"] if failed else ["preflight", "model"])
+
+
+@pytest.mark.parametrize("stage", ["expert", "moe"])
+def test_expert_verbosity_is_model_only(tmp_path, monkeypatch, stage):
+    monkeypatch.setattr(sys, "argv", ["acceptance", "--model", str(tmp_path), "--stage", stage, "--verbose-experts"])
+    with pytest.raises(SystemExit):
+        acceptance.main()
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("extra", [[], ["--stage", "moe"], ["--stage", "model", "--baseline-report", "/old"]])
