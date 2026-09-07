@@ -8,6 +8,7 @@ import re
 import subprocess
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -23,6 +24,7 @@ from tools.validate_vq2a8_phase4_kernel import (
 from vllm_ascend.quantization.vq2a8_fused_fp8 import (
     BLOCK_K,
     _vq_decode_cube_kernel,
+    fused_fp8_launch_options,
     launch_cube_control,
     launch_fused_fp8,
     validate_fused_fp8_inputs,
@@ -30,6 +32,77 @@ from vllm_ascend.quantization.vq2a8_fused_fp8 import (
 )
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA developer check, not Ascend certification")
+
+
+@pytest.mark.parametrize("device_type", ["npu", "cuda"])
+def test_launch_options_are_backend_local_and_not_shared(device_type):
+    expected = {"num_warps": 4, "enable_fp_fusion": False}
+    if device_type == "npu":
+        expected["sync_solver"] = True
+    options = fused_fp8_launch_options(device_type)
+    assert options == expected
+    options.clear()
+    assert fused_fp8_launch_options(device_type) == expected
+    assert "sync_solver" not in fused_fp8_launch_options("cuda")
+
+
+@pytest.mark.parametrize("device_type", ["npu", "cuda"])
+@pytest.mark.parametrize("stage", ["direct", "bridge", "fused"])
+def test_actual_launchers_forward_prototype_options(stage, device_type, monkeypatch):
+    import vllm_ascend.quantization.vq2a8_fused_fp8 as kernel
+
+    # Use real host tensor metadata and the real wrapper validation; only
+    # allocation/launch are recorded. This does not simulate NPU execution.
+    device = SimpleNamespace(type=device_type)
+
+    def metadata(tensor):
+        mock = MagicMock(spec=torch.Tensor)
+        mock.shape, mock.ndim, mock.dtype = tensor.shape, tensor.ndim, tensor.dtype
+        mock.device = device
+        mock.is_contiguous.return_value = tensor.is_contiguous()
+        mock.data_ptr.return_value = tensor.data_ptr()
+        mock.numel.return_value = tensor.numel()
+        mock.__getitem__.side_effect = lambda index: metadata(tensor[index])
+        return mock
+
+    inputs = tuple(metadata(t) for t in synthetic_inputs(3, 64, 512, 3))
+    weight = metadata(torch.empty((32, 512), dtype=torch.float8_e4m3fn))
+    allocation = MagicMock()
+    launcher = MagicMock()
+    monkeypatch.setattr(kernel.torch, "empty", allocation)
+    target = "_vq_decode_cube_kernel" if stage == "fused" else "_cube_bridge_kernel"
+    monkeypatch.setattr(kernel, target, launcher)
+    if stage == "fused":
+        output, compiled = launch_fused_fp8(*inputs)
+    else:
+        output, compiled = launch_cube_control(inputs[0], weight, bridge=stage == "bridge")
+
+    n = 64 if stage == "fused" else 32
+    allocation.assert_called_once_with((3, n), dtype=torch.bfloat16, device=device)
+    launcher.__getitem__.assert_called_once_with((n // 32,))
+    invoke = launcher.__getitem__.return_value
+    invoke.assert_called_once()
+    expected = {
+        "M": 3,
+        "K": 512,
+        "BK": 128,
+        "BM": 32 if device_type == "npu" else 64,
+        "ASCEND": device_type == "npu",
+        "num_warps": 4,
+        "enable_fp_fusion": False,
+    }
+    if device_type == "npu":
+        expected["sync_solver"] = True
+    if stage == "fused":
+        expected.update(N=64, COLUMN_TILES=3, TABLE_TILES=4)
+        forwarded = inputs
+    else:
+        expected.update(BRIDGE=stage == "bridge")
+        forwarded = (inputs[0], weight)
+    assert invoke.call_args.kwargs == expected
+    assert all(actual is original for actual, original in zip(invoke.call_args.args, (*forwarded, output)))
+    assert len(invoke.call_args.args) == len(forwarded) + 1
+    assert output is allocation.return_value and compiled is invoke.return_value
 
 
 @pytest.mark.parametrize("rows", [1, 3, 10, 32])
@@ -277,6 +350,50 @@ def test_direct_retains_codegen_before_an_oracle_failure(tmp_path, monkeypatch):
     report = json.loads(args.output.read_text())
     assert report["status"] == "failed" and report["results"] == []
     assert report["native_instruction_verified"] is False
+    assert report["requested_launch_options"] == {"num_warps": 4, "enable_fp_fusion": False}
+
+
+@pytest.mark.parametrize("device_type", ["npu", "cuda"])
+@pytest.mark.parametrize("stage", ["direct", "bridge", "fused"])
+def test_requested_options_saved_before_device_failure(stage, device_type, tmp_path, monkeypatch, capsys):
+    import tools.validate_vq2a8_fused_fp8 as driver
+    import tools.validate_vq2a8_tp1_packed_kernel as runtime
+
+    args = argparse.Namespace(device=f"{device_type}:0", stage=stage, probe="0:0", output=tmp_path / "report.json")
+    expected = {"num_warps": 4, "enable_fp_fusion": False}
+    if device_type == "npu":
+        expected["sync_solver"] = True
+
+    def fail_initialization(device):
+        assert device.type == device_type
+        initial = json.loads(args.output.read_text())
+        assert initial["status"] == "running" and initial["requested_launch_options"] == expected
+        raise RuntimeError("device unavailable in host recorder")
+
+    # No torch-npu dependency or accelerator allocation for report ordering.
+    monkeypatch.setattr(torch, "device", lambda name: SimpleNamespace(type=name.split(":")[0]))
+    monkeypatch.setattr(runtime, "environment_report", lambda: {})
+    monkeypatch.setattr(runtime, "_initialize_device", fail_initialization)
+    with pytest.raises(RuntimeError, match="device unavailable"):
+        driver.run_child(args)
+    report = json.loads(args.output.read_text())
+    assert report["status"] == "failed" and report["results"] == []
+    assert report["requested_launch_options"] == expected
+    for field in (
+        "npu_execution_verified",
+        "native_instruction_verified",
+        "on_chip_decode_verified",
+        "model_integration_verified",
+        "performance_verified",
+    ):
+        assert report[field] is False
+    lines = capsys.readouterr().out.splitlines()
+    options = [
+        json.loads(line.removeprefix("FUSED_LAUNCH_OPTIONS "))
+        for line in lines
+        if line.startswith("FUSED_LAUNCH_OPTIONS ")
+    ]
+    assert options == [expected]
 
 
 def test_cuda_report_must_have_actual_native_instruction(tmp_path):

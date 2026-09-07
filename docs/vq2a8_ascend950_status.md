@@ -1613,3 +1613,65 @@ Required `bash format.sh ci` was attempted and remains blocked by missing
 local `pre-commit`. No new NPU PASS or real-expert chain PASS is claimed.
 Pull and rerun the same synthetic-only supervisor; no C++ rebuild,
 reinstallation, repacking or cache clearing is required for this change.
+
+### Ascend direct control: explicit graph synchronization solver
+
+At `d859a86f`, the user's direct control reaches BiShengIR but aborts in
+`SyncSolverIRTranslator.cpp` with
+`coreType.value() != hivm::TCoreType::CUBE_OR_VECTOR`. The failed JIT run is
+`/tmp/vq2a8-fused-fp8-1r9qtv06`; this is a compiler assertion, not a device
+execution or numerical result.
+
+The user replayed its cached `_cube_bridge_kernel.ttadapter` on the same
+Ascend950PR_957d compiler, initially with both graph and cross-core solver
+switches explicitly enabled. A subsequent graph-only replay, leaving the
+cross-core switch unspecified, reports `GRAPH_ONLY_COMPILE_EXIT=0` at
+`/tmp/vq2a8-graph-only.vACVZF`. It produces `kernel.o` (18,208 bytes),
+`kernel_mix_aic.o` (23,808 bytes) and `kernel_mix_aiv.o` (27,768 bytes).
+Its printed IR contains FP8 operands to `hivm.hir.mmadmxL1` and BF16 output
+through `fixpipe`. This is direct-control compilation evidence only:
+the replay does not launch a kernel, check numerical output or exercise
+VQ decode. It does not identify which operation caused the earlier
+ambiguous-core assertion or certify final native instructions.
+
+Both prototype launchers now request `sync_solver=True` on NPU:
+`launch_cube_control` (direct and bridge) and `launch_fused_fp8`. The
+[3.2.2 A5 backend](https://github.com/triton-lang/triton-ascend/blob/2deb5df0254e23ec750443f175340b38a196097e/third_party/ascend/backend/compiler.py#L476-L479),
+matching the user's printed installed code, maps this option to
+`--enable-hivm-graph-sync-solver=True` only. The A2/A3 path's additional
+cross-core flag must not be assumed for A5. No synchronization is disabled,
+and no system compiler, global runtime setting, older Vector kernel or
+default model backend is patched. CUDA keeps its previous launch options.
+K/M/N geometry, unit-scale bytes, accumulation and numerical gates are
+unchanged. Bridge/fused applicability still requires the NPU rerun.
+
+The shared `fused_fp8_launch_options` helper is used by both launchers and
+the child report. `FUSED_LAUNCH_OPTIONS` and JSON `requested_launch_options`
+are emitted/saved before device initialization, including on failure.
+These fields describe requests, not proof that a compiler honored them;
+actual codegen metadata remains separately retained and unreviewed.
+Host regressions record the real wrappers' keyword forwarding for NPU and
+CUDA, verify options are not shared mutable state, and preserve failure
+reporting without promoting execution/native/on-chip/model flags.
+
+Validation: **764 VQ2A8 development tests pass** in 15.97 seconds on the
+NVIDIA/host system, including 14 new option/report regressions. The focused
+helper/fused set passes 87 tests, including existing actual CUDA kernels.
+Ruff check/format, Markdown lint and `git diff --check` pass. Required
+`bash format.sh ci` was attempted but remains blocked by missing local
+`pre-commit`. There is no new NPU numerical PASS from the development host.
+
+Next run the synthetic-only supervisor (no model argument):
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_fused_fp8.py --physical-npu 4
+```
+
+It must pass 4 direct, 4 bridge and 20 fused cases, including unchanged
+oracles and repeatability checks. Compilation alone is not a prototype
+PASS. Real-expert chain convergence, on-chip/native instruction review,
+model integration, performance, quality and serving remain unverified.
+The earlier real-expert chain FAIL is not superseded by this compiler
+replay. No C++ rebuild, editable reinstall, cache deletion or weight
+repacking is required for this Python launch-option change.

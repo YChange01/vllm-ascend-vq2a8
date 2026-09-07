@@ -218,7 +218,7 @@ def run_child(args):
     from tools.validate_vq2a8_phase4_kernel import bitwise_equal, compare, synthetic_dense_oracle, synthetic_inputs
     from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device, environment_report
     from vllm_ascend.quantization.vq2a8_fp8_cube import ascend_fp8_unit_scale_contract
-    from vllm_ascend.quantization.vq2a8_fused_fp8 import launch_cube_control
+    from vllm_ascend.quantization.vq2a8_fused_fp8 import fused_fp8_launch_options, launch_cube_control
 
     device = torch.device(args.device)
     report = {
@@ -228,6 +228,7 @@ def run_child(args):
         "probe": args.probe,
         "environment": environment_report(),
         "dot_scale_contract": ascend_fp8_unit_scale_contract() if device.type == "npu" else None,
+        "requested_launch_options": fused_fp8_launch_options(device.type),
         "results": [],
         "npu_execution_verified": False,
         "native_instruction_verified": False,
@@ -258,6 +259,7 @@ def run_child(args):
     save()
     print("ENVIRONMENT " + json.dumps(report["environment"]), flush=True)
     print("FUSED_DOT_SCALE_CONTRACT " + json.dumps(report["dot_scale_contract"]), flush=True)
+    print("FUSED_LAUNCH_OPTIONS " + json.dumps(report["requested_launch_options"]), flush=True)
     codegen_root = args.output.parent / f"{args.output.stem}-codegen"
     try:
         report["device_info"] = _initialize_device(device)

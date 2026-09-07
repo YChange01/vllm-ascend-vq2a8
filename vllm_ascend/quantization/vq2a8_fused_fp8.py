@@ -32,6 +32,18 @@ BLOCK_K = 128
 MAX_COLUMN_TILES = 32
 
 
+def fused_fp8_launch_options(device_type: str) -> dict[str, int | bool]:
+    """Requested per-launch options, not proof of compiler/device execution."""
+    options = {"num_warps": 4, "enable_fp_fusion": False}
+    if device_type == "npu":
+        # The user's 3.2.2/A5 direct-control replay compiles with the graph
+        # solver explicitly enabled. This backend forwards only the graph
+        # switch for sync_solver; do not assume it also sets cross-core GSS.
+        # Keep this opt-in prototype-local; CUDA must not receive this option.
+        options["sync_solver"] = True
+    return options
+
+
 def validate_fused_fp8_inputs(activation, scale, bias, packed, codebooks, tile_ids):
     """Metadata-only validation; artifact/preparer must validate tensor values."""
     if not isinstance(activation, torch.Tensor) or activation.ndim != 2:
@@ -140,8 +152,7 @@ def launch_fused_fp8(activation, scale, bias, packed, codebooks, tile_ids):
         BK=BLOCK_K,
         BM=BLOCK_M if activation.device.type == "npu" else 64,
         ASCEND=activation.device.type == "npu",
-        num_warps=4,
-        enable_fp_fusion=False,
+        **fused_fp8_launch_options(activation.device.type),
     )
     return output, compiled
 
@@ -201,7 +212,6 @@ def launch_cube_control(activation, weight, *, bridge=False):
         BM=BLOCK_M if activation.device.type == "npu" else 64,
         BRIDGE=bridge,
         ASCEND=activation.device.type == "npu",
-        num_warps=4,
-        enable_fp_fusion=False,
+        **fused_fp8_launch_options(activation.device.type),
     )
     return output, compiled
