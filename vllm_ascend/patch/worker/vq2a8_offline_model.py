@@ -166,6 +166,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_steps = []
         for index in self.model.offline_owner.calls:
             self.model.offline_owner.calls[index] = 0
+        self.model.offline_owner.reset_backend_trace()
         for module in self.modules():
             method = getattr(module, "quant_method", None)
             if isinstance(method, OfflineRootFP8Method):
@@ -244,6 +245,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "peak_allocated_bytes": torch.npu.max_memory_allocated(),
             "peak_reserved_bytes": torch.npu.max_memory_reserved(),
             "root_fp8": self.root_fp8_evidence(),
+            "expert_backend": self.model.offline_owner.backend_report(),
         }
 
     def root_fp8_evidence(self):

@@ -189,6 +189,142 @@ def test_cached_policy_preserves_per_row_preparation_and_aligned_scalars(monkeyp
         torch.testing.assert_close(bias, ref_bias, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("count", [1, 17, 32, 33, 65])
+@pytest.mark.parametrize("columns", [512, 480])
+def test_native_policy_batches_only_after_accepted_row_preparation(monkeypatch, count, columns):
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.__dict__.update(cache_only_runtime().__dict__)
+    runtime.device = NS(type="npu")  # Host capture only; no actual NPU assertion.
+    runtime.reset_native_trace()
+    monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
+    calls = []
+    payload = {
+        "weight_scale": torch.ones(512),
+        "weight_bias": torch.zeros(512),
+        "rht_sign": torch.ones(512, dtype=torch.int8),
+        "packed_indices": torch.zeros(1, dtype=torch.int32),
+        "codebooks": torch.zeros(1),
+        "codebook_tile_ids": torch.zeros(1),
+    }
+
+    def native(q, scale, bias, packed, book, ids):
+        assert 1 <= q.shape[0] <= 32 and q.shape[1] == 512
+        assert scale.shape == bias.shape == (q.shape[0],)
+        assert (
+            packed is payload["packed_indices"] and book is payload["codebooks"] and ids is payload["codebook_tile_ids"]
+        )
+        calls.append((q.clone(), scale.clone(), bias.clone()))
+        return (q.float() * scale[:, None] + bias[:, None]).to(torch.bfloat16)
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(vq2a8_ascendc=native))
+    hidden = ((torch.arange(count * columns).reshape(count, columns) % 17 - 8) / 16).bfloat16()
+    output = runtime._projection(hidden, payload, NS(columns=512, rht_true_columns=columns, rht_block_size=128))
+    expected = []
+    for row in hidden.split(1):
+        prepared = prepare_repacked_vq2a8_activation_reference(
+            torch.nn.functional.pad(row, (0, 512 - columns)),
+            payload["weight_scale"],
+            payload["weight_bias"],
+            payload["rht_sign"],
+            128,
+        )
+        expected.append(prepared)
+    for actual, ref in zip((torch.cat(v) for v in zip(*calls)), (torch.cat(v) for v in zip(*expected))):
+        assert torch.equal(actual.view(torch.uint8), ref.view(torch.uint8))
+    assert output.shape == (count, 512)
+    assert runtime.native_calls == (count + 31) // 32
+    assert runtime.native_rows == runtime.projection_rows == runtime.prepare_batches == count
+
+
+def test_native_policy_no_host_fallback_and_no_count_on_failure(monkeypatch):
+    with pytest.raises(ValueError, match="no CPU/CUDA fallback"):
+        execution.AscendCVQ2TP1MoE(None, 0, "cpu")
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.__dict__.update(cache_only_runtime().__dict__)
+    runtime.reset_native_trace()
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(vq2a8_ascendc=lambda *a: pytest.fail("fallback"))
+    )
+    with pytest.raises(ValueError, match="never fall back"):
+        runtime._projection(torch.zeros(1, 512), {}, None)
+    assert runtime.native_calls == 0
+
+
+def test_native_trace_reset_excludes_profile_and_preserves_cache(monkeypatch):
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.native_calls, runtime.native_rows, runtime.native_experts = 20, 40, 10
+    runtime.native_steps = [{"tokens": 999}]
+    runtime._cache = {0: "packed"}
+    runtime.reset_native_trace()
+
+    def forward(self, hidden, input_ids):
+        self.native_calls += 2
+        self.native_rows += 2 * len(hidden)
+        self.native_experts += 1
+        return hidden
+
+    monkeypatch.setattr(execution.CachedVQ2TP1MoE, "forward", forward)
+    hidden = torch.zeros(3, 4)
+    assert runtime.forward(hidden) is hidden
+    assert runtime.native_steps == [{"tokens": 3, "projection_calls": 2, "projection_rows": 6, "expert_calls": 1}]
+    runtime.reset_native_trace()
+    assert runtime.native_steps == [] and runtime.native_calls == 0
+    assert runtime._cache == {0: "packed"}
+
+
+@pytest.mark.parametrize("hashed", [True, False])
+def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monkeypatch, hashed):
+    """Real scheduler/preparation/SwiGLU with a CPU projection stand-in, not NPU evidence."""
+    monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
+
+    def projection(q, scale, bias, packed, book, ids):
+        value = (q.float() * scale[:, None] + bias[:, None]).bfloat16()
+        return torch.cat((value, value / 2), dim=1) if packed == "gate_up" else value
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_triton", NS(vq2a8_tp1_m1_packed_gemm=projection))
+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(vq2a8_ascendc=projection))
+    baseline = cache_only_runtime()
+    candidate = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    candidate.__dict__.update(cache_only_runtime().__dict__)
+    candidate.reset_native_trace()
+    for runtime, device in ((baseline, "cuda"), (candidate, "npu")):
+        runtime.device = NS(type=device)
+        runtime.token_chunk = 2
+        runtime.config = NS(
+            hidden_size=512, top_k=2, renormalize=True, num_shared=1, routed_scale=1.5, swiglu_limit=None
+        )
+        runtime.root = {"gate.weight": torch.zeros(2, 512)}
+        runtime.root["gate.tid2eid" if hashed else "gate.bias"] = (
+            torch.tensor([[0, 0], [1, 0]]) if hashed else torch.zeros(2)
+        )
+        runtime.shared = lambda hidden: torch.full_like(hidden, 2)
+        for expert in (0, 1):
+            runtime._cache[expert] = {
+                kind: (
+                    {
+                        "weight_scale": torch.full((512,), 1 + expert / 2),
+                        "weight_bias": torch.zeros(512),
+                        "rht_sign": torch.ones(512, dtype=torch.int8),
+                        "packed_indices": kind,
+                        "codebooks": None,
+                        "codebook_tile_ids": None,
+                    },
+                    NS(columns=512, rht_true_columns=512, rht_block_size=128),
+                )
+                for kind in ("gate_up", "down")
+            }
+    hidden = ((torch.arange(3 * 512).reshape(3, 512) % 11 - 5) / 16).bfloat16()
+    ids = torch.tensor([0, 1, 0])
+    expected = baseline.forward(hidden, ids)
+    actual = candidate.forward(hidden, ids)
+    assert torch.equal(actual, expected)
+    assert candidate.cache_loads == 0  # existing packed residency reused
+    step = candidate.native_steps[0]
+    assert step["projection_calls"] == 2 * step["expert_calls"]
+    assert step["projection_rows"] == (8 if hashed else 12)
+    assert step["tokens"] == 3
+
+
 def test_owner_configures_actual_layer_limits_before_any_expert_is_loaded(monkeypatch):
     owner = OfflineMoEOwner.__new__(OfflineMoEOwner)
     owner.options = {"execution_policy": "cached", "cache_experts": 256}

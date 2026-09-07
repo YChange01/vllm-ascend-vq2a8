@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Bounded cached execution; the accepted router and M=1 kernel stay unchanged.
+"""Bounded cached execution with an explicit native AscendC projection policy.
 
-This is an opt-in residency/diagnostic policy, not a new batched GEMM or
-native FP8 Cube implementation. No dense expert matrix is materialized.
+The default cached policy retains the accepted M=1 kernel. Both policies keep
+the same router and row-wise preparation; no dense expert matrix is stored.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_TORCH_DTYPES
 
 GIB = 1024**3
 ALLOCATION_GRANULARITY = 512
+ASCENDC_MAX_ROWS = 32
 
 
 def synchronize_execution(device: torch.device) -> None:
@@ -256,9 +257,103 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             "cache_hits": self.cache_hits - cache_before["hits"],
             "evictions": self.evictions - cache_before["evictions"],
             "resident_bytes": self._resident_bytes,
-            "execution_policy": "cached",
-            "native_fp8_dot": False if self.device.type == "npu" else None,
+            "execution_policy": getattr(self, "execution_policy", "cached"),
+            "native_fp8_dot": False
+            if self.device.type == "npu" and getattr(self, "execution_policy", "cached") != "ascendc"
+            else None,  # native policy call coverage is not an ISA-verification claim
         }
         if self.progress:
             print("MODEL_MOE_TIMING " + json.dumps(report), flush=True)
         return result
+
+
+class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
+    """Opt-in eager native projections; routing/cache/shared math is unchanged.
+
+    Preparation retains the accepted one-row rounding geometry. Only prepared
+    rows of the same expert are batched for the native projection, never dense
+    expert weights. This is integration bring-up, not a serving fast path.
+    """
+
+    execution_policy = "ascendc"
+
+    def __init__(self, artifact, layer_index, device, **kwargs):
+        if torch.device(device).type != "npu":
+            raise ValueError("AscendC expert execution requires NPU; no CPU/CUDA fallback.")
+        super().__init__(artifact, layer_index, device, **kwargs)
+        self.native_calls = 0
+        self.native_rows = 0
+        self.native_experts = 0
+        self.native_steps = []
+        self.trace_native = False
+
+    def reset_native_trace(self):
+        self.native_calls = self.native_rows = self.native_experts = 0
+        self.native_steps = []
+        self.trace_native = True
+
+    def _projection(self, hidden, payload, spec):
+        from vllm_ascend.quantization.vq2a8_ascendc import vq2a8_ascendc
+
+        if self.device.type != "npu":
+            raise ValueError("AscendC projections never fall back to CPU/CUDA.")
+        outputs = []
+        for chunk in hidden.split(ASCENDC_MAX_ROWS):
+            start = time.perf_counter()
+            prepared = []
+            for row in chunk.split(1):
+                if spec.columns != spec.rht_true_columns:
+                    row = F.pad(row, (0, spec.columns - spec.rht_true_columns))
+                with torch.device("cpu"):
+                    prepared.append(
+                        prepare_repacked_vq2a8_activation_reference(
+                            row,
+                            payload["weight_scale"],
+                            payload["weight_bias"],
+                            payload["rht_sign"],
+                            spec.rht_block_size,
+                        )
+                    )
+            quantized, scale, bias = (torch.cat(values, dim=0).contiguous() for values in zip(*prepared))
+            synchronize_execution(self.device)
+            self.timing["prepare_s"] += time.perf_counter() - start
+            self.prepare_batches += chunk.shape[0]
+            start = time.perf_counter()
+            outputs.append(
+                vq2a8_ascendc(
+                    quantized,
+                    scale,
+                    bias,
+                    payload["packed_indices"],
+                    payload["codebooks"],
+                    payload["codebook_tile_ids"],
+                )
+            )
+            synchronize_execution(self.device)
+            self.timing["packed_projection_s"] += time.perf_counter() - start
+            self.projection_rows += chunk.shape[0]
+            self.native_calls += 1
+            self.native_rows += chunk.shape[0]
+        return torch.cat(outputs, dim=0)
+
+    def expert(self, expert_id, hidden):
+        output = super().expert(expert_id, hidden)
+        self.native_experts += 1  # both gate/up and down completed
+        return output
+
+    @torch.inference_mode()
+    def forward(self, hidden, input_ids=None):
+        before = self.native_calls, self.native_rows, self.native_experts
+        output = super().forward(hidden, input_ids)
+        if self.trace_native:
+            if len(self.native_steps) >= 128:
+                raise ValueError("Native model trace exceeded the offline step bound.")
+            self.native_steps.append(
+                {
+                    "tokens": hidden.shape[0],
+                    "projection_calls": self.native_calls - before[0],
+                    "projection_rows": self.native_rows - before[1],
+                    "expert_calls": self.native_experts - before[2],
+                }
+            )
+        return output

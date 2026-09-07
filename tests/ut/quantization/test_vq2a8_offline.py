@@ -47,6 +47,37 @@ def test_plan_preserves_model_type_and_selects_only_explicit_offline_architectur
     assert validate_offline_config(config())["enabled"] is True
 
 
+@pytest.mark.parametrize("bad", [None, "path", "sha", "policy"])
+def test_native_model_options_are_explicit_and_default_unchanged(bad):
+    assert (
+        offline_engine_options(Path("/m"), Path("/a"))["additional_config"]["vq2a8_offline"]["execution_policy"]
+        == "cached"
+    )
+    plan = offline_engine_options(
+        Path("/m"),
+        Path("/a"),
+        execution_policy="ascendc",
+        ascendc_library="/build/libvq2a8_ascendc.so",
+        ascendc_sha256="a" * 64,
+    )
+    cfg = config()
+    cfg.additional_config = plan["additional_config"]
+    options = cfg.additional_config["vq2a8_offline"]
+    if bad == "path":
+        options["ascendc_library"] = "relative.so"
+    elif bad == "sha":
+        options["ascendc_sha256"] = "wrong"
+    elif bad == "policy":
+        options["execution_policy"] = "cached"
+    if bad:
+        with pytest.raises(ValueError):
+            validate_offline_config(cfg)
+    else:
+        assert validate_offline_config(cfg) is options
+        assert options["cache_experts"] == 256 and options["token_chunk"] == 2
+        assert plan["gpu_memory_utilization"] == 0.9
+
+
 @pytest.mark.parametrize(
     "section,key,value",
     [
@@ -213,6 +244,59 @@ def test_model_evidence_requires_all_layers_real_steps_and_greedy_logits():
     result = validate_offline_evidence(evidence(), [0, 1, 2], [7] * 4, 2, 8)
     assert result["finite_logits"] and result["greedy_logits_agree"]
     assert result["decode_steps"] == 3 and result["layers_executed"] == 2
+
+
+@pytest.mark.parametrize("bad", [None, "policy", "hash", "layer", "profile", "step", "calls", "rows", "fallback"])
+def test_native_model_evidence_requires_each_real_step_and_no_fallback(bad):
+    data = evidence()
+    data["expert_backend"] = {
+        "policy": "ascendc",
+        "library": {"sha256": "a" * 64},
+        "fallback_enabled": False,
+        "layers": [
+            {
+                "layer": i,
+                "steps": [
+                    {
+                        "tokens": s["tokens"],
+                        "projection_calls": 2,
+                        "projection_rows": 2 * s["tokens"],
+                        "expert_calls": 1,
+                    }
+                    for s in data["steps"]
+                ],
+            }
+            for i in range(2)
+        ],
+    }
+    backend = data["expert_backend"]
+    steps = backend["layers"][0]["steps"]
+    if bad == "policy":
+        backend["policy"] = "cached"
+    elif bad == "hash":
+        backend["library"]["sha256"] = "b" * 64
+    elif bad == "layer":
+        backend["layers"].pop()
+    elif bad == "profile":
+        steps.insert(0, dict(steps[0]))
+    elif bad == "step":
+        steps[1]["tokens"] = 3
+    elif bad == "calls":
+        steps[1]["projection_calls"] = 1
+    elif bad == "rows":
+        steps[1]["projection_rows"] = 0
+    elif bad == "fallback":
+        backend["fallback_enabled"] = True
+    if bad:
+        with pytest.raises(ValueError):
+            validate_offline_evidence(
+                data, [0, 1, 2], [7] * 4, 2, 8, execution_policy="ascendc", ascendc_sha256="a" * 64
+            )
+    else:
+        result = validate_offline_evidence(
+            data, [0, 1, 2], [7] * 4, 2, 8, execution_policy="ascendc", ascendc_sha256="a" * 64
+        )
+        assert result["expert_backend"] == backend
 
 
 @pytest.mark.parametrize(

@@ -223,8 +223,9 @@ def test_shutdown_errors_are_counted_without_claiming_their_cause(tmp_path, mark
     assert [row["after_shutdown_notice"] for row in review["errors"]] == [False, True]
 
 
-def test_instruction_progress_reads_only_bounded_instruction_tails(tmp_path):
-    dump = tmp_path / "profile/OPPROF_mock/dump"
+@pytest.mark.parametrize("suffix", ["dump", "device0/vq2a8_ascendc_fused_2_mix_aic/0/dump"])
+def test_instruction_progress_reads_only_bounded_instruction_tails(tmp_path, suffix):
+    dump = tmp_path / "profile/OPPROF_mock" / suffix
     dump.mkdir(parents=True)
     for core in ("cubecore0", "veccore0", "veccore1"):
         (dump / f"core0.{core}.instr_log.dump").write_text("old\n" * 2000 + "PC: last1\nPC: last2\n")

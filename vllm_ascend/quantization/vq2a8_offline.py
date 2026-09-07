@@ -12,7 +12,12 @@ from pathlib import Path
 import torch
 from safetensors import safe_open
 
-from vllm_ascend.quantization.vq2a8_execution import CachedVQ2TP1MoE, device_cache_budget, packed_cache_plan
+from vllm_ascend.quantization.vq2a8_execution import (
+    AscendCVQ2TP1MoE,
+    CachedVQ2TP1MoE,
+    device_cache_budget,
+    packed_cache_plan,
+)
 from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
 from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
 
@@ -29,6 +34,8 @@ def offline_engine_options(
     cache_budget_gib=0.0,
     cache_reserve_gib=16.0,
     root_linear_mode="bf16",
+    ascendc_library=None,
+    ascendc_sha256=None,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     return {
@@ -50,7 +57,7 @@ def offline_engine_options(
         "max_model_len": OFFLINE_CONTEXT_LIMIT,
         "max_num_batched_tokens": OFFLINE_CONTEXT_LIMIT,
         "block_size": 128,
-        "gpu_memory_utilization": 0.9 if execution_policy == "cached" else 0.35,
+        "gpu_memory_utilization": 0.9 if execution_policy in ("cached", "ascendc") else 0.35,
         "kv_cache_memory_bytes": 1024**3,
         "seed": 0,
         "disable_log_stats": True,
@@ -62,11 +69,16 @@ def offline_engine_options(
                 "enabled": True,
                 "artifact": str(artifact),
                 "execution_policy": execution_policy,
-                "cache_experts": 256 if execution_policy == "cached" else 2,
+                "cache_experts": 256 if execution_policy in ("cached", "ascendc") else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
                 "root_linear_mode": root_linear_mode,
+                **(
+                    {"ascendc_library": str(ascendc_library), "ascendc_sha256": ascendc_sha256}
+                    if execution_policy == "ascendc"
+                    else {}
+                ),
             },
         },
     }
@@ -86,6 +98,8 @@ def validate_offline_config(config) -> dict:
         "cache_budget_gib",
         "cache_reserve_gib",
         "root_linear_mode",
+        "ascendc_library",
+        "ascendc_sha256",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
         raise ValueError("Invalid vq2a8_offline options/artifact path.")
@@ -131,8 +145,16 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Generic offload/sleep cannot manage standalone packed-cache ownership.")
     if config.load_config.load_format != "safetensors":
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
-    if options.get("execution_policy", "baseline") not in ("baseline", "cached"):
-        raise ValueError("execution_policy must be baseline or cached.")
+    if options.get("execution_policy", "baseline") not in ("baseline", "cached", "ascendc"):
+        raise ValueError("execution_policy must be baseline, cached or ascendc.")
+    if options.get("execution_policy") == "ascendc":
+        path, sha = options.get("ascendc_library"), options.get("ascendc_sha256")
+        if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
+            raise ValueError("AscendC requires an absolute native .so library path.")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise ValueError("AscendC requires the regression-tested library SHA256.")
+    elif "ascendc_library" in options or "ascendc_sha256" in options:
+        raise ValueError("Native library options require explicit execution_policy=ascendc.")
     if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
         raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
     for key, default, upper in (("cache_experts", 2, 256), ("token_chunk", 2, 8)):
@@ -185,6 +207,13 @@ class OfflineMoEOwner:
     """One artifact index per model; lazy per-layer caches share a byte budget."""
 
     def __init__(self, model_root: Path, options: dict, device: torch.device):
+        self.native_library = None
+        if options.get("execution_policy") == "ascendc":
+            from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
+
+            if device.type != "npu":
+                raise ValueError("AscendC offline execution requires an NPU, without fallback.")
+            self.native_library = load_pinned_library(options["ascendc_library"], options["ascendc_sha256"])
         self.artifact = open_vq2a8_tp1_artifact(
             Path(options["artifact"]),
             model_root / "config.json",
@@ -205,14 +234,18 @@ class OfflineMoEOwner:
         # vLLM constructs under a default NPU device. Keep CPU validation
         # factories on CPU; the tested runtime moves its roots explicitly.
         with torch.device("cpu"):
-            runtime_class = CachedVQ2TP1MoE if self.options.get("execution_policy") == "cached" else VQ2TP1MoE
+            runtime_class = {
+                "baseline": VQ2TP1MoE,
+                "cached": CachedVQ2TP1MoE,
+                "ascendc": AscendCVQ2TP1MoE,
+            }[self.options.get("execution_policy", "baseline")]
             layer = runtime_class(
                 self.artifact,
                 index,
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
-                **({"progress": True} if runtime_class is CachedVQ2TP1MoE else {}),
+                **({"progress": True} if issubclass(runtime_class, CachedVQ2TP1MoE) else {}),
             )
         self.layers[index] = layer
         self.calls[index] = 0
@@ -221,7 +254,7 @@ class OfflineMoEOwner:
 
     def configure_cache(self, memory_fraction: float) -> None:
         """Call after strict root load, before profiling populates any cache."""
-        if self.options.get("execution_policy") != "cached":
+        if self.options.get("execution_policy") not in ("cached", "ascendc"):
             return
         if any(layer.cache_stats()["resident_experts"] for layer in self.layers.values()):
             raise ValueError("Configure the packed cache before the first expert call.")
@@ -311,8 +344,34 @@ class OfflineMoEOwner:
             "plan": self.cache_plan,
         }
 
+    def reset_backend_trace(self):
+        for layer in self.layers.values():
+            if isinstance(layer, AscendCVQ2TP1MoE):
+                layer.reset_native_trace()
 
-def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list[int], layers: int, vocab: int) -> dict:
+    def backend_report(self) -> dict:
+        return {
+            "policy": self.options.get("execution_policy", "baseline"),
+            "library": self.native_library,
+            "fallback_enabled": False,
+            "layers": [
+                {"layer": index, "steps": list(layer.native_steps)}
+                for index, layer in self.layers.items()
+                if isinstance(layer, AscendCVQ2TP1MoE)
+            ],
+        }
+
+
+def validate_offline_evidence(
+    evidence: dict,
+    prompt: list[int],
+    generated: list[int],
+    layers: int,
+    vocab: int,
+    *,
+    execution_policy=None,
+    ascendc_sha256=None,
+) -> dict:
     """Require real prefill followed by decode, all layers, and sampler/logit agreement."""
     if len(prompt) < 2 or len(generated) != OFFLINE_NEW_TOKENS:
         raise ValueError("Gate requires a multi-token prefill and four generated tokens.")
@@ -322,6 +381,37 @@ def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list
     expected_steps.extend({"tokens": 1, "positions": [len(prompt) + index]} for index in range(len(generated) - 1))
     if evidence["steps"] != expected_steps:
         raise ValueError(f"Unexpected prefill/decode positions or padded batch: {evidence['steps']}.")
+    backend = evidence.get("expert_backend", {})
+    if execution_policy is not None and backend.get("policy") != execution_policy:
+        raise ValueError("Requested expert backend did not execute on the model.")
+    if execution_policy == "ascendc":
+        records = backend.get("layers", [])
+        if (
+            not isinstance(ascendc_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", ascendc_sha256)
+            or backend.get("library", {}).get("sha256") != ascendc_sha256
+            or backend.get("fallback_enabled") is not False
+            or len(records) != layers
+            or {r["layer"] for r in records} != set(range(layers))
+        ):
+            raise ValueError("AscendC model library/layer coverage mismatch.")
+        for record in records:
+            steps = record.get("steps", [])
+            if len(steps) != len(expected_steps):
+                raise ValueError("AscendC profile calls cannot count as generation coverage.")
+            for step, expected in zip(steps, expected_steps):
+                if (
+                    any(
+                        type(step.get(k)) is not int
+                        for k in ("tokens", "projection_calls", "projection_rows", "expert_calls")
+                    )
+                    or step["tokens"] != expected["tokens"]
+                    or step["expert_calls"] < 1
+                    or step["projection_calls"] != 2 * step["expert_calls"]
+                    or step["projection_rows"] < 2 * step["tokens"]
+                    or step["projection_rows"] % 2
+                ):
+                    raise ValueError("AscendC gate/up and down coverage is incomplete for a real model step.")
     calls = {int(index): count for index, count in evidence["cache"]["layer_calls"].items()}
     if calls != {index: len(expected_steps) for index in range(layers)}:
         raise ValueError(f"Not all {layers} MoE layers executed once per model step: {calls}.")
@@ -377,4 +467,5 @@ def validate_offline_evidence(evidence: dict, prompt: list[int], generated: list
         "peak_allocated_bytes": evidence["peak_allocated_bytes"],
         "peak_reserved_bytes": evidence["peak_reserved_bytes"],
         "root_fp8": root,
+        "expert_backend": backend,
     }

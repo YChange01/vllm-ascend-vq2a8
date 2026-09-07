@@ -42,18 +42,32 @@ def main() -> None:
     parser.add_argument("--device", choices=["npu:0"], default="npu:0")
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
-    parser.add_argument("--execution-policy", choices=["baseline", "cached"], default="cached")
+    parser.add_argument("--execution-policy", choices=["baseline", "cached", "ascendc"], default="cached")
+    parser.add_argument("--ascendc-library", type=Path)
+    parser.add_argument("--ascendc-preflight", type=Path)
     parser.add_argument("--root-linear-mode", choices=["bf16", "online_fp8_sm90"], default="bf16")
     parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="0: auto budget after root loading.")
     parser.add_argument(
         "--cache-reserve-gib", type=float, default=16.0, help="Reserve for KV, workspace and allocator."
     )
     args = parser.parse_args()
-    if args.baseline_report and args.root_linear_mode != "bf16":
+    if args.execution_policy == "ascendc":
+        if args.ascendc_library is None or args.ascendc_preflight is None:
+            parser.error("AscendC requires --ascendc-library and the short --ascendc-preflight receipt.")
+    elif args.ascendc_library or args.ascendc_preflight:
+        parser.error("Native library/preflight options require execution-policy ascendc.")
+    if args.baseline_report and (args.root_linear_mode != "bf16" or args.execution_policy == "ascendc"):
         parser.error("The phase-1 BF16 baseline is not an exact oracle for online FP8; do not mix these gates.")
     model_root, artifact_root = args.model.resolve(strict=True), args.artifact.resolve(strict=True)
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    native_library = None
+    if args.execution_policy == "ascendc":
+        from tools.validate_vq2a8_ascendc import checked_model_preflight, require_hardware_runtime
+
+        require_hardware_runtime()
+        native_library = checked_model_preflight(args.ascendc_library, args.ascendc_preflight)
+        print("MODEL_ASCENDC_LIBRARY " + json.dumps(native_library), flush=True)
     # Existing vLLM diagnostic control: the single worker stays in this
     # supervised process. A timeout/abort must not leave an EngineCore orphan.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -92,6 +106,8 @@ def main() -> None:
         print("BASELINE_PREFLIGHT=PASS INDEPENDENT_REFERENCE=False", flush=True)
     print("MODEL stage=device_init_start", flush=True)
     print("DEVICE " + json.dumps(_initialize_device(torch.device(args.device))), flush=True)
+    if native_library:
+        require_hardware_runtime()
     print("MODEL stage=artifact_and_root_audit", flush=True)
     artifact = open_vq2a8_tp1_artifact(
         artifact_root,
@@ -134,6 +150,8 @@ def main() -> None:
         cache_budget_gib=args.cache_budget_gib,
         cache_reserve_gib=args.cache_reserve_gib,
         root_linear_mode=args.root_linear_mode,
+        ascendc_library=native_library["path"] if native_library else None,
+        ascendc_sha256=native_library["sha256"] if native_library else None,
     )
     missing = set(options) - set(inspect.signature(EngineArgs).parameters)
     if missing or not hasattr(LLM, "collective_rpc"):
@@ -153,7 +171,7 @@ def main() -> None:
                 "expert_device": args.device,
                 "expert_load_path": "cpu_validate_then_device_cache",
                 "root_linear_execution": args.root_linear_mode,
-                "native_fp8_dot": False,
+                "native_fp8_dot": None if native_library else False,
             }
         ),
         flush=True,
@@ -175,7 +193,15 @@ def main() -> None:
         evidence = single_worker_result(llm.collective_rpc(capture_worker_trace))
         if evidence.get("root_fp8", {}).get("mode", "bf16") != args.root_linear_mode:
             raise ValueError("Requested root mode was not installed on the executing model.")
-        result = validate_offline_evidence(evidence, prompt, tokens, config["num_hidden_layers"], config["vocab_size"])
+        result = validate_offline_evidence(
+            evidence,
+            prompt,
+            tokens,
+            config["num_hidden_layers"],
+            config["vocab_size"],
+            execution_policy=args.execution_policy,
+            ascendc_sha256=native_library["sha256"] if native_library else None,
+        )
         logits = evidence["logits"]
         path = output / f"run-{run}-logits.safetensors"
         save_file({"logits": logits.contiguous()}, str(path))
@@ -226,13 +252,17 @@ def main() -> None:
                 "runs": OFFLINE_RUNS,
                 "new_tokens": OFFLINE_NEW_TOKENS,
                 "layers": len(artifact.layers),
-                "native_fp8_dot": False,
+                "native_fp8_dot": None if native_library else False,
+                "native_instruction_verified": False,
                 "repeat_exact": True,
                 "root_linear_mode": args.root_linear_mode,
                 "native_fp8_root_matmul": args.root_linear_mode == "online_fp8_sm90",
                 "root_fp8_execution_verified": args.root_linear_mode == "online_fp8_sm90",
                 "baseline_exact": True if previous_runs is not None else None,
                 "offline_execution_verified": True,
+                "expert_execution_policy": args.execution_policy,
+                "ascendc_model_execution_verified": args.execution_policy == "ascendc",
+                "on_chip_decode_verified": False,
                 "logits_reference_verified": False,
                 "quality_verified": False,
                 "serving_integration_verified": False,

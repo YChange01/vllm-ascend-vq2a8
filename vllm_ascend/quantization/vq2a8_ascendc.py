@@ -7,9 +7,24 @@ Triton implementation or fallback in the projection path. C++ validates the
 tensor metadata even when callers bypass this Python wrapper.
 """
 
+import hashlib
+import re
 from pathlib import Path
 
 import torch
+
+
+def load_pinned_library(path: str | Path, expected_sha256: str) -> dict:
+    """Load only the exact standalone candidate selected by the offline gate."""
+    if not isinstance(expected_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256):
+        raise ValueError("AscendC requires an explicit SHA256 library identity.")
+    path = Path(path).resolve(strict=True)
+    with path.open("rb") as stream:
+        actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    if actual != expected_sha256:
+        raise ValueError("AscendC library differs from the regression-tested candidate.")
+    load_library(path)
+    return {"path": str(path), "sha256": actual}
 
 
 def load_library(path: str | Path) -> Path:

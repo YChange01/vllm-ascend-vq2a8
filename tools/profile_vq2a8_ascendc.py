@@ -250,11 +250,12 @@ def instruction_progress(directory):
     """Bounded raw-tail observation, not an automatic liveness or ISA verdict.
 
     CCU logs can grow while waiting, so observe instruction logs separately.
-    A buffered log can also stay unchanged while simulation advances.
+    A buffered log can also stay unchanged while simulation advances. File
+    order is not necessarily time order; tails are not last-executed PCs.
     """
     rows = []
     for core in ("cubecore0", "veccore0", "veccore1"):
-        matches = sorted((directory / "profile").glob(f"OPPROF*/dump/core0.{core}.instr_log.dump"))
+        matches = instruction_dump_paths(directory, core)
         if not matches:
             continue
         path = matches[-1]
@@ -270,6 +271,20 @@ def instruction_progress(directory):
         except OSError:
             continue  # profiler may not have created/flushed the dump yet
     return rows
+
+
+def instruction_dump_paths(directory, core):
+    """Find both pre-export nested and post-export flat instruction dumps."""
+    if core not in ("cubecore0", "veccore0", "veccore1"):
+        raise ValueError("Expected core0's Cube or one of its two Vector cores.")
+    return sorted(
+        p
+        for p in (directory / "profile").glob(f"OPPROF*/**/dump/core0.{core}.instr_log*.dump")
+        if re.fullmatch(rf"core0\.{core}\.instr_log(?:\.\d+)?\.dump", p.name)
+        and p.is_file()
+        and not p.is_symlink()
+        and p.resolve().is_relative_to(directory.resolve())
+    )
 
 
 def profiler_command(msprof, args, directory, library_sha):

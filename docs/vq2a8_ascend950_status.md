@@ -2205,3 +2205,78 @@ Markdown and repository-configured spelling checks pass for changed files.
 The required `bash format.sh ci` was attempted and remains blocked by missing
 local `pre-commit`. The native source and library are unchanged by this patch;
 the longer simulator capture has not been run on the development host.
+
+### Advance to opt-in AscendC model execution; stop extending simulation
+
+The user completed the 45-minute capture at
+`/tmp/vq2a8-ascendc-sim-p4g9t3j3`. It still did not complete the application.
+Its raw files are under
+`profile/OPPROF_20260907203250_YCJIBYSTLHLSEBAY/device0/vq2a8_ascendc_fused_2_mix_aic/0/dump/`.
+The previous live-progress glob searched only the post-export flat layout,
+so `instruction_logs: []` was a discovery failure, not proof of no execution.
+Discovery now supports both layouts. No additional simulator run is requested.
+The new library remains SHA256
+`022bbb8ccd39e0de0a193199027ba2e935e87967c8d49f1a9f251ddcdf6b1518`.
+
+The shutdown-time scalar instruction errors remain unresolved observations.
+No complete simulator execution or new-library native/on-chip acceptance is
+claimed. The old library's single `MMAD dtype:E4M3E4M3` observation cannot be
+transferred to the sync-fix library. Also, the official
+[profiler architecture](https://github.com/Ascend/msopprof/blob/master/docs/en/development_guide/architecture.md)
+notes that instruction-log order is not necessarily time order; file tails
+must not be presented as the last executed PC.
+
+At the user's direction, complete simulator forensics and kernel performance
+optimization are no longer prerequisites for **experimental model bring-up**.
+Production quality, stability and throughput acceptance are still required
+before a serving rollout. The new explicit `--execution-policy ascendc`
+selects native expert projections only on the existing eager TP1 offline
+architecture. Default `cached` execution, root projection policy, attention,
+routing, shared experts, SwiGLU and packed-cache budgeting are unchanged.
+
+`AscendCVQ2TP1MoE` prepares each activation row with the accepted numerical
+geometry, then batches only prepared rows from the same expert, at most 32
+per native call. The existing offline token chunk stays at two. Packed
+payloads remain cached; no full decoded expert matrix is placed on the NPU.
+There is no native-projection fallback. Scalar UB decode, synchronous routing
+and host preparation costs still need later optimization; this is not a
+high-throughput multi-expert serving kernel.
+
+One command now performs the necessary short hardware check and proceeds
+directly to model execution if it passes. It runs 28 synthetic fused cases
+and six real gate/up/down cases at M=1,17,32 on probe `0:0`. The latter include
+oracle/baseline/independent-chain comparisons, repeat/row-chunk checks and
+resident-projection timing with three warmups and ten repeats. Any failure
+stops before model loading. Simulator preload/config is rejected, and the
+native source manifest, library hash and child evidence hashes are checked.
+This is limited regression coverage, not exhaustive synchronization proof.
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_tp1_acceptance.py --stage model --execution-policy ascendc --ascendc-library build/vq2a8-ascendc-syncfix/libvq2a8_ascendc.so --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 4
+```
+
+No rebuild, simulator capture, archive or broad standalone campaign is part
+of this command. The model worker loads the same pinned library and retains
+per-layer native expert/projection call and row counts for each real prefill
+and decode step. Resetting the trace excludes initialization/profile calls
+without evicting packed weights. Missing layers, missing gate/up or down
+calls, fallback, hash mismatches, and wrong token/step coverage fail acceptance.
+The model gate then checks two independent short greedy runs for finite,
+repeat-exact logits and sampler agreement, recording timing and peak memory.
+
+Native Cube accumulation is not required to match the old serial-vector
+model bit-for-bit; `--baseline-report` remains an exact-only cached-policy
+gate and cannot be combined with AscendC. The new model report distinguishes
+AscendC model **execution** from native-instruction/on-chip forensic acceptance,
+independent logits reference, quality and serving acceptance. None of those
+remaining claims is inferred merely from a short generation PASS.
+
+The development-host VQ2A8 suite passes **928 tests**, including host-only
+full routed-chain comparison with a projection stand-in, prepared-row
+batching/padding, same-library preflight, backend selection and per-step
+coverage checks. These are not NPU model results. Changed-file Ruff, Markdown
+and repository-configured spelling checks pass. `bash format.sh ci` remains
+blocked by missing local `pre-commit`. The native C++ sources are unchanged;
+the user's NPU run above is the next required result.

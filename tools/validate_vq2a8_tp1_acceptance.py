@@ -6,7 +6,7 @@
 This supervisor imports no torch/NPU modules. Each expert probe runs in its
 own child process, with full output both live on stdout and saved on disk.
 Only --stage model starts an offline vLLM instance. No stage starts an HTTP
-server or exercises an experimental Cube implementation.
+server. Experimental AscendC experts require an explicit model policy/library.
 """
 
 from __future__ import annotations
@@ -42,6 +42,7 @@ _RESULT_PREFIXES = (
     "MODEL_PLAN ",
     "MODEL_LOAD_RESULT ",
     "MODEL_ROOT_FP8_RESULT ",
+    "MODEL_ASCENDC_LIBRARY ",
     "MODEL_RESULT ",
     "MODEL_REPEAT_FAILURE ",
     "MODEL_BASELINE_RESULT ",
@@ -97,6 +98,14 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                 {},
             )
             latest = runs[-1] if runs else {}
+            if summary.get("execution_policy") == "ascendc":
+                library = latest.get("expert_backend", {}).get("library") or {}
+                executed = result.get("passed") is True and gate.get("ascendc_model_execution_verified") is True
+                lines.append(
+                    "EXPERT_BACKEND=ascendc "
+                    f"ASCENDC_MODEL_EXECUTION_VERIFIED={executed} "
+                    f"LIBRARY_SHA256={library.get('sha256', 'unknown')}"
+                )
             lines.append(
                 f"PROBE={result.get('probe', '?')} {'PASS' if result.get('passed') is True else 'FAIL'} "
                 f"runs={len(runs)} layers={latest.get('layers_executed', '?')} "
@@ -235,7 +244,7 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
         if r["type"]
         in ("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "VQ2A8_TP1_MOE_GATE=PASS", "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS")
     ]
-    modes = sorted({str(g.get("native_fp8_dot", "unknown")) for g in gates})
+    modes = sorted({str(g.get("native_fp8_dot")) if g.get("native_fp8_dot") is not None else "unknown" for g in gates})
     lines.append("NATIVE_FP8_DOT=" + (",".join(modes) if modes else "unknown"))
     if summary.get("stage") == "model":
         lines.extend(["LOGITS_REFERENCE_VERIFIED=False", "QUALITY_VERIFIED=False"])
@@ -329,13 +338,16 @@ def main() -> int:
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument(
         "--execution-policy",
-        choices=["baseline", "cached"],
+        choices=["baseline", "cached", "ascendc"],
         default=None,
         help="MoE/model only; defaults to baseline for MoE, cached for model.",
     )
     parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="Model packed cache: 0 = auto.")
     parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
     parser.add_argument("--root-linear-mode", choices=["bf16", "online_fp8_sm90"], default="bf16")
+    parser.add_argument(
+        "--ascendc-library", type=Path, help="Model only: explicit native library; runs short hardware preflight first."
+    )
     parser.add_argument(
         "--allow-partial-artifact", action="store_true", help="Developer checks only; never serving readiness."
     )
@@ -348,7 +360,14 @@ def main() -> int:
         parser.error("--model is required unless --summarize is used.")
     if args.stage == "expert" and args.execution_policy is not None:
         parser.error("--execution-policy applies to --stage moe/model only.")
-    if args.baseline_report and (args.stage != "model" or args.execution_policy == "baseline"):
+    if args.execution_policy == "ascendc":
+        if args.stage != "model" or args.ascendc_library is None:
+            parser.error("AscendC requires --stage model and --ascendc-library.")
+        if args.artifact is not None:
+            parser.error("AscendC preflight/model must use the same canonical model/experts_vq_ascend_v2 artifact.")
+    elif args.ascendc_library is not None:
+        parser.error("--ascendc-library requires explicit --execution-policy ascendc.")
+    if args.baseline_report and (args.stage != "model" or args.execution_policy in ("baseline", "ascendc")):
         parser.error("--baseline-report requires the cached model stage.")
     if args.root_linear_mode != "bf16" and (args.stage != "model" or args.baseline_report):
         parser.error("Online root FP8 requires --stage model and cannot use the phase-1 exact BF16 baseline.")
@@ -414,6 +433,7 @@ def main() -> int:
         "device_kernel_performance_verified": False,
         "baseline_report": str(frozen_baseline) if frozen_baseline else None,
         "root_linear_mode": args.root_linear_mode,
+        "execution_policy": args.execution_policy,
     }
     summary_path = output / "summary.json"
     short_path = output / "summary.txt"
@@ -424,6 +444,24 @@ def main() -> int:
 
     save_summary()
     print(f"REPORT_DIR={output}", flush=True)
+    native_preflight = None
+    if args.execution_policy == "ascendc":
+        if str(repo) not in sys.path:
+            sys.path.insert(0, str(repo))
+        from tools.validate_vq2a8_ascendc import run_model_preflight
+
+        try:
+            args.ascendc_library = args.ascendc_library.resolve(strict=True)
+            native_preflight = run_model_preflight(
+                args.ascendc_library, model, args.physical_npu, output / "ascendc-preflight", min(args.timeout, 600)
+            )
+            summary["ascendc_preflight"] = str(native_preflight)
+        except (OSError, ValueError, RuntimeError) as exc:
+            summary.update(status="failed", error=str(exc))
+            save_summary()
+            print(f"ASCENDC_MODEL_PREFLIGHT=FAIL ERROR={exc} REPORT={summary_path}", flush=True)
+            return 1
+        save_summary()
     for index, probe in enumerate(probes):
         log = output / f"probe-{probe.replace(':', '-')}.log"
         command = [
@@ -491,6 +529,10 @@ def main() -> int:
             ]
             if frozen_baseline:
                 command.extend(["--baseline-report", str(frozen_baseline)])
+            if native_preflight:
+                command.extend(
+                    ["--ascendc-library", str(args.ascendc_library), "--ascendc-preflight", str(native_preflight)]
+                )
         if index == 0:
             command.append("--audit-model")
             if args.verify_tensor_hashes:

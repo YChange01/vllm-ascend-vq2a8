@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -64,6 +65,20 @@ def library_evidence(library):
     if manifest.get("source_sha256") != source_hashes():
         raise ValueError("Native sources changed since build; rebuild this standalone library.")
     return {"path": str(library), "sha256": digest, "build": manifest}
+
+
+def require_hardware_runtime():
+    """Keep simulator preload/config out of physical-device regression receipts."""
+    if sys.platform != "linux":
+        raise RuntimeError("Physical AscendC regression requires the Linux NPU host.")
+    mapped = [
+        line.split()[-1]
+        for line in Path("/proc/self/maps").read_text().splitlines()
+        if "/" in line and ("camodel" in line.lower() or "/simulator/" in line.lower())
+    ]
+    if mapped or os.environ.get("CAMODEL_CONFIG_PATH") or "camodel" in os.environ.get("LD_PRELOAD", "").lower():
+        raise RuntimeError("Simulator runtime/config detected; use a normal hardware CANN shell.")
+    return {"checked": True, "simulator_runtime_paths": []}
 
 
 def check_projection(inputs, dense, *, baseline=True):
@@ -209,6 +224,7 @@ def run_child(args):
 
     save()
     try:
+        require_hardware_runtime()
         report["library"] = library_evidence(args.library)
         print("ASCENDC_LIBRARY " + json.dumps(report["library"]), flush=True)
         import torch
@@ -222,6 +238,7 @@ def run_child(args):
         device = torch.device("npu:0")
         report["environment"] = environment_report()
         report["device"] = _initialize_device(device)
+        report["hardware_runtime"] = require_hardware_runtime()
         if not report["device"].get("name", "").startswith("Ascend950"):
             raise RuntimeError("Only Ascend950 is supported.")
         load_library(args.library)
@@ -355,6 +372,59 @@ def evidence_passed(path, stage, digest, probe="0:0"):
         )
     except (OSError, ValueError, TypeError, KeyError):
         return False
+
+
+def checked_model_preflight(library_path, receipt_path):
+    """Bind both small hardware gates to the library the model worker will load."""
+    library = library_evidence(library_path)
+    receipt = json.loads(receipt_path.read_text())
+    if receipt.get("status") != "passed" or receipt.get("library_sha256") != library["sha256"]:
+        raise ValueError("AscendC model requires a passing same-library short hardware preflight.")
+    for stage in ("fused", "timing"):
+        path = receipt_path.parent / f"{stage}.json"
+        if not evidence_passed(path, stage, library["sha256"], "0:0"):
+            raise ValueError(f"AscendC model preflight is missing/incomplete: {stage}.")
+        child = json.loads(path.read_text())
+        if child.get("hardware_runtime") != {"checked": True, "simulator_runtime_paths": []}:
+            raise ValueError("Preflight must use physical NPU execution, not the simulator.")
+        if receipt.get("evidence_sha256", {}).get(stage) != hashlib.sha256(path.read_bytes()).hexdigest():
+            raise ValueError("Preflight child evidence changed after collection.")
+    return library
+
+
+def run_model_preflight(library_path, model, physical_npu, directory, timeout=600):
+    """28 synthetic + six real expert timing/numerical cases; no simulation."""
+    from tools.validate_vq2a8_ascendc_suite import run_step
+
+    require_hardware_runtime()
+    library = library_evidence(library_path)
+    directory.mkdir(parents=True, exist_ok=False)
+    receipt_path = directory / "preflight.json"
+    receipt = {"status": "running", "library_sha256": library["sha256"], "evidence_sha256": {}, "results": []}
+    args = SimpleNamespace(
+        library=library_path, model=model, physical_npu=physical_npu, timeout=timeout, warmups=3, repeats=10
+    )
+    print(f"ASCENDC_MODEL_PREFLIGHT cases=34 simulator_reruns=0 REPORT={receipt_path}", flush=True)
+    try:
+        for stage in ("fused", "timing"):
+            receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+            step = {"id": stage, "stage": stage, "probe": "0:0"}
+            result = run_step(args, step, directory, library["sha256"])
+            receipt["results"].append(result)
+            if not result["passed"]:
+                raise RuntimeError(f"AscendC short {stage} regression failed; model loading was not started.")
+            path = directory / f"{stage}.json"
+            receipt["evidence_sha256"][stage] = hashlib.sha256(path.read_bytes()).hexdigest()
+        receipt["status"] = "passed"
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+        checked_model_preflight(library_path, receipt_path)
+    except Exception as exc:
+        receipt.update(status="failed", error=str(exc))
+        raise
+    finally:
+        receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
+    print(f"ASCENDC_MODEL_PREFLIGHT=PASS REPORT={receipt_path}", flush=True)
+    return receipt_path
 
 
 def run_parent(args):
