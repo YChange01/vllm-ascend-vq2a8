@@ -2060,3 +2060,86 @@ profiler-harness tests. Ruff, Markdown and spelling checks pass for changed
 files. `bash format.sh ci` was attempted but cannot start without the local
 `pre-commit` dependency. The actual CANN simulator capture remains unverified
 until the user runs the command above; no new hardware result is claimed.
+
+### Partial simulator evidence and TPipe event ownership fix
+
+The user supplied `/tmp/vq2a8-ascendc-sim-h98hzsc6` for the same
+`c8e7dfee...46677` library. The application and simulator both confirm the
+private config with `flush_level=2` and the mapped `dav_3510` simulator
+runtime. This resolves the earlier config-path uncertainty without changing
+the global toolkit. The selected kernel is `vq2a8_ascendc_fused_2_mix_aic`.
+
+The partial trace contains concrete native-instruction and transfer evidence:
+
+- AIC `MMAD`, pipe `CUBE`, detail `dtype:E4M3E4M3`, address `0x10d0f480`,
+  `call_count=1`: native E4M3-by-E4M3 matrix execution is observed in simulation.
+  This is not the scalar integer `MADD` also present in the trace.
+- Both AIVs execute `MOV_UB_TO_L1`, reading UB offset `0x1800` into L1
+  offsets `0x1000` and `0x1200`. These match the source's decoded B buffer
+  and the two halves of its B L1 tile. AIC `LOAD_2Dv2` reads that L1 tile
+  into L0B as bytes before the FP8 MMAD.
+- These observations support the first decoded K-tile handoff, not completion
+  of all four K tiles, all-shape on-chip-only operation, or a new hardware
+  performance result. Scalar byte loads/stores dominate the captured AIV
+  samples; optimization still needs completed traces and hardware measurement.
+
+The application never records completion. The simulator reports four
+`execute_set_flag already has same set_flag` errors at `0x10d0f488`, then
+hits its five-minute timeout. That PC exactly matches the post-MMAD
+`SET_FLAG`, `PIPE:CUBE,TRIGGERPIPE:MTE1,FLAGID:0` in the AIC CSV.
+The reported 92.96/108.49 microsecond core durations are from an incomplete
+simulation, not a completed projection and not the previously measured
+hardware wall times. The profiler's subsequent `All task success` describes
+saved-data parsing and does not make this kernel execution successful.
+
+The source's immediate `Fence<E>()` had hard-coded event ID 0. The official
+[A5 TPipe implementation](https://gitcode.com/cann/asc-devkit/blob/0290f560c82a867528b8ecbdb1a20366a6760a64/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h)
+allocates and pre-sets `M_MTE1` IDs 0, 1 and 2 during initialization, and
+waits/releases them at teardown. This identifies a framework-event ownership
+collision in our helper, consistent with the exact failing PC. Official
+[SetFlag guidance](https://www.hiascend.com/document/detail/en/canncommercial/850/API/ascendcopapi/atlasascendc_api_07_0270.html)
+warns against manually specified IDs and recommends obtaining them from
+`TPipe` to avoid framework synchronization conflicts and hangs.
+
+The helper now uses `GetTPipePtr()->FetchEventID(E)` for each immediately
+paired SetFlag/WaitFlag. Fetch queries a free event without reserving it;
+the immediate pair finishes before reuse. It does not consume TPipe's
+initialization/teardown tokens. Cross-core Ready/Read/Result/Stored flag
+numbers belong to a different mechanism and remain unchanged. This patch
+does not disable synchronization or simulator checks, change FP8 types,
+introduce an FP16 fallback, or alter model dispatch.
+
+The profiler now records bounded runtime errors and inner application
+timeouts even if the profiler exits zero after parsing. Scalar `MADD` is
+no longer selected as matrix-instruction evidence. A host C++ regression
+executes the actual Fence body extracted from the kernel against a model
+of occupied/pre-set events, detects the old duplicate-set behavior, and
+checks that repeated K-tile fences preserve framework teardown tokens.
+This host model is not a CANN compilation or NPU execution test.
+
+Rebuild into a separate directory to preserve the old tested library, then
+capture only one small fused call from the changed candidate:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+git pull --ff-only
+/usr/local/python3.11.10/bin/python3 -u tools/build_vq2a8_ascendc.py --build-dir build/vq2a8-ascendc-syncfix
+/usr/local/python3.11.10/bin/python3 -u tools/profile_vq2a8_ascendc.py --diagnostic-build --library build/vq2a8-ascendc-syncfix/libvq2a8_ascendc.so
+```
+
+Run the capture only after the new build reports PASS. `--diagnostic-build`
+is explicitly separate from `--suite-report`: the changed library cannot
+inherit numerical or timing acceptance from the old hash. The build manifest,
+native source hashes and parent/child library hashes are still checked.
+The report marks the missing matching standalone suite; all acceptance flags
+remain false. Do not rerun the broad numerical campaign just to diagnose this
+event conflict. After complete, error-free simulation, validate numerics and
+hardware timings for the new library before proceeding to model integration.
+The old standalone receipts remain historical evidence for the old binary.
+
+The development-host VQ2A8 suite passes **867 tests** (six added regression
+cases). This includes the extracted C++ Fence event-ownership test, not device
+execution. Changed-file Ruff, Markdown and spelling checks pass; the required
+`bash format.sh ci` was attempted but still cannot start without local
+`pre-commit`. The corrected kernel still needs a CANN build and the bounded
+simulator rerun on the user's machine; no new hardware PASS is claimed.

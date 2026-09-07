@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Collect one small fused AscendC simulator trace from the tested library.
+"""Collect one small fused AscendC simulator trace from a pinned library.
 
 No rebuild, model loading, numerical campaign or global CANN config changes.
+Use a matching standalone suite, or explicitly select a diagnostic build that
+has not yet passed that suite. Both modes require the native build manifest.
 Simulation instruction/dataflow evidence requires review; it is not a hardware
 benchmark. Vendor environment variables here are child-only profiler controls,
 not new vLLM runtime settings.
@@ -187,7 +189,7 @@ def collect_instruction_csv(root):
                     "sync"
                     if re.search(r"flag|event|barrier|wait|sync", instr, re.I)
                     else "matrix"
-                    if re.search(r"mad|cube|matrix", instr + " " + pipe, re.I)
+                    if pipe.upper() == "CUBE" or re.fullmatch(r"MMAD\w*", instr, re.I)
                     else "transfer"
                     if re.search(r"mte|copy|load|store|fixpipe", instr + " " + pipe, re.I)
                     else "other"
@@ -210,6 +212,20 @@ def collect_instruction_csv(root):
             samples=samples,
         )
     return evidence
+
+
+def inspect_profiler_log(path):
+    """Profiler exit 0 may mean partial traces parsed after an application abort."""
+    result = {"application_timeout_reported": False, "runtime_error_count": 0, "errors": []}
+    with path.open(errors="replace") as stream:
+        for number, line in enumerate(stream, 1):
+            if "The timeout has reached" in line or "application will be forcibly killed" in line:
+                result["application_timeout_reported"] = True
+            if "[ERROR]" in line:
+                result["runtime_error_count"] += 1
+                if len(result["errors"]) < 12:
+                    result["errors"].append({"line": number, "text": line.strip()[:800]})
+    return result
 
 
 def profiler_command(msprof, args, directory, library_sha):
@@ -255,7 +271,8 @@ def run(args):
         raise RuntimeError("Run on the Linux CANN installation, not the development host.")
     args.library = args.library.resolve(strict=True)
     library = library_evidence(args.library)
-    suite = checked_suite(args.suite_report / "summary.json", library)
+    # A rebuilt diagnostic candidate cannot inherit the old library's suite.
+    suite = None if args.diagnostic_build else checked_suite(args.suite_report / "summary.json", library)
     msprof = shutil.which("msprof")
     if not msprof:
         raise RuntimeError("msprof is not on PATH; source the existing CANN environment first.")
@@ -268,6 +285,8 @@ def run(args):
         "scope": "single_synthetic_fused_simulation",
         "library": library,
         "suite": suite,
+        "diagnostic_build": args.diagnostic_build,
+        "matching_standalone_suite_supplied": suite is not None,
         "harness_sha256": digest(Path(__file__)),
         "native_instruction_verified": False,
         "on_chip_decode_verified": False,
@@ -290,6 +309,7 @@ def run(args):
         environment = {**os.environ, "CAMODEL_CONFIG_PATH": str(directory / "config")}
         write_json(manifest, report)
         report["profiler"] = run_profiler(command, directory, environment, args.timeout_minutes * 60 + 120)
+        report["profiler_log_review"] = inspect_profiler_log(directory / "profiler.log")
         application = directory / "application.json"
         report["application"] = json.loads(application.read_text()) if application.is_file() else {}
         report["instruction_csv"] = collect_instruction_csv(directory / "profile")
@@ -308,6 +328,8 @@ def run(args):
         )
         complete = (
             report["profiler"] == {"exit": 0, "timeout": False}
+            and not report["profiler_log_review"]["application_timeout_reported"]
+            and not report["profiler_log_review"]["runtime_error_count"]
             and app.get("status") == "completed"
             and app.get("projection_calls") == 1
             and app.get("library_sha256") == library["sha256"]
@@ -329,6 +351,7 @@ def run(args):
     for entry in report.get("instruction_csv", []):
         print("ASCENDC_SIM_CSV " + json.dumps(entry), flush=True)
     print("ASCENDC_SIM_FILES " + json.dumps(report.get("profile_files", [])), flush=True)
+    print("ASCENDC_SIM_LOG_REVIEW " + json.dumps(report.get("profiler_log_review", {})), flush=True)
     print(
         f"ASCENDC_SIM={report['status']} GLOBAL_CONFIG_UNCHANGED={report['global_config_unchanged']} REPORT={directory}"
     )
@@ -340,7 +363,13 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--suite-report", type=Path, help="Existing successful standalone suite directory.")
+    evidence = parser.add_mutually_exclusive_group()
+    evidence.add_argument("--suite-report", type=Path, help="Existing successful standalone suite directory.")
+    evidence.add_argument(
+        "--diagnostic-build",
+        action="store_true",
+        help="Trace a freshly built candidate without claiming prior numerical acceptance.",
+    )
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc/libvq2a8_ascendc.so")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann-9.1.0"))
     parser.add_argument("--soc", default="Ascend950PR_957d")
@@ -352,8 +381,8 @@ def main():
         parser.error("Require Ascend950 SOC and 1..5 simulator timeout minutes.")
     if args.application_report:
         return run_application(args)
-    if not args.suite_report:
-        parser.error("--suite-report is required; existing evidence is not rerun.")
+    if not args.suite_report and not args.diagnostic_build:
+        parser.error("Require --suite-report or explicit --diagnostic-build; no implicit acceptance bypass.")
     return run(args)
 
 

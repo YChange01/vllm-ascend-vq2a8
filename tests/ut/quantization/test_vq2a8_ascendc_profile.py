@@ -175,6 +175,36 @@ def test_csv_samples_keep_sync_and_later_transfer_kinds(tmp_path):
     assert samples[1]["detail"] == "UB to L1"
 
 
+def test_scalar_madd_is_not_cube_matrix_evidence(tmp_path):
+    path = tmp_path / "core0.cubecore0_instr_exe.csv"
+    make_csv(
+        path,
+        [
+            {"instr": "MADD", "pipe": "SCALAR", "detail": "dtype:S64"},
+            {"instr": "MMAD", "pipe": "CUBE", "detail": "dtype:E4M3E4M3"},
+            {"instr": "SET_FLAG", "pipe": "CUBE", "detail": "PIPE:CUBE,TRIGGERPIPE:MTE1,FLAGID:0"},
+        ],
+    )
+    samples = profile.collect_instruction_csv(tmp_path)[0]["samples"]
+    assert [row["kind"] for row in samples] == ["other", "matrix", "sync"]
+    assert samples[1]["detail"] == "dtype:E4M3E4M3"
+
+
+def test_profiler_log_keeps_bounded_errors_despite_successful_parsing(tmp_path):
+    path = tmp_path / "profiler.log"
+    path.write_text(
+        "[ERROR] pem_ccu.cc:2270 execute_set_flag already has same set_flag! pc:0x10d0f488.\n" * 20
+        + "[INFO] The timeout has reached and the application will be forcibly killed.\n"
+        + "[INFO] Profiling running finished. All task success.\n"
+    )
+    result = profile.inspect_profiler_log(path)
+    assert result["application_timeout_reported"] is True
+    assert result["runtime_error_count"] == 20
+    assert len(result["errors"]) == 12
+    assert result["errors"][0]["line"] == 1
+    assert "0x10d0f488" in result["errors"][0]["text"]
+
+
 @pytest.mark.parametrize("mode", ["empty", "unknown_schema", "large"])
 def test_csv_missing_or_unreadable_instruction_contract(tmp_path, mode, monkeypatch):
     path = tmp_path / "core0_instr_exe.csv"
@@ -189,7 +219,19 @@ def test_csv_missing_or_unreadable_instruction_contract(tmp_path, mode, monkeypa
     )
 
 
-@pytest.mark.parametrize("mode", ["success", "profiler_failure", "missing_app", "wrong_library", "missing_vector"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "success",
+        "diagnostic",
+        "profiler_failure",
+        "missing_app",
+        "wrong_library",
+        "missing_vector",
+        "inner_timeout",
+        "runtime_error",
+    ],
+)
 def test_profiler_supervision_preserves_gate_flags(tmp_path, monkeypatch, mode):
     cann = tmp_path / "cann"
     config = cann / "tools/simulator/Ascend950PR_957d/lib/config.json"
@@ -219,6 +261,13 @@ def test_profiler_supervision_preserves_gate_flags(tmp_path, monkeypatch, mode):
         assert json.loads((Path(env["CAMODEL_CONFIG_PATH"]) / "config.json").read_text())["flush_level"] == 2
         assert config.read_text() == '{"flush_level": 3}'
         assert timeout_seconds == 420
+        (output / "profiler.log").write_text(
+            "[INFO] The timeout has reached and the application will be forcibly killed.\n"
+            if mode == "inner_timeout"
+            else "[ERROR] pem_ccu.cc:2270 execute_set_flag already has same set_flag! pc:0x10d0f488.\n"
+            if mode == "runtime_error"
+            else "[INFO] Profiling running finished. All task success.\n"
+        )
         if mode != "missing_app":
             profile.write_json(
                 output / "application.json",
@@ -240,10 +289,20 @@ def test_profiler_supervision_preserves_gate_flags(tmp_path, monkeypatch, mode):
 
     monkeypatch.setattr(profile, "run_profiler", collect)
     code = profile.run(
-        SimpleNamespace(library=library, suite_report=suite, cann=cann, soc="Ascend950PR_957d", timeout_minutes=5)
+        SimpleNamespace(
+            library=library,
+            suite_report=None if mode == "diagnostic" else suite,
+            diagnostic_build=mode == "diagnostic",
+            cann=cann,
+            soc="Ascend950PR_957d",
+            timeout_minutes=5,
+        )
     )
     report = json.loads((directory / "summary.json").read_text())
-    assert (code == 0) is (mode == "success")
+    assert (code == 0) is (mode in ("success", "diagnostic"))
+    assert report["diagnostic_build"] is (mode == "diagnostic")
+    assert report["matching_standalone_suite_supplied"] is (mode != "diagnostic")
+    assert (report["suite"] is None) is (mode == "diagnostic")
     assert report["global_config_unchanged"] is True
     for key in (
         "native_instruction_verified",

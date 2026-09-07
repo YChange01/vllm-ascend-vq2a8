@@ -23,8 +23,11 @@ constexpr FixpipeConfig kToUb = {CO2Layout::ROW_MAJOR, true};
 
 template <HardEvent E>
 __aicore__ inline void Fence() {
-  SetFlag<E>(0);
-  WaitFlag<E>(0);
+  // TPipe owns/pre-sets some events (A5 M_MTE1 IDs 0,1,2). Do not
+  // overwrite those tokens or consume the flags reserved for its teardown.
+  event_t event = static_cast<event_t>(GetTPipePtr()->FetchEventID(E));
+  SetFlag<E>(event);
+  WaitFlag<E>(event);
 }
 
 class ProjectionKernel {

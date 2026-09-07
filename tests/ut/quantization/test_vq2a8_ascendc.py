@@ -6,6 +6,7 @@ import copy
 import hashlib
 import importlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -44,6 +45,35 @@ def test_native_host_layout(tmp_path):
     result = subprocess.run([str(executable)], check=True, capture_output=True, text=True)
     assert "ASCENDC_HOST_LAYOUT=PASS" in result.stdout
     assert "DEVICE_EXECUTION_VERIFIED=False" in result.stdout
+
+
+def test_native_fence_preserves_framework_event_ownership(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Run the host event-model regression on the Linux development host.")
+    source = (REPO / "csrc/vq2a8_ascendc/kernel.cpp").read_text()
+    fence = re.search(r"template <HardEvent E>\s+__aicore__ inline void Fence\(\) \{.*?\n\}", source, re.S)
+    assert fence is not None
+    (tmp_path / "fence_under_test.h").write_text(fence.group())
+    executable = tmp_path / "sync"
+    subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(tmp_path),
+            str(Path(__file__).with_name("vq2a8_ascendc_sync_test.cpp")),
+            "-o",
+            str(executable),
+        ],
+        check=True,
+    )
+    result = subprocess.run([str(executable)], capture_output=True, text=True, check=True)
+    assert "ASCENDC_HOST_SYNC=PASS DEVICE_EXECUTION_VERIFIED=False" in result.stdout
 
 
 def good_evidence(stage):
