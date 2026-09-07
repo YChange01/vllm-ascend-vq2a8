@@ -14,8 +14,10 @@ FP8-root offline-model PASS at `57e48c73`, with 43 layers and two identical
 runs (`/tmp/vq2a8-phase3-ej7e_5co`). Native FP8 root matmul is verified;
 native FP8 expert dot, independent full-model reference and quality are not.
 At the user's request, the phase-4 Vector optimization branch is paused;
-development now targets the standalone VQ-decode + native FP8 Cube fused
-prototype described at the end of this document. It does not change the
+development now targets a **native AscendC/C++ VQ-decode + FP8 Cube fused
+projection**, described at the end of this document. The earlier Triton
+fusion prototype is paused after repeated A5 compiler assertions; it is
+not the implementation of the new AscendC operator. This does not change the
 accepted model backend. Phase 2 stays skipped and phase 5 stays deferred.
 The following sections preserve the earlier milestones as history.
 
@@ -1675,3 +1677,149 @@ model integration, performance, quality and serving remain unverified.
 The earlier real-expert chain FAIL is not superseded by this compiler
 replay. No C++ rebuild, editable reinstall, cache deletion or weight
 repacking is required for this Python launch-option change.
+
+## Native AscendC fused projection: implementation, not yet NPU accepted
+
+The user explicitly requested a direct AscendC implementation after the
+Triton prototype continued to fail in the A5 GraphSyncSolver. The six-way
+compiler replay (`/tmp/vq2a8-compile-ab-aml5knku`) failed in every case.
+The earlier one-off manual compile is not sufficient evidence of a usable
+Triton fix. Pause that investigation and the old phase-4 Vector sweep.
+
+The new implementation is in `csrc/vq2a8_ascendc/kernel.cpp`, with native
+C++ Torch registration in `csrc/vq2a8_ascendc/torch_binding.cpp`. The Python
+module `vq2a8_ascendc.py` only explicitly loads the built library and calls
+its registered operations. It does not invoke Triton, compile on demand,
+dequantize a dense expert to HBM or select a fallback. The independent
+CMake target avoids enabling unrelated kernels excluded by the root A5
+build. Existing package installation and model dispatch are unchanged.
+
+### Numerical and memory design
+
+This is a **single expert projection primitive**, not a whole fused MoE
+block. Gate/up and down can each use it; routing, RHT/A8 preparation and
+SwiGLU remain outside this first device kernel. It consumes the existing
+frozen packed artifact without a new weight format:
+
+- Activation: contiguous E4M3FN `[M,K]`, with FP32 row scale and bias `[M]`.
+- Packed indices: int32 `[N/2,K/8]`, eight unsigned 4-bit codes per word.
+- Codebooks: E4M3FN `[tiles,N/32,16,2]`; tile IDs: uint8 `[K]`.
+- Output: BF16 `[M,N]`, computed as `FP32(A @ decoded_W.T) * scale + bias`.
+- Scope: `1 <= M <= 32`, `N % 32 == 0`, `K % 512 == 0`, positive
+  `N,K <= 65536`, and `1 <= tiles <= 256`. C++ checks metadata even if the
+  Python wrapper is bypassed. Malformed tile IDs cannot index outside the
+  local table: the decoder emits an FP8 NaN byte instead.
+
+Each core group processes 32 output channels, K tiles of 128, and a padded
+32-row activation tile. AIV0/AIV1 each own 16 rows of A and 16 channels of
+B. Activations are padded with zero in UB without reading nonexistent GM
+rows. B shares one nibble between each adjacent output pair, selecting the
+two distinct codebook bytes; no numeric FP8-to-byte conversion is used.
+
+```text
+packed words + codebooks + tile IDs (GM)
+  -> bounded UB decode on AIV0/AIV1
+  -> shared L1 [K/32,32,32] -> FP8 L0B
+activation (GM) -> zero-padded UB -> shared L1 -> FP8 L0A
+  -> native Mmad -> FP32 L0C accumulation across K
+  -> Fixpipe to two UBs -> FP32 row scale, then bias -> BF16 output (GM)
+```
+
+The first decoder and activation layout transform use **scalar UB
+accesses**, not a tuned vector gather. This is deliberate bring-up scope;
+there is no performance claim. Explicit buffer requests are 18,176 UB
+bytes per AIV, 8,192 L1 bytes per core group, and 4,096 bytes each for L0A,
+L0B and L0C. These are source-level allocations, not measured compiler
+resource usage. Only the small tile is decoded; full expert weights remain
+packed in device memory. No workspace argument is present in the launch ABI.
+
+The implementation uses A5 mode-4 cross-core flags, following the existing
+arch35 attention kernels. Both AIVs participate even when M <= 16:
+
+| Flag | Producer -> consumer | Reuse condition |
+| --- | --- | --- |
+| 0 / 16 | AIV MTE3 -> AIC MTE1 | Both A/B halves have reached L1 |
+| 1 / 17 | AIC MTE1 -> AIV MTE3 | Cube has copied L1 data into L0 |
+| 2 / 18 | AIC FIX -> AIV V | FP32 result halves have reached UB |
+| 3 / 19 | AIV MTE3 -> AIC FIX | Epilogue/output transfer has finished |
+
+Single buffering and local pipeline fences avoid reusing UB/L1/L0 while
+their previous consumers still need them. Multibuffering/overlap is not
+enabled. A compile-time guard rejects CANN's 1:1 TSCM GM compatibility
+route. The runtime queries the AIC count instead of assuming 16, 28 or 32
+cores, and checks an Ascend950 device with a 1C:2V topology.
+
+The FP8 operation is **unscaled `AscendC::Mmad`**, not the Triton
+`dot_scaled` helper or a hidden FP16 GEMM. The official
+[Mmad API](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/910beta3/API/ascendcopapi/atlasascendc_api_07_0249.html)
+documents E4M3FN x E4M3FN -> FP32. Official `CANN/asc-devkit` source at
+`0290f560c82a867528b8ecbdb1a20366a6760a64`,
+`impl/basic_api/dav_3510/kernel_operator_mm_impl.h`, also distinguishes
+plain FP8 `mad` from MX `mad_mx`. The same source audit checks the
+LoadData2DParamsV2 fields, native UB->L1 copy and mode-4 synchronization.
+The installed CANN 9.1 compiler remains the authoritative compatibility
+check; the header audit is not device compilation or binary inspection.
+
+### Build and first hardware run
+
+Run on the user's Ascend950 machine. These are separate commands; stop if
+the build fails. No package-wide editable reinstall, Triton cache removal,
+compiler patch, OPP reinstall or model weight repack is required.
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+/usr/local/python3.11.10/bin/python3 -u tools/build_vq2a8_ascendc.py
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_ascendc.py --physical-npu 4
+```
+
+Build options include `--cann`, `--soc`, `--jobs` and `--build-dir`.
+Defaults are CANN 9.1.0 (or existing `ASCEND_HOME_PATH`),
+`Ascend950PR_957d`, four build jobs and `build/vq2a8-ascendc`.
+Build logs/manifests stay in that directory. Validation verifies the exact
+`.so` hash and native source hashes against its successful build manifest;
+stale libraries are rejected before NPU execution. For a different build
+directory pass `--library /absolute/path/libvq2a8_ascendc.so` to validation.
+
+The supervisor runs isolated children and prints progress/errors:
+
+1. Six direct FP8 controls, beginning with M=32 before testing padding.
+2. Six sign-bit-flip controls exercising Vector-produced FP8 into Cube.
+3. Twenty-eight packed synthetic cases: CPU FP64 same-FP8 oracle,
+   accepted Vector baseline, three bitwise repeats and exact row chunking.
+4. Optional: 48 real expert gate_up/down cases with an independently
+   prepared accepted chain, retaining the existing zero-exact and
+   `rtol=0.03, atol=0.05` chain gates. The normalized error gate also stays.
+
+Only after the synthetic stages pass, opt into the real expert:
+
+```bash
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_ascendc.py --physical-npu 4 --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --probe 0:0
+```
+
+Any failure/timeout/missing or incomplete evidence stops later stages.
+The accepted Triton/Vector kernel is used only as an independent comparison
+in the validation harness, never as an AscendC implementation or fallback.
+Reports and any chain-failure tensors remain on the machine; send printed
+`ASCENDC_BUILD`, `ASCENDC_START`, `ASCENDC_RESULT` and error lines rather
+than an archive. A successful build alone never prints a numerical PASS.
+
+### Validation boundary
+
+Development-host tests: **18 new tests pass**, including a real g++ C++17
+host executable that exhaustively checks the shared packing/NZ indexing,
+two-AIV L1 assembly, partial-M zero padding and core-group coverage.
+The full existing VQ2A8 suite plus the new tests passes **782 tests** on the
+NVIDIA/host development machine. These are not AscendC device-kernel tests.
+
+Changed-file Ruff, clang-format, Markdown and spelling checks pass. The
+required `bash format.sh ci` was attempted but could not start because
+`pre-commit` is not installed in the local development shell.
+
+No CANN installation or NPU is accessible on that development host. The
+native source and build/validation tools are implemented, but **device
+compilation, NPU numerical execution, generated FP8 instruction review,
+on-chip-only transfer review and performance are unverified**. No prior
+Triton/CUDA PASS is promoted to an AscendC PASS. Even after standalone
+numerical success, instruction and on-chip flags stay false until the
+generated native binary/dataflow is reviewed. Model integration, full-model
+reference logits, quality, serving, and phase 5 remain separate acceptance.

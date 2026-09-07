@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+cmake_minimum_required(VERSION 3.16)
+project(vq2a8_ascendc LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(RUN_MODE npu CACHE STRING "AscendC execution mode")
+set(SOC_VERSION Ascend950PR_957d CACHE STRING "Exact Ascend950 target")
+string(TOLOWER "${SOC_VERSION}" SOC_LOWER)
+if(NOT SOC_LOWER MATCHES "^ascend950")
+  message(FATAL_ERROR "This experimental kernel supports Ascend950 only")
+endif()
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "Build the AscendC prototype on Linux with CANN installed")
+endif()
+set(ASCEND_CANN_PACKAGE_PATH "${ASCEND_HOME_PATH}")
+foreach(candidate tools/tikcpp/ascendc_kernel_cmake compiler/tikcpp/ascendc_kernel_cmake ascendc_devkit/tikcpp/samples/cmake)
+  if(EXISTS "${ASCEND_HOME_PATH}/${candidate}/ascendc.cmake")
+    set(ASCENDC_CMAKE_DIR "${ASCEND_HOME_PATH}/${candidate}")
+    break()
+  endif()
+endforeach()
+if(NOT ASCENDC_CMAKE_DIR)
+  message(FATAL_ERROR "AscendC CMake support missing under ASCEND_HOME_PATH")
+endif()
+include("${ASCENDC_CMAKE_DIR}/ascendc.cmake")
+find_package(Torch REQUIRED)
+separate_arguments(TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+# Independent opt-in target: do not enable the unrelated direct kernels which
+# the root build deliberately excludes on A5. CANN performs native compilation.
+ascendc_library(vq2a8_ascendc_kernel STATIC kernel.cpp)
+add_library(vq2a8_ascendc SHARED torch_binding.cpp)
+target_compile_options(vq2a8_ascendc PRIVATE ${TORCH_FLAGS})
+target_include_directories(vq2a8_ascendc PRIVATE ${TORCH_INCLUDE_DIRS}
+  "${TORCH_NPU_PATH}/include" "${ASCEND_HOME_PATH}/include")
+target_link_directories(vq2a8_ascendc PRIVATE "${TORCH_NPU_PATH}/lib" "${ASCEND_HOME_PATH}/lib64")
+target_link_libraries(vq2a8_ascendc PRIVATE vq2a8_ascendc_kernel ${TORCH_LIBRARIES}
+  torch_npu ascendcl tiling_api platform)
+set_target_properties(vq2a8_ascendc PROPERTIES BUILD_RPATH
+  "${TORCH_NPU_PATH}/lib;${ASCEND_HOME_PATH}/lib64")
