@@ -1583,3 +1583,33 @@ remains blocked by missing local `pre-commit`.
 Pull this Python/Triton update and use the same synthetic-only command
 above. Do not rebuild C++, repack weights, clear caches or run the full
 model to diagnose this frontend failure.
+
+### Ascend direct control: separate compile-time assertions
+
+The next user run at `e6c95df9`, report
+`/tmp/vq2a8-fused-fp8-i1sb2fr3`, fails in the helper's combined dtype
+assertion with `'bool' object has no attribute 'logical_and'`. It has not
+reached `dot_scaled`; the scale layout and Cube execution are still
+unverified on the user's NPU. Printing the scale contract is not a PASS.
+
+The [3.2.2 AST frontend](https://github.com/triton-lang/triton-ascend/blob/2deb5df0254e23ec750443f175340b38a196097e/python/triton/compiler/code_generator.py)
+lowers `and` through `logical_and`, while dtype comparisons can produce
+ordinary Python booleans. Each static assertion now contains just one
+comparison. All four conditions are retained: LHS E4M3, RHS E4M3, matching
+K dimensions and K divisible by 64. The scale bytes, shapes, accumulation,
+epilogue, numerical gates and default model backend are unchanged.
+
+The earlier host tests called `.fn` under ordinary Python and therefore
+missed this AST-lowering incompatibility. The new regression inspects the
+actual JIT source for separate guards without Boolean composition. Negative
+cases independently check both operand dtypes, unequal K and unaligned K,
+requiring rejection before `dot_scaled`. These tests do not emulate or
+execute the Ascend compiler.
+
+Validation: **750 VQ2A8 development tests pass** in 18.44 seconds on the
+NVIDIA/host development system; the focused helper/fused set passes 73
+tests. Ruff check/format, Markdown lint and `git diff --check` pass.
+Required `bash format.sh ci` was attempted and remains blocked by missing
+local `pre-commit`. No new NPU PASS or real-expert chain PASS is claimed.
+Pull and rerun the same synthetic-only supervisor; no C++ rebuild,
+reinstallation, repacking or cache clearing is required for this change.

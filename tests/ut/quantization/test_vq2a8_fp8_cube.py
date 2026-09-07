@@ -116,8 +116,47 @@ def test_frontend_regression_rejects_missing_scale(scale_frontend):
         )
 
 
-@pytest.mark.parametrize("dtype,k", [(torch.float16, 128), (torch.bfloat16, 128), (torch.float8_e4m3fn, 96)])
-def test_unit_scaled_dot_rejects_other_operand_formats_and_unaligned_k(scale_frontend, dtype, k):
-    lhs = torch.ones((32, k)).to(dtype)
+def test_static_guards_avoid_legacy_frontend_boolop_lowering():
+    # Calling .fn executes ordinary Python and cannot expose the 3.2.2 AST
+    # frontend's bool.logical_and failure. Check the actual JIT source too;
+    # this is a syntax regression guard, not an Ascend compilation test.
+    tree = ast.parse(inspect.getsource(cube.ascend_fp8_dot_unit_scale.fn))
+    assert not any(isinstance(node, ast.BoolOp) for node in ast.walk(tree))
+    guards = [
+        node.args[0]
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "static_assert"
+    ]
+    assert [ast.unparse(guard) for guard in guards] == [
+        "lhs.dtype == tl.float8e4nv",
+        "rhs.dtype == tl.float8e4nv",
+        "lhs.shape[1] == rhs.shape[0]",
+        "lhs.shape[1] % 64 == 0",
+    ]
+
+
+@pytest.mark.parametrize(
+    "lhs_dtype,rhs_dtype,lhs_k,rhs_k",
+    [
+        (torch.float16, torch.float8_e4m3fn, 128, 128),
+        (torch.bfloat16, torch.float8_e4m3fn, 128, 128),
+        (torch.float8_e4m3fn, torch.float16, 128, 128),
+        (torch.float8_e4m3fn, torch.bfloat16, 128, 128),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, 96, 96),
+        (torch.float8_e4m3fn, torch.float8_e4m3fn, 128, 192),
+    ],
+)
+def test_unit_scaled_dot_rejects_invalid_operands_before_dot(
+    scale_frontend, monkeypatch, lhs_dtype, rhs_dtype, lhs_k, rhs_k
+):
+    language, calls = scale_frontend
+
+    def unexpected_dot(*args, **kwargs):
+        pytest.fail("invalid operands reached dot_scaled instead of failing a static guard")
+
+    monkeypatch.setattr(language, "dot_scaled", unexpected_dot)
+    lhs = torch.ones((32, lhs_k)).to(lhs_dtype)
+    rhs = torch.ones((rhs_k, 32)).to(rhs_dtype)
     with pytest.raises(AssertionError):
-        cube.ascend_fp8_dot_unit_scale.fn(lhs, lhs.T, torch.zeros((32, 32)))
+        cube.ascend_fp8_dot_unit_scale.fn(lhs, rhs, torch.zeros((32, 32)))
+    assert not calls

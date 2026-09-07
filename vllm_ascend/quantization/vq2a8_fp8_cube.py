@@ -16,8 +16,12 @@ def ascend_fp8_dot_unit_scale(lhs, rhs, accumulator):
     """E4M3 dot with mandatory unit scales; no A8 requantization or GM input."""
     scale_k: tl.constexpr = 16
     unit_e8m0: tl.constexpr = 127
-    tl.static_assert(lhs.dtype == tl.float8e4nv and rhs.dtype == tl.float8e4nv)
-    tl.static_assert(lhs.shape[1] == rhs.shape[0] and lhs.shape[1] % 64 == 0)
+    # Ascend 3.2.2 lowers `and` to logical_and even for Python bool dtype
+    # comparisons. Keep each compile-time predicate in its own assertion.
+    tl.static_assert(lhs.dtype == tl.float8e4nv)
+    tl.static_assert(rhs.dtype == tl.float8e4nv)
+    tl.static_assert(lhs.shape[1] == rhs.shape[0])
+    tl.static_assert(lhs.shape[1] % 64 == 0)
     # The RHS is [K,N], but its scale is [N,K/16], not [K/16,N].
     lhs_scale = tl.full((lhs.shape[0], lhs.shape[1] // scale_k), unit_e8m0, tl.uint8)
     rhs_scale = tl.full((rhs.shape[1], rhs.shape[0] // scale_k), unit_e8m0, tl.uint8)
