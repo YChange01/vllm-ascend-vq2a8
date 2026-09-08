@@ -367,13 +367,19 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
 
         if self.device.type != "npu":
             raise ValueError("AscendC projections never fall back to CPU/CUDA.")
-        if len(requests) == 1:
+        state = getattr(self, "_optimization", None)
+        if len(requests) == 1 and state is None:
             return [self._projection(*requests[0])]
         if not hasattr(self, "_row_preparation"):
             self._row_preparation = RowwiseVQ2A8Preparation()
         start = time.perf_counter()
         with torch.device("cpu"):
-            prepared = self._row_preparation.many(requests)
+            if state is None:
+                prepared = self._row_preparation.many(requests)
+            else:
+                with state.scope("preparation"):
+                    prepared = self._row_preparation.many(requests)
+                state.stats["preparation_calls"] += 1
         self._timing_sync()
         rows = sum(hidden.shape[0] for hidden, _, _ in requests)
         self.timing["prepare_s"] += time.perf_counter() - start
@@ -383,7 +389,13 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
             for values, (_, payload, _) in zip(prepared, requests)
         ]
         start = time.perf_counter()
-        output = grouped_projection(inputs)
+        if state is not None and state.options.pipeline:
+            from vllm_ascend.quantization.vq2a8_ascendc import grouped_projection_pipeline
+
+            with state.scope("native_projection"):
+                output = grouped_projection_pipeline(inputs)
+        else:
+            output = grouped_projection(inputs)
         self._timing_sync()
         self.timing["packed_projection_s"] += time.perf_counter() - start
         self.native_calls += len(requests)  # logical projections, not launches
@@ -399,6 +411,9 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         callback computes up to six of those requests together and returns
         them to the original slot writer. No cross-token reduction is moved.
         """
+        state = getattr(self, "_optimization", None)
+        if state is not None:
+            return state.forward(self, hidden, input_ids)
         if self.token_chunk > ASCENDC_MAX_ROWS:
             # Do not silently change shared-expert GEMM geometry for callers
             # outside the bounded offline grouped path.

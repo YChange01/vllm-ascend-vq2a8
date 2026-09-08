@@ -18,10 +18,19 @@ from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE, _sylvest
 class RowwiseVQ2A8Preparation:
     """One bounded constant cache owned by the single-stream offline runtime."""
 
-    def __init__(self, *, compact=False):
+    def __init__(self, *, compact=False, validity=None):
         self._key = None
         self._hadamard = None
         self.compact = compact
+        # A private offline probe may defer the decision until its snapshot.
+        # Still scan every input: no cached or skipped validity decisions.
+        self.validity = validity
+
+    def _validate(self, valid):
+        if self.validity is not None:
+            self.validity(valid)
+        elif not bool(valid):
+            raise ValueError("Invalid activation/weight_scale/weight_bias (non-finite) or rht_sign (not -1/+1).")
 
     def rows(self, hidden, payload, spec):
         if self.compact:
@@ -78,8 +87,7 @@ class RowwiseVQ2A8Preparation:
         # Equality with -1/+1 is exact in int8; no widening buffer is needed.
         signs = rht_sign if self.compact else rht_sign.to(torch.int16)
         valid = valid & ((signs == -1) | (signs == 1)).all()
-        if not bool(valid):
-            raise ValueError("Invalid activation/weight_scale/weight_bias (non-finite) or rht_sign (not -1/+1).")
+        self._validate(valid)
         self._ensure_hadamard(first.device, block)
         signed = x.reshape(-1, width // block, block) * rht_sign.float().reshape(-1, width // block, block)
         # Do not turn these into a batched GEMM: its rounding may differ on NPU.
@@ -98,8 +106,7 @@ class RowwiseVQ2A8Preparation:
         valid = torch.isfinite(x).all() & torch.isfinite(weight_scale).all() & torch.isfinite(weight_bias).all()
         signs = rht_sign.to(torch.int16)
         valid = valid & ((signs == -1) | (signs == 1)).all()
-        if not bool(valid):
-            raise ValueError("Invalid activation/weight_scale/weight_bias (non-finite) or rht_sign (not -1/+1).")
+        self._validate(valid)
 
         self._ensure_hadamard(activation.device, rht_block_size)
         blocks = x.reshape(1, width // rht_block_size, rht_block_size)

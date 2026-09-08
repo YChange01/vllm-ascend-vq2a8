@@ -93,6 +93,9 @@ class OfflineDecoderLayer(DeepseekV2DecoderLayer):
                 raise ValueError(f"Root FP8 coverage mismatch: {selected} != {sorted(required)}.")
 
     def forward(self, *args, **kwargs):
+        if getattr(self._offline_owner, "optimization_profile", False):
+            with torch.profiler.record_function(f"vq2a8::decoder::{self.layer_idx}"):
+                return super().forward(*args, **kwargs)
         if getattr(self._offline_owner, "measurement_mode", False):
             return super().forward(*args, **kwargs)
         print(f"MODEL layer={self.layer_idx} stage=decoder_start", flush=True)
@@ -180,7 +183,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 method.state.calls = 0
         self._offline_trace = True
 
-    def configure_performance_probe(self, *, measurement, compact):
+    def configure_performance_probe(self, *, measurement, compact, optimization=None, profile=False):
         """Explicit, bounded offline benchmark control; not a serving switch.
 
         Only the supervisor's single in-process worker calls this between
@@ -189,16 +192,27 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         """
         from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
         from vllm_ascend.quantization.vq2a8_execution import AscendCVQ2TP1MoE
+        from vllm_ascend.quantization.vq2a8_optimization import (
+            OptimizationOptions,
+            configure_runtime,
+            install_profile_hooks,
+        )
 
         owner = self.model.offline_owner
         if not self._offline_loaded or self._offline_root_mode != "bf16":
             raise ValueError("Performance probe requires strictly loaded BF16 roots.")
         if type(measurement) is not bool or type(compact) is not bool:
             raise ValueError("Performance probe switches must be booleans.")
+        if type(profile) is not bool:
+            raise ValueError("Profile switch must be boolean.")
+        if optimization is not None:
+            OptimizationOptions.preset(optimization)
         if not owner.layers or not all(isinstance(layer, AscendCVQ2TP1MoE) for layer in owner.layers.values()):
             raise ValueError("Performance probe requires the explicit AscendC backend on every layer.")
         torch.npu.synchronize()
         owner.measurement_mode = measurement
+        owner.optimization_profile = profile
+        install_profile_hooks(self, profile)
         self._offline_trace = False
         self._offline_logits = []
         self._offline_steps = []
@@ -208,18 +222,38 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             layer.measurement_mode = measurement
             layer.trace_native = False
             layer.native_steps = []
+            if optimization is not None or hasattr(layer, "_optimization"):
+                configure_runtime(layer, optimization, profile=profile)
             preparation = getattr(layer, "_row_preparation", None)
             if preparation is None:
                 preparation = layer._row_preparation = RowwiseVQ2A8Preparation()
-            preparation.compact = compact
-        return {"measurement": measurement, "compact": compact, "scope": "bounded_tp1_offline"}
+            if optimization is None:
+                preparation.compact = compact
+        return {
+            "measurement": measurement,
+            "compact": compact,
+            "optimization": optimization,
+            "scope": "bounded_tp1_offline",
+        }
 
     def performance_snapshot(self):
         """Called outside timed intervals; synchronize and check finite flags."""
         torch.npu.synchronize()
         owner = self.model.offline_owner
+        valid = self._measurement_valid
+        optimization = {}
+        for index, layer in owner.layers.items():
+            state = getattr(layer, "_optimization", None)
+            if state is not None:
+                if state.valid is not None:
+                    valid = state.valid if valid is None else valid & state.valid
+                optimization[str(index)] = state.report()
+                preparation = layer._row_preparation
+                if hasattr(preparation, "report"):
+                    optimization[str(index)]["graph"] = preparation.report()
         return {
-            "finite": bool(self._measurement_valid) if self._measurement_valid is not None else None,
+            "finite": bool(valid) if valid is not None else None,
+            "optimization": optimization,
             "forwards": getattr(self, "_measurement_forwards", 0),
             "cache": owner.cache_report(),
             "native_calls": sum(layer.native_calls for layer in owner.layers.values()),

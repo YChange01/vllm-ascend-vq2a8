@@ -174,7 +174,9 @@ class SummaryChildLog(LiveChildLog):
         lines = (self._screen_pending + text).split("\n")
         self._screen_pending = lines[-1][-65536:]
         for line in lines[:-1]:
-            if line.startswith(("PERF_", "PERFORMANCE=", "PROBE_WAIT=", "ASCENDC_SIM_REPORT=", "ERROR=", "Traceback")):
+            if line.startswith(
+                ("PERF_", "PERFORMANCE=", "OPTIMIZATION_", "PROBE_WAIT=", "ASCENDC_SIM_REPORT=", "ERROR=", "Traceback")
+            ):
                 super()._emit(line[:2000] + "\n")
                 self._screen_updated = time.monotonic()
         if time.monotonic() - self._screen_updated >= 30:
@@ -430,8 +432,10 @@ def run(args):
         preflight = stage(
             "preflight",
             lambda o: helper("preflight", o),
-            lambda o: (o / "preflight.json").is_file()
-            and json.loads((o / "preflight.json").read_text())["status"] == "passed",
+            lambda o: (
+                (o / "preflight.json").is_file()
+                and json.loads((o / "preflight.json").read_text())["status"] == "passed"
+            ),
             1900,
         )
         if preflight["status"] != "PASS":

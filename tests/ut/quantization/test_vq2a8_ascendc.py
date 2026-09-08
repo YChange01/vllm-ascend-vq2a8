@@ -309,7 +309,8 @@ def test_native_path_has_no_dense_workspace_or_triton():
     assert "LoadData2DParamsV2" in kernel
     assert "KERNEL_TYPE_MIX_AIC_1_2" in kernel
     assert "Fixpipe<float, float, kToUb>" in kernel
-    assert "CrossCoreWaitFlag<4, PIPE_MTE1>(kReady + kPeer)" in kernel
+    assert "CrossCoreWaitFlag<4, PIPE_MTE1>(Ready(start) + kPeer)" in kernel
+    assert "kBuffers = Pipeline ? 2 : 1" in kernel
     assert "CrossCoreWaitFlag<4, PIPE_FIX>(kStored + kPeer)" in kernel
     assert "at::empty({x.size(0), n}" in binding
     assert "TORCH_LIBRARY_IMPL(vq2a8_ascendc, PrivateUse1" in binding

@@ -92,6 +92,7 @@ def route_vq2a8(
     correction_bias: torch.Tensor | None = None,
     hash_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
+    validity=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return unscaled FP32 weights and int64 expert IDs.
 
@@ -107,7 +108,10 @@ def route_vq2a8(
         or type(renormalize) is not bool
     ):
         raise ValueError("Invalid router logits or top-k.")
-    _finite(logits, "router logits")
+    if validity is None:
+        _finite(logits, "router logits")
+    else:
+        validity(torch.isfinite(logits).all())
     scores = F.softplus(logits.float()).sqrt()
     if hash_table is not None:
         if correction_bias is not None:
@@ -130,7 +134,10 @@ def route_vq2a8(
         if correction_bias is not None:
             if correction_bias.shape != (logits.shape[1],) or correction_bias.device != logits.device:
                 raise ValueError("Correction bias shape/device does not match router logits.")
-            _finite(correction_bias, "correction bias")
+            if validity is None:
+                _finite(correction_bias, "correction bias")
+            else:
+                validity(torch.isfinite(correction_bias).all())
             choice += correction_bias.float()
         selected = []
         for _ in range(top_k):
@@ -141,8 +148,11 @@ def route_vq2a8(
     weights = scores.gather(1, ids)
     if renormalize:
         denominator = weights.sum(dim=1, keepdim=True)
-        if bool((denominator <= 0).any()):
-            raise ValueError("Selected router scores sum to zero.")
+        if validity is None:
+            if bool((denominator <= 0).any()):
+                raise ValueError("Selected router scores sum to zero.")
+        else:
+            validity(torch.isfinite(denominator).all() & (denominator > 0).all())
         weights = weights / denominator
     return weights, ids
 

@@ -65,9 +65,12 @@ def preparation_preflight():
     return rows
 
 
-def configure_worker(worker, measurement, compact):
+def configure_worker(worker, measurement, compact, optimization=None, profile=False):
     model = worker.get_model()
-    return {"pid": os.getpid(), **model.configure_performance_probe(measurement=measurement, compact=compact)}
+    options = dict(measurement=measurement, compact=compact)
+    if optimization is not None or profile:
+        options.update(optimization=optimization, profile=profile)
+    return {"pid": os.getpid(), **model.configure_performance_probe(**options)}
 
 
 def snapshot_worker(worker):
@@ -78,8 +81,10 @@ def snapshot(llm):
     return single_worker_result(llm.collective_rpc(snapshot_worker))
 
 
-def configure(llm, *, measurement, compact):
-    result = single_worker_result(llm.collective_rpc(configure_worker, args=(measurement, compact)))
+def configure(llm, *, measurement, compact, optimization=None, profile=False):
+    result = single_worker_result(
+        llm.collective_rpc(configure_worker, args=(measurement, compact, optimization, profile))
+    )
     if result["pid"] != os.getpid():
         raise RuntimeError("Benchmark worker must remain inside the supervised process.")
 
@@ -150,14 +155,16 @@ def timed_request(llm, prompt, output_tokens, request_id):
         "memory": {k: v for k, v in after.items() if "bytes" in k},
         "host_memory": memory_observation(),
         "resident_packed_bytes": after["cache"]["resident_packed_bytes"],
+        "optimization_before": before.get("optimization", {}),
+        "optimization_after": after.get("optimization", {}),
     }
 
 
-def diagnostic(llm, prompt, output_tokens, compact, target):
+def diagnostic(llm, prompt, output_tokens, compact, target, *, optimization=None):
     from safetensors.torch import save_file
     from vllm import SamplingParams
 
-    configure(llm, measurement=False, compact=compact)
+    configure(llm, measurement=False, compact=compact, optimization=optimization)
     single_worker_result(llm.collective_rpc(reset_worker_trace))
     result = llm.generate(
         [{"prompt_token_ids": prompt}],
@@ -165,6 +172,8 @@ def diagnostic(llm, prompt, output_tokens, compact, target):
         use_tqdm=False,
     )
     evidence = single_worker_result(llm.collective_rpc(capture_worker_trace))
+    if optimization is not None and snapshot(llm)["finite"] is not True:
+        raise ValueError("Deferred optimization validity check failed in diagnostic request.")
     if len(result) != 1 or len(result[0].outputs) != 1:
         raise ValueError("Expected exactly one completed offline request.")
     tokens = list(result[0].outputs[0].token_ids)
@@ -231,8 +240,18 @@ def run(args):
     write_json(path, manifest)
     try:
         manifest["device"] = _initialize_device(torch.device("npu:0"))
+        manifest["host_execution"] = {
+            "torch_num_threads": torch.get_num_threads(),
+            "torch_num_interop_threads": torch.get_num_interop_threads(),
+            "cpu_affinity": sorted(os.sched_getaffinity(0)),
+        }
         require_hardware_runtime()
         manifest["preparation_preflight"] = preparation_preflight()
+        if getattr(args, "optimization_presets", None):
+            from tools.vq2a8_optimization_report import candidate_preflight
+
+            manifest["candidate_preflight"] = candidate_preflight(args.optimization_presets, output, args.library)
+            write_json(path, manifest)
         root = args.model.resolve(strict=True)
         config = json.loads((root / "config.json").read_text())
         if config["num_hidden_layers"] != EXPECTED_MODEL_LAYERS:
@@ -268,6 +287,14 @@ def run(args):
         manifest["engine_init_profile_kv_s"] = time.perf_counter() - engine_started
         print(f"PERF_ENGINE_READY startup_s={manifest['startup_s']:.3f}", flush=True)
         write_json(path, manifest)
+        if getattr(args, "optimization_presets", None):
+            from tools.vq2a8_optimization_report import run_cases
+
+            run_cases(llm, args, manifest, prompts, output)
+            manifest["library_unchanged"] = digest(args.library) == library["sha256"]
+            if not manifest["library_unchanged"]:
+                raise ValueError("Library changed during benchmark.")
+            return
         for length, count in args.cases:
             case = f"p{length}-o{count}"
             print(f"PERF_PHASE case={case} stage=first_request_and_exact_regression", flush=True)
@@ -354,8 +381,26 @@ def main():
     parser.add_argument("--cache-budget-gib", type=float, default=0.0)
     parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
     parser.add_argument("--cases", default="10:4,32:32,96:32")
+    parser.add_argument(
+        "--optimization-presets",
+        default="",
+        help="Opt-in comma-separated ordered candidates; baseline/compact benchmark is unchanged by default",
+    )
+    parser.add_argument(
+        "--profile-optimization",
+        action="store_true",
+        help="Collect a separate untimed CPU/NPU profile after each passing candidate",
+    )
     args = parser.parse_args()
     args.cases = validate_cases([tuple(map(int, item.split(":"))) for item in args.cases.split(",")])
+    if args.optimization_presets:
+        from vllm_ascend.quantization.vq2a8_optimization import PRESETS
+
+        args.optimization_presets = args.optimization_presets.split(",")
+        if len(set(args.optimization_presets)) != len(args.optimization_presets) or any(
+            name not in PRESETS for name in args.optimization_presets
+        ):
+            parser.error(f"Optimization presets must be distinct members of {PRESETS}")
     if args.warmups < 2 or args.repeats < 5:
         parser.error("Require >=2 warmups and >=5 repeats.")
     run(args)

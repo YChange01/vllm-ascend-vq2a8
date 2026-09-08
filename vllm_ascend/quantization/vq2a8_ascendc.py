@@ -74,3 +74,13 @@ def grouped_projection(inputs):
     if not 1 <= len(inputs) <= 6 or any(len(value) != 6 for value in inputs):
         raise ValueError("Grouped projection expects 1..6 six-tensor inputs.")
     return torch.ops.vq2a8_ascendc.grouped_projection(*(list(values) for values in zip(*inputs)))
+
+
+def grouped_projection_pipeline(inputs):
+    """Explicit experimental L1 ping-pong entry; never silently use the old ABI."""
+    _require_loaded()
+    if not hasattr(torch.ops.vq2a8_ascendc, "grouped_projection_pipeline"):
+        raise RuntimeError("Rebuild the standalone library for grouped_projection_pipeline; no fallback enabled.")
+    if not 1 <= len(inputs) <= 6 or any(len(value) != 6 for value in inputs):
+        raise ValueError("Grouped projection expects 1..6 six-tensor inputs.")
+    return torch.ops.vq2a8_ascendc.grouped_projection_pipeline(*(list(values) for values in zip(*inputs)))

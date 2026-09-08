@@ -39,7 +39,15 @@ __aicore__ inline void MaskDecodeLanes(LocalTensor<uint32_t> codes, LocalTensor<
   Ands(tile64, tile64, kTileLanePairMask, kPairs / 2);
 }
 
+template <bool Pipeline = false>
 class ProjectionKernel {
+  static constexpr uint32_t kBuffers = Pipeline ? 2 : 1;
+  static constexpr uint32_t kResult = Pipeline ? 4 : 2;
+  static constexpr uint32_t kStored = Pipeline ? 5 : 3;
+  __aicore__ inline uint32_t Slot(uint32_t start) { return (start / kK) % kBuffers; }
+  __aicore__ inline uint32_t Ready(uint32_t start) { return 2 * Slot(start); }
+  __aicore__ inline uint32_t Read(uint32_t start) { return Ready(start) + 1; }
+
  public:
   __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR packed, GM_ADDR book, GM_ADDR ids,
                               GM_ADDR dense, GM_ADDR y, uint32_t m, uint32_t n, uint32_t k, uint32_t tiles) {
@@ -75,8 +83,8 @@ class ProjectionKernel {
     // Identical buffer allocation order on AIC/AIV: Fixpipe addresses the
     // result UB at offset zero on BOTH AIVs. L1 is shared by the core group.
     pipe_.InitBuffer(result_, kHalf * kN * sizeof(float));
-    pipe_.InitBuffer(aL1_, kM * kK);
-    pipe_.InitBuffer(bL1_, kN * kK);
+    pipe_.InitBuffer(aL1_, kBuffers * kM * kK);
+    pipe_.InitBuffer(bL1_, kBuffers * kN * kK);
     pipe_.InitBuffer(aL0_, kM * kK);
     pipe_.InitBuffer(bL0_, kN * kK);
     pipe_.InitBuffer(cL0_, kM * kN * sizeof(float));
@@ -265,16 +273,20 @@ class ProjectionKernel {
       }
       // Decode tile k+1 while Cube consumes tile k. L1 cannot be overwritten
       // until its previous MTE1 read is acknowledged; UB has its own fence.
-      if (start != 0) {
-        CrossCoreWaitFlag<4, PIPE_MTE3>(kRead);
+      if (start >= kBuffers * kK) {
+        CrossCoreWaitFlag<4, PIPE_MTE3>(Read(start));
       }
       Fence<HardEvent::V_MTE3>();
-      CopyHalfToL1(aL1_.Get<uint8_t>(), aUb_.Get<uint8_t>(), half);
-      CopyHalfToL1(bL1_.Get<uint8_t>(), bUb_.Get<uint8_t>(), half);
-      CrossCoreSetFlag<4, PIPE_MTE3>(kReady);
+      CopyHalfToL1(aL1_.Get<uint8_t>()[Slot(start) * kM * kK], aUb_.Get<uint8_t>(), half);
+      CopyHalfToL1(bL1_.Get<uint8_t>()[Slot(start) * kN * kK], bUb_.Get<uint8_t>(), half);
+      CrossCoreSetFlag<4, PIPE_MTE3>(Ready(start));
       Fence<HardEvent::MTE3_V>();  // drain UB reads, not the later L1 read
     }
-    CrossCoreWaitFlag<4, PIPE_MTE3>(kRead);  // balance the final acknowledgement
+    // Drain one final acknowledgement per occupied slot, including odd tile
+    // counts. Leave no event token behind for the next N tile or expert job.
+    for (uint32_t slot = 0; slot < kBuffers && slot * kK < k_; ++slot) {
+      CrossCoreWaitFlag<4, PIPE_MTE3>(2 * slot + 1);
+    }
     CrossCoreWaitFlag<4, PIPE_V>(kResult);
     auto result = result_.Get<float>();
     auto out = outUb_.Get<bfloat16_t>();
@@ -311,12 +323,12 @@ class ProjectionKernel {
     load.dstStride = 2;
     load.ifTranspose = false;
     for (uint32_t start = 0; start < k_; start += kK) {
-      CrossCoreWaitFlag<4, PIPE_MTE1>(kReady);
-      CrossCoreWaitFlag<4, PIPE_MTE1>(kReady + kPeer);
-      LoadData(a, aL1_.Get<fp8_e4m3fn_t>(), load);
-      LoadData(b, bL1_.Get<fp8_e4m3fn_t>(), load);  // B stored as [N,K]
-      CrossCoreSetFlag<4, PIPE_MTE1>(kRead);
-      CrossCoreSetFlag<4, PIPE_MTE1>(kRead + kPeer);
+      CrossCoreWaitFlag<4, PIPE_MTE1>(Ready(start));
+      CrossCoreWaitFlag<4, PIPE_MTE1>(Ready(start) + kPeer);
+      LoadData(a, aL1_.Get<fp8_e4m3fn_t>()[Slot(start) * kM * kK], load);
+      LoadData(b, bL1_.Get<fp8_e4m3fn_t>()[Slot(start) * kN * kK], load);
+      CrossCoreSetFlag<4, PIPE_MTE1>(Read(start));
+      CrossCoreSetFlag<4, PIPE_MTE1>(Read(start) + kPeer);
       Fence<HardEvent::MTE1_M>();
       MmadParams p;
       p.m = kM;
@@ -368,7 +380,7 @@ class ProjectionKernel {
                                              GM_ADDR ids, GM_ADDR dense, GM_ADDR y, uint32_t m, uint32_t n,        \
                                              uint32_t k, uint32_t tiles, uint32_t cores) {                         \
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);                                                             \
-    vq2a8_ascendc::ProjectionKernel op;                                                                            \
+    vq2a8_ascendc::ProjectionKernel<> op;                                                                          \
     op.Init(x, scale, bias, packed, book, ids, dense, y, m, n, k, tiles);                                          \
     op.Process<MODE>(cores);                                                                                       \
   }
@@ -380,12 +392,23 @@ VQ2_KERNEL(vq2a8_ascendc_fused, 2)
 extern "C" __global__ __aicore__ void vq2a8_ascendc_grouped(GM_ADDR descriptors, uint32_t jobs, uint32_t groups,
                                                             uint32_t cores) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-  vq2a8_ascendc::ProjectionKernel op;
+  vq2a8_ascendc::ProjectionKernel<> op;
+  op.InitBuffers();
+  op.ProcessGrouped(descriptors, jobs, groups, cores);
+}
+
+extern "C" __global__ __aicore__ void vq2a8_ascendc_grouped_pipeline(GM_ADDR descriptors, uint32_t jobs,
+                                                                     uint32_t groups, uint32_t cores) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  vq2a8_ascendc::ProjectionKernel<true> op;
   op.InitBuffers();
   op.ProcessGrouped(descriptors, jobs, groups, cores);
 }
 
 namespace vq2a8_ascendc {
+void LaunchGroupedPipeline(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t groups) {
+  vq2a8_ascendc_grouped_pipeline<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs, groups, blocks);
+}
 void LaunchGrouped(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t groups) {
   vq2a8_ascendc_grouped<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs, groups, blocks);
 }

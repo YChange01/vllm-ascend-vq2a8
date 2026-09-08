@@ -80,6 +80,7 @@ at::Tensor Projection(const at::Tensor& x, const at::Tensor& scale, const at::Te
   return Run(x, scale, bias, packed, book, ids, {}, packed.size(0) * 2, book.size(0), 2);
 }
 
+template <bool Pipeline = false>
 std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, const std::vector<at::Tensor>& scale,
                                           const std::vector<at::Tensor>& bias, const std::vector<at::Tensor>& packed,
                                           const std::vector<at::Tensor>& book, const std::vector<at::Tensor>& ids) {
@@ -139,7 +140,11 @@ std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, cons
         (void)book;
         (void)ids;
         (void)output;
-        LaunchGrouped(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
+        if constexpr (Pipeline) {
+          LaunchGroupedPipeline(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
+        } else {
+          LaunchGrouped(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
+        }
         return 0;
       });
   command.Run();
@@ -165,9 +170,13 @@ TORCH_LIBRARY(vq2a8_ascendc, m) {
   m.def(
       "grouped_projection(Tensor[] x, Tensor[] scale, Tensor[] bias, Tensor[] packed, Tensor[] book, Tensor[] ids) -> "
       "Tensor[]");
+  m.def(
+      "grouped_projection_pipeline(Tensor[] x, Tensor[] scale, Tensor[] bias, Tensor[] packed, Tensor[] book, "
+      "Tensor[] ids) -> Tensor[]");
 }
 TORCH_LIBRARY_IMPL(vq2a8_ascendc, PrivateUse1, m) {
   m.impl("projection", &vq2a8_ascendc::Projection);
   m.impl("cube_control", &vq2a8_ascendc::CubeControl);
-  m.impl("grouped_projection", &vq2a8_ascendc::GroupedProjection);
+  m.impl("grouped_projection", &vq2a8_ascendc::GroupedProjection<false>);
+  m.impl("grouped_projection_pipeline", &vq2a8_ascendc::GroupedProjection<true>);
 }
