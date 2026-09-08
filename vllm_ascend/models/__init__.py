@@ -10,6 +10,10 @@ def register_model():
         "KimiK3ForConditionalGeneration",
         "vllm_ascend.models.kimi_k3:AscendKimiK3ForConditionalGeneration",
     )
+    ModelRegistry.register_model(
+        "VQ2A8TP1OfflineForCausalLM",
+        "vllm_ascend.patch.worker.vq2a8_offline_model:VQ2A8TP1OfflineForCausalLM",
+    )
     ModelRegistry.register_model("DeepseekV4ForCausalLM", "vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM")
     ModelRegistry.register_model(
         "MiniMaxM3SparseForCausalLM",

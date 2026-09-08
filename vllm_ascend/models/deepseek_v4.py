@@ -926,7 +926,6 @@ class DeepseekV2DecoderLayer(nn.Module):
             config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
-        parallel_config = vllm_config.parallel_config
 
         self.hidden_size = config.hidden_size
         max_position_embeddings = config.rope_parameters["original_max_position_embeddings"]
@@ -948,13 +947,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
         )
 
-        self.mlp = DeepseekV4MoE(
-            config=config,
-            parallel_config=parallel_config,
-            quant_config=quant_config,
-            prefix=f"{prefix}.mlp",
-            is_draft_layer=is_draft_layer,
-        )
+        self.mlp = self._build_mlp(vllm_config, config, f"{prefix}.mlp", is_draft_layer)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=self.norm_eps)
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
@@ -969,6 +962,15 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+
+    def _build_mlp(self, vllm_config, config, prefix, is_draft_layer):
+        return DeepseekV4MoE(
+            config=config,
+            parallel_config=vllm_config.parallel_config,
+            quant_config=vllm_config.quant_config,
+            prefix=prefix,
+            is_draft_layer=is_draft_layer,
+        )
 
     def hc_pre(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         y = torch.ops._C_ascend.npu_hc_pre_v2(
@@ -988,6 +990,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
@@ -998,7 +1001,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if input_ids is None:
+            hidden_states = self.mlp(hidden_states)
+        else:
+            hidden_states = self.mlp(hidden_states, input_ids=input_ids)
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
@@ -1007,6 +1013,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 @support_torch_compile
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    requires_moe_input_ids = False
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1044,7 +1051,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+            lambda prefix: self._make_decoder_layer(vllm_config, prefix, topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
 
@@ -1088,6 +1095,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
+
+    def _make_decoder_layer(self, vllm_config, prefix, topk_indices_buffer):
+        return DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1135,7 +1145,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
         aux_hidden_states: list[torch.Tensor] = []
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
+            if self.requires_moe_input_ids:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, llama_4_scaling, input_ids=input_ids
+                )
+            else:
+                hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
             if layer.layer_idx + 1 in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states.mean(dim=1))
 
