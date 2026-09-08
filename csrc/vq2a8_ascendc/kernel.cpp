@@ -29,6 +29,16 @@ __aicore__ inline void Fence() {
   WaitFlag<E>(event);
 }
 
+__aicore__ inline void MaskDecodeLanes(LocalTensor<uint32_t> codes, LocalTensor<uint32_t> tile) {
+  // Reinterpret adjacent lanes as uint64_t: same aligned UB storage, no
+  // conversion/copy. Repeat the mask in both halves and halve the count.
+  static_assert(kPairs % 2 == 0, "64-bit mask requires even 32-bit lane count");
+  auto codes64 = codes.ReinterpretCast<uint64_t>();
+  auto tile64 = tile.ReinterpretCast<uint64_t>();
+  Ands(codes64, codes64, kCodeLanePairMask, kPairs / 2);
+  Ands(tile64, tile64, kTileLanePairMask, kPairs / 2);
+}
+
 class ProjectionKernel {
  public:
   __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR packed, GM_ADDR book, GM_ADDR ids,
@@ -199,8 +209,7 @@ class ProjectionKernel {
     ShiftRight(codes, codes, codeShifts_.Get<int32_t>(), int32_t(kPairs));
     ShiftRight(tile, tile, idShifts_.Get<int32_t>(), int32_t(kPairs));
     PipeBarrier<PIPE_V>();
-    Ands(codes, codes, uint32_t(15), kPairs);
-    Ands(tile, tile, uint32_t(255), kPairs);
+    MaskDecodeLanes(codes, tile);
     PipeBarrier<PIPE_V>();
     ShiftLeft(codes, codes, uint32_t(1), kPairs);
     ShiftLeft(tile, tile, uint32_t(5), kPairs);

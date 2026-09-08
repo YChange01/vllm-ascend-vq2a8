@@ -76,6 +76,50 @@ def test_native_fence_preserves_framework_event_ownership(tmp_path):
     assert "ASCENDC_HOST_SYNC=PASS DEVICE_EXECUTION_VERIFIED=False" in result.stdout
 
 
+@pytest.mark.parametrize("original_uint32", [False, True])
+def test_native_mask_uses_supported_ands_dtype_and_preserves_lanes(tmp_path, original_uint32):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Run the host dtype-contract regression on the Linux development host.")
+    source = (REPO / "csrc/vq2a8_ascendc/kernel.cpp").read_text()
+    mask = re.search(r"__aicore__ inline void MaskDecodeLanes\(.*?\n\}", source, re.S)
+    assert mask is not None and "MaskDecodeLanes(codes, tile);" in source
+    implementation = mask.group()
+    if original_uint32:
+        implementation = (
+            "inline void MaskDecodeLanes(LocalTensor<uint32_t> codes, LocalTensor<uint32_t> tile) {\n"
+            "  Ands(codes, codes, uint32_t(15), kPairs);\n"
+            "  Ands(tile, tile, uint32_t(255), kPairs);\n}\n"
+        )
+    (tmp_path / "mask_under_test.h").write_text(implementation)
+    executable = tmp_path / "mask"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            str(REPO),
+            "-I",
+            str(tmp_path),
+            str(Path(__file__).with_name("vq2a8_ascendc_mask_test.cpp")),
+            "-o",
+            str(executable),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if original_uint32:
+        assert result.returncode != 0 and "Ands unsupported dtype" in result.stderr
+    else:
+        assert result.returncode == 0, result.stderr
+        output = subprocess.run([str(executable)], check=True, capture_output=True, text=True)
+        assert "ASCENDC_HOST_MASK=PASS DEVICE_EXECUTION_VERIFIED=False" in output.stdout
+
+
 def good_evidence(stage):
     return {
         "status": "passed",

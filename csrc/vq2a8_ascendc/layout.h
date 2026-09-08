@@ -18,6 +18,10 @@ constexpr uint32_t kMaxTiles = 256;
 constexpr uint32_t kMaxDimension = 65536;
 constexpr uint8_t kInvalidFp8 = 0x7f;  // fail closed on an invalid tile ID
 constexpr uint32_t kPairs = kHalfTileBytes / 2;
+// Ands supports uint64_t, not uint32_t, in the target CANN 9.1 headers.
+// Each mask covers two independent 32-bit lanes without numeric casting.
+constexpr uint64_t kCodeLanePairMask = (uint64_t(15) << 32) | uint64_t(15);
+constexpr uint64_t kTileLanePairMask = (uint64_t(255) << 32) | uint64_t(255);
 constexpr uint32_t kMaxJobs = 6;
 // Seven pointers, four dimensions, one reserved word. Host-only construction.
 constexpr uint32_t kJobWords = 12;

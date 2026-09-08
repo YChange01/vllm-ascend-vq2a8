@@ -2498,3 +2498,28 @@ and shared C++ indexing/event-ownership tests. Changed-file Ruff, Markdown,
 spelling and C++ formatting checks pass. `bash format.sh ci` was attempted
 but its full hook runner is unavailable because `pre-commit` is not installed.
 These are development-host results, not an AscendC compile or NPU benchmark.
+
+### Opt2 CANN 9.1 mask dtype build correction
+
+The 198 build reported that `Ands` rejects `uint32_t`; its installed headers
+allow `uint16_t`, `int16_t`, `int64_t` and `uint64_t`. Both nibble and tile-ID
+masks used the unsupported type. This is a kernel API compatibility bug,
+not a missing package or an incorrect SoC selection.
+
+The correction reinterprets each pair of aligned 32-bit UB lanes as one
+64-bit lane, repeats the mask in both halves (`0x0000000f0000000f` and
+`0x000000ff000000ff`) and halves the element count. It adds no copy, numeric
+conversion or buffer allocation. Grouping, preparation, shifts, Gather,
+pipeline fences and FP8 accumulation order are unchanged.
+
+A host regression compiles the actual mask helper against a model of the
+reported dtype whitelist, checks all nibble/ID values with distinct adjacent
+lanes and trailing guards, and requires the original uint32 calls to fail
+compilation. This is not compilation against the vendor SDK. Rebuild in the
+same opt2 directory using the command above; no cleanup or editable-package
+reinstall is needed. Preserve opt1 as the frozen baseline. Native compile,
+preflight and full-model exact/performance regression remain pending.
+
+All **1060 VQ2A8 host tests pass** (20.40 s), including the positive and
+negative dtype-contract cases. Changed-file Ruff, C++ formatting, Markdown
+and spelling checks pass; the full hook runner still lacks `pre-commit`.
