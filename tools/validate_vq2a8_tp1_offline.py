@@ -67,7 +67,7 @@ def main() -> None:
             parser.error("AscendC requires --ascendc-library and the short --ascendc-preflight receipt.")
     elif args.ascendc_library or args.ascendc_preflight:
         parser.error("Native library/preflight options require execution-policy ascendc.")
-    from tools.validate_vq2a8_v026_environment import require_v026_stack
+    from tools.validate_vq2a8_v026_environment import check_scheduler_apis, require_v026_stack
 
     print("MODEL_V026_ENVIRONMENT " + json.dumps(require_v026_stack()), flush=True)
     if args.baseline_report and args.root_linear_mode != "bf16":
@@ -113,6 +113,7 @@ def main() -> None:
 
     environment = environment_report()
     print("ENVIRONMENT " + json.dumps(environment), flush=True)
+    print("MODEL_V026_SCHEDULER_PREFLIGHT " + json.dumps(check_scheduler_apis()), flush=True)
     previous_runs, previous_logits = None, None
     if args.baseline_report:
         print("MODEL stage=baseline_preflight", flush=True)

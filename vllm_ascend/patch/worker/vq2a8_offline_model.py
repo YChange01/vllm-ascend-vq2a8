@@ -57,10 +57,13 @@ class OfflineMoEAdapter(nn.Module):
     def forward(self, hidden_states, input_ids=None):
         if input_ids is None:
             raise ValueError("Offline MoE must receive actual input_ids, including hash layers.")
-        print(f"MODEL layer={self.layer_index} stage=moe_start tokens={input_ids.numel()}", flush=True)
+        quiet = getattr(self.owner, "measurement_mode", False)
+        if not quiet:
+            print(f"MODEL layer={self.layer_index} stage=moe_start tokens={input_ids.numel()}", flush=True)
         result = self.runtime.forward(hidden_states, input_ids)
         self.owner.calls[self.layer_index] += 1
-        print(f"MODEL layer={self.layer_index} stage=moe_done", flush=True)
+        if not quiet:
+            print(f"MODEL layer={self.layer_index} stage=moe_done", flush=True)
         return result
 
 
@@ -90,6 +93,8 @@ class OfflineDecoderLayer(DeepseekV2DecoderLayer):
                 raise ValueError(f"Root FP8 coverage mismatch: {selected} != {sorted(required)}.")
 
     def forward(self, *args, **kwargs):
+        if getattr(self._offline_owner, "measurement_mode", False):
+            return super().forward(*args, **kwargs)
         print(f"MODEL layer={self.layer_idx} stage=decoder_start", flush=True)
         result = super().forward(*args, **kwargs)
         print(f"MODEL layer={self.layer_idx} stage=decoder_done", flush=True)
@@ -160,6 +165,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         return loaded
 
     def reset_offline_trace(self):
+        if getattr(self.model.offline_owner, "measurement_mode", False):
+            raise ValueError("Leave measurement mode before collecting diagnostic logits.")
         if not self._offline_loaded:
             raise RuntimeError("Offline model weights have not passed strict loading.")
         self._offline_logits = []
@@ -172,6 +179,74 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             if isinstance(method, OfflineRootFP8Method):
                 method.state.calls = 0
         self._offline_trace = True
+
+    def configure_performance_probe(self, *, measurement, compact):
+        """Explicit, bounded offline benchmark control; not a serving switch.
+
+        Only the supervisor's single in-process worker calls this between
+        requests. Same-stream native handlers own their tensors; cache eviction
+        retains its completion fence. No async H2D or workspace reuse is added.
+        """
+        from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
+        from vllm_ascend.quantization.vq2a8_execution import AscendCVQ2TP1MoE
+
+        owner = self.model.offline_owner
+        if not self._offline_loaded or self._offline_root_mode != "bf16":
+            raise ValueError("Performance probe requires strictly loaded BF16 roots.")
+        if type(measurement) is not bool or type(compact) is not bool:
+            raise ValueError("Performance probe switches must be booleans.")
+        if not owner.layers or not all(isinstance(layer, AscendCVQ2TP1MoE) for layer in owner.layers.values()):
+            raise ValueError("Performance probe requires the explicit AscendC backend on every layer.")
+        torch.npu.synchronize()
+        owner.measurement_mode = measurement
+        self._offline_trace = False
+        self._offline_logits = []
+        self._offline_steps = []
+        self._measurement_valid = None
+        self._measurement_forwards = 0
+        for layer in owner.layers.values():
+            layer.measurement_mode = measurement
+            layer.trace_native = False
+            layer.native_steps = []
+            preparation = getattr(layer, "_row_preparation", None)
+            if preparation is None:
+                preparation = layer._row_preparation = RowwiseVQ2A8Preparation()
+            preparation.compact = compact
+        return {"measurement": measurement, "compact": compact, "scope": "bounded_tp1_offline"}
+
+    def performance_snapshot(self):
+        """Called outside timed intervals; synchronize and check finite flags."""
+        torch.npu.synchronize()
+        owner = self.model.offline_owner
+        return {
+            "finite": bool(self._measurement_valid) if self._measurement_valid is not None else None,
+            "forwards": getattr(self, "_measurement_forwards", 0),
+            "cache": owner.cache_report(),
+            "native_calls": sum(layer.native_calls for layer in owner.layers.values()),
+            "native_launches": sum(layer.native_launches for layer in owner.layers.values()),
+            "h2d_bytes": sum(layer.h2d_bytes for layer in owner.layers.values()),
+            "host_observed_timing": {
+                key: sum(layer.timing[key] for layer in owner.layers.values())
+                for key in (
+                    "host_load_validate_s",
+                    "host_read_s",
+                    "host_validate_s",
+                    "h2d_s",
+                    "prepare_s",
+                    "packed_projection_s",
+                )
+            },
+            "timing_scope": "host submission/validation waits included; prepare/projection are not kernel-only",
+            "allocated_bytes": torch.npu.memory_allocated(),
+            "reserved_bytes": torch.npu.memory_reserved(),
+            "peak_allocated_bytes": torch.npu.max_memory_allocated(),
+            "peak_reserved_bytes": torch.npu.max_memory_reserved(),
+            "device_free_total_bytes": list(torch.npu.mem_get_info()),
+        }
+
+    def _retain_finite_flag(self, value):
+        valid = torch.isfinite(value).all()
+        self._measurement_valid = valid if self._measurement_valid is None else self._measurement_valid & valid
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
         if not self._offline_loaded or input_ids is None or inputs_embeds is not None:
@@ -189,6 +264,13 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             print("MODEL_ROOT_FP8_RESULT " + json.dumps(report), flush=True)
         if self._offline_trace and not get_forward_context().attn_metadata:
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
+        if getattr(self.model.offline_owner, "measurement_mode", False):
+            if not get_forward_context().attn_metadata:
+                raise ValueError("Performance probes require real attention metadata.")
+            result = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
+            self._retain_finite_flag(result)
+            self._measurement_forwards += 1
+            return result
         phase = ("prefill" if not self._offline_steps else "decode") if self._offline_trace else "profile"
         print(
             f"MODEL stage=forward_start phase={phase} step={len(self._offline_steps)} tokens={input_ids.numel()}",
@@ -219,6 +301,12 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         return result
 
     def compute_logits(self, hidden_states):
+        if getattr(self.model.offline_owner, "measurement_mode", False):
+            logits = super().compute_logits(hidden_states)
+            if logits is None:
+                raise ValueError("Missing model logits.")
+            self._retain_finite_flag(logits)
+            return logits
         print(f"MODEL stage=logits_start rows={hidden_states.shape[0]}", flush=True)
         started = time.perf_counter()
         logits = super().compute_logits(hidden_states)

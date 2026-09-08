@@ -3905,7 +3905,11 @@ class NPUModelRunner(GPUModelRunner):
                     layer_kv_cache_spec[layer_name] = group_spec.kv_cache_specs[layer_name]
                 else:
                     layer_kv_cache_spec[layer_name] = group_spec
-                if static_forward_context is not None:
+                # vLLM can replace the shared block size with the scheduler's
+                # minimum after planning. Compressed KV must keep the planned
+                # per-layer layout instead of rebuilding it from that value.
+                # Only non-compressed SFA needs the indexer subtype restored.
+                if static_forward_context is not None and not getattr(self, "use_compress", False):
                     attn_layer = static_forward_context.get(layer_name)
                     if isinstance(attn_layer, AttentionLayerBase):
                         spec = attn_layer.get_kv_cache_spec(self.vllm_config)

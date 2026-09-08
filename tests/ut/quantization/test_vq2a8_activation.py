@@ -111,7 +111,8 @@ def requests(count=6, width=512, true_width=512):
 
 @pytest.mark.parametrize("width,true_width", [(512, 512), (512, 480), (2048, 2048), (4096, 4000)])
 @pytest.mark.parametrize("case", ["normal", "zero", "impulse", "small"])
-def test_grouped_preparation_exact_for_distinct_experts_and_mixed_rows(width, true_width, case):
+@pytest.mark.parametrize("compact", [False, True])
+def test_grouped_preparation_exact_for_distinct_experts_and_mixed_rows(width, true_width, case, compact):
     batch = requests(width=width, true_width=true_width)
     for hidden, _, _ in batch:
         if case in ("zero", "impulse"):
@@ -120,8 +121,8 @@ def test_grouped_preparation_exact_for_distinct_experts_and_mixed_rows(width, tr
             hidden[:, -1] = -2
         if case == "small":
             hidden *= 1e-7
-    prepare = RowwiseVQ2A8Preparation()
-    expected = [prepare.rows(*request) for request in batch]
+    prepare = RowwiseVQ2A8Preparation(compact=compact)
+    expected = [RowwiseVQ2A8Preparation().rows(*request) for request in batch]
     for order in (batch, batch, list(reversed(batch))):
         got = prepare.many(order)
         want = list(reversed(expected)) if order is not batch else expected
@@ -131,9 +132,10 @@ def test_grouped_preparation_exact_for_distinct_experts_and_mixed_rows(width, tr
 
 
 @pytest.mark.parametrize("field", ["hidden", "weight_scale", "weight_bias", "rht_sign"])
-def test_grouped_input_value_validation_not_cached(field):
+@pytest.mark.parametrize("compact", [False, True])
+def test_grouped_input_value_validation_not_cached(field, compact):
     batch = requests()
-    prepare = RowwiseVQ2A8Preparation()
+    prepare = RowwiseVQ2A8Preparation(compact=compact)
     prepare.many(batch)
     tensor = batch[-1][0] if field == "hidden" else batch[-1][1][field]
     tensor.view(-1)[-1] = 0 if field == "rht_sign" else float("nan")
@@ -141,7 +143,8 @@ def test_grouped_input_value_validation_not_cached(field):
         prepare.many(batch)
 
 
-def test_grouped_validation_one_decision_and_reference_matmul_shapes(monkeypatch):
+@pytest.mark.parametrize("compact", [False, True])
+def test_grouped_validation_one_decision_and_reference_matmul_shapes(monkeypatch, compact):
     batch = requests(count=2)
     decisions, shapes = [], []
     old_bool, old_matmul = torch.Tensor.__bool__, torch.Tensor.__matmul__
@@ -156,7 +159,7 @@ def test_grouped_validation_one_decision_and_reference_matmul_shapes(monkeypatch
 
     monkeypatch.setattr(torch.Tensor, "__bool__", boolean)
     monkeypatch.setattr(torch.Tensor, "__matmul__", matmul)
-    RowwiseVQ2A8Preparation().many(batch)
+    RowwiseVQ2A8Preparation(compact=compact).many(batch)
     assert decisions == [1]
     assert shapes == [((1, 4, 128), (128, 128))] * 3 + [((1, 512), (512,))] * 3
 

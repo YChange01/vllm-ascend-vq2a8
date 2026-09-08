@@ -112,6 +112,8 @@ def device_cache_budget(device, *, reserve_gib=16.0, budget_gib=0.0, memory_frac
 class CachedVQ2TP1MoE(VQ2TP1MoE):
     """Reuse packed payloads without changing M=1 preparation or reduction."""
 
+    measurement_mode = False
+
     def __init__(self, *args, progress=False, verbose_experts=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.progress = progress
@@ -123,6 +125,12 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         )
         self.projection_rows = 0
         self.prepare_batches = 0
+        self.measurement_mode = False
+        self.h2d_bytes = 0
+
+    def _timing_sync(self):
+        if not self.measurement_mode:
+            synchronize_execution(self.device)
 
     def _emit(self, stage, **values):
         if self.progress and self.verbose_experts:
@@ -155,6 +163,10 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             self._cache.move_to_end(expert_id)
             return self._cache[expert_id]
         if len(self._cache) >= self.cache_experts:
+            # Measurement removes timing fences, not payload lifetime fences.
+            # Do not release weights until their last native consumer completes.
+            if self.measurement_mode:
+                synchronize_execution(self.device)
             _, evicted = self._cache.popitem(last=False)
             self._resident_bytes -= self._payload_bytes(evicted)
             del evicted
@@ -182,6 +194,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             self.timing[key] += value
         self.timing["h2d_s"] += h2d_s
         self._cache[expert_id] = expert
+        if self.device.type != "cpu":
+            self.h2d_bytes = getattr(self, "h2d_bytes", 0) + self._payload_bytes(expert)
         self._resident_bytes += self._payload_bytes(expert)
         self.cache_peak_bytes = max(self.cache_peak_bytes, self._resident_bytes)
         self.cache_loads += 1
@@ -248,6 +262,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
 
     @torch.inference_mode()
     def forward(self, hidden, input_ids=None):
+        if self.measurement_mode:
+            return self._forward(hidden, input_ids)
         synchronize_execution(self.device)
         start = time.perf_counter()
         before = dict(self.timing)
@@ -319,7 +335,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         for chunk in hidden.split(ASCENDC_MAX_ROWS):
             start = time.perf_counter()
             quantized, scale, bias = self._row_preparation.rows(chunk, payload, spec)
-            synchronize_execution(self.device)
+            self._timing_sync()
             self.timing["prepare_s"] += time.perf_counter() - start
             self.prepare_batches += chunk.shape[0]
             start = time.perf_counter()
@@ -333,7 +349,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
                     payload["codebook_tile_ids"],
                 )
             )
-            synchronize_execution(self.device)
+            self._timing_sync()
             self.timing["packed_projection_s"] += time.perf_counter() - start
             self.projection_rows += chunk.shape[0]
             self.native_calls += 1
@@ -358,7 +374,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         start = time.perf_counter()
         with torch.device("cpu"):
             prepared = self._row_preparation.many(requests)
-        synchronize_execution(self.device)
+        self._timing_sync()
         rows = sum(hidden.shape[0] for hidden, _, _ in requests)
         self.timing["prepare_s"] += time.perf_counter() - start
         self.prepare_batches += rows
@@ -368,7 +384,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         ]
         start = time.perf_counter()
         output = grouped_projection(inputs)
-        synchronize_execution(self.device)
+        self._timing_sync()
         self.timing["packed_projection_s"] += time.perf_counter() - start
         self.native_calls += len(requests)  # logical projections, not launches
         self.native_launches += 1

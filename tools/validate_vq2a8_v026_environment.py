@@ -23,6 +23,7 @@ import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from types import SimpleNamespace
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
@@ -85,6 +86,43 @@ def require_v026_stack():
     return report
 
 
+def _check_structured_output_manager(manager_type):
+    """Check the paired scheduler API without constructing an engine/backend."""
+    advance = inspect.signature(manager_type.should_advance)
+    trim = inspect.signature(manager_type.trim_reasoning_for_advance)
+    try:
+        advance.bind(None, None, new_token_ids=[223])
+        trim.bind(None, None, [223])
+    except TypeError as exc:
+        raise RuntimeError(
+            "Ascend 0.26 scheduler/structured-output API mismatch: "
+            f"should_advance{advance}, trim_reasoning_for_advance{trim}. "
+            "Check local-build version recognition and VLLM_VERSION; "
+            "the paired reasoning-boundary patch must be installed before model loading."
+        ) from exc
+    manager = object.__new__(manager_type)
+    request = SimpleNamespace(use_structured_output=False)
+    if manager.should_advance(request, new_token_ids=[223]) is not False:
+        raise RuntimeError("Plain generation must not advance a structured-output grammar.")
+    return {
+        "scope": "python_scheduler_contract_only",
+        "should_advance": str(advance),
+        "trim_reasoning_for_advance": str(trim),
+        "plain_request_checked": True,
+        "npu_kernel_execution": False,
+    }
+
+
+def check_scheduler_apis():
+    # Install the same platform patches used by the engine before checking the
+    # effective method. The upstream, unpatched method lacks new_token_ids.
+    from vllm.v1.structured_output import StructuredOutputManager
+
+    import vllm_ascend.patch.platform  # noqa: F401
+
+    return _check_structured_output_manager(StructuredOutputManager)
+
+
 def check_runtime_imports():
     """Import real 0.26 APIs, but do not load model weights or run a kernel."""
     import torch
@@ -106,6 +144,7 @@ def check_runtime_imports():
         "model_class": VQ2A8TP1OfflineForCausalLM.__name__,
         "engine_options_checked": sorted(options),
         "collective_rpc": True,
+        "scheduler_apis": check_scheduler_apis(),
         "npu_kernel_execution": False,
     }
 

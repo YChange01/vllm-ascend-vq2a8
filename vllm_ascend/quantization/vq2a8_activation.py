@@ -18,11 +18,14 @@ from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE, _sylvest
 class RowwiseVQ2A8Preparation:
     """One bounded constant cache owned by the single-stream offline runtime."""
 
-    def __init__(self):
+    def __init__(self, *, compact=False):
         self._key = None
         self._hadamard = None
+        self.compact = compact
 
     def rows(self, hidden, payload, spec):
+        if self.compact:
+            return self.many([(hidden, payload, spec)])[0]
         prepared = []
         for row in hidden.split(1):
             if spec.columns != spec.rht_true_columns:
@@ -65,11 +68,15 @@ class RowwiseVQ2A8Preparation:
                 if width != current.rht_true_columns:
                     row = torch.nn.functional.pad(row, (0, width - current.rht_true_columns))
                 self._check_metadata(row, payload["weight_scale"], payload["weight_bias"], payload["rht_sign"], block)
-                values.append((row.float(), payload["weight_scale"], payload["weight_bias"], payload["rht_sign"]))
-        x = torch.cat([value[0] for value in values])
+                values.append((row, payload["weight_scale"], payload["weight_bias"], payload["rht_sign"]))
+        # One conversion instead of one allocation/launch per row. Mixed input
+        # dtypes retain the old conversion-before-concatenation contract.
+        compact = self.compact and len({value[0].dtype for value in values}) == 1
+        x = torch.cat([value[0] if compact else value[0].float() for value in values]).float()
         weight_scale, weight_bias, rht_sign = (torch.stack([value[i] for value in values]) for i in (1, 2, 3))
         valid = torch.isfinite(x).all() & torch.isfinite(weight_scale).all() & torch.isfinite(weight_bias).all()
-        signs = rht_sign.to(torch.int16)
+        # Equality with -1/+1 is exact in int8; no widening buffer is needed.
+        signs = rht_sign if self.compact else rht_sign.to(torch.int16)
         valid = valid & ((signs == -1) | (signs == 1)).all()
         if not bool(valid):
             raise ValueError("Invalid activation/weight_scale/weight_bias (non-finite) or rht_sign (not -1/+1).")

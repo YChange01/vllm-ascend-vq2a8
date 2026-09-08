@@ -112,6 +112,20 @@ def simulator_runtime_paths(maps):
     )
 
 
+def selected_kernel(args):
+    return "vq2a8_ascendc_" + getattr(args, "projection_path", "fused")
+
+
+def probe_shapes(args):
+    # M=17 reaches both vector halves and a masked tail. K=512 exercises four
+    # K tiles. Grouped uses two distinct jobs (different row counts).
+    return (
+        [(17, 32, 512, 3), (1, 32, 512, 3)]
+        if getattr(args, "projection_path", "fused") == "grouped"
+        else [(17, 32, 512, 3)]
+    )
+
+
 def run_application(args):
     # LD_PRELOAD must already have loaded the simulator at process startup.
     # Refuse an accidental bare-Python invocation before importing torch/NPU.
@@ -137,8 +151,8 @@ def run_application(args):
         "config_path": str(config),
         "config_sha256": digest(config),
         "flush_levels": levels,
-        "shape": {"m": 32, "n": 32, "k": 512, "tiles": 3},
-        "kernel_prefix": KERNEL_PREFIX,
+        "shapes": [dict(zip(("m", "n", "k", "tiles"), shape)) for shape in probe_shapes(args)],
+        "kernel_prefix": selected_kernel(args),
         "projection_calls": 0,
         "physical_npu_execution_claimed": False,
     }
@@ -148,21 +162,22 @@ def run_application(args):
     import torch_npu  # noqa: F401
 
     from tools.validate_vq2a8_phase4_kernel import synthetic_inputs
-    from vllm_ascend.quantization.vq2a8_ascendc import load_library, vq2a8_ascendc
+    from vllm_ascend.quantization.vq2a8_ascendc import grouped_projection, load_pinned_library, vq2a8_ascendc
 
     torch.set_num_threads(4)
     torch.npu.set_device(0)  # simulator logical device, not a physical-device selection
-    load_library(args.library)
+    report["loaded_library"] = load_pinned_library(args.library, library["sha256"])
     # CPU construction, then six transfers. No preparation/oracle/repeat kernels.
-    inputs = tuple(t.to("npu:0") for t in synthetic_inputs(32, 32, 512, 3))
+    jobs = [tuple(t.to("npu:0") for t in synthetic_inputs(*shape)) for shape in probe_shapes(args)]
     torch.npu.synchronize()
-    output = vq2a8_ascendc(*inputs)  # exactly one native fused call, blockDim=1
+    outputs = grouped_projection(jobs) if len(jobs) > 1 else [vq2a8_ascendc(*jobs[0])]
     torch.npu.synchronize()
     # Do not print/read device values in simulator mode. Metadata only.
     report.update(
         status="completed",
         projection_calls=1,
-        output_shape=list(output.shape),
+        output_shapes=[list(output.shape) for output in outputs],
+        logical_projections=len(jobs),
         library_unchanged=digest(args.library) == library["sha256"],
     )
     write_json(args.application_report, report)
@@ -304,7 +319,7 @@ def profiler_command(msprof, args, directory, library_sha):
         "simulator",
         f"--soc-version={args.soc}",
         f"--output={directory / 'profile'}",
-        f"--kernel-name={KERNEL_PREFIX}",
+        f"--kernel-name={selected_kernel(args)}",
         "--launch-count=1",
         f"--timeout={args.timeout_minutes}",
         sys.executable,
@@ -316,6 +331,8 @@ def profiler_command(msprof, args, directory, library_sha):
         str(args.library),
         "--expected-library-sha256",
         library_sha,
+        "--projection-path",
+        getattr(args, "projection_path", "fused"),
     ]
 
 
@@ -362,6 +379,10 @@ def run(args):
         raise RuntimeError("Run on the Linux CANN installation, not the development host.")
     args.library = args.library.resolve(strict=True)
     library = library_evidence(args.library)
+    if args.soc is None:
+        args.soc = library["build"]["soc"]
+    if not re.fullmatch(r"Ascend950[A-Za-z0-9_]+", args.soc):
+        raise ValueError("Require an explicit Ascend950 SOC or the pinned build manifest SOC.")
     # A rebuilt diagnostic candidate cannot inherit the old library's suite.
     suite = None if args.diagnostic_build else checked_suite(args.suite_report / "summary.json", library)
     msprof = shutil.which("msprof")
@@ -369,11 +390,18 @@ def run(args):
         raise RuntimeError("msprof is not on PATH; source the existing CANN environment first.")
     config = (args.cann / "tools/simulator" / args.soc / "lib/config.json").resolve(strict=True)
     config_sha = digest(config)
-    directory = Path(tempfile.mkdtemp(prefix="vq2a8-ascendc-sim-")).resolve()
+    if getattr(args, "output_dir", None):
+        directory = args.output_dir.resolve()
+        directory.mkdir(parents=True, exist_ok=False)
+    else:
+        directory = Path(tempfile.mkdtemp(prefix="vq2a8-ascendc-sim-")).resolve()
     print(f"ASCENDC_SIM_REPORT={directory}", flush=True)
     report = {
         "status": "running",
-        "scope": "single_synthetic_fused_simulation",
+        "scope": "single_synthetic_kernel_simulation",
+        "kernel_prefix": selected_kernel(args),
+        "soc": args.soc,
+        "shapes": probe_shapes(args),
         "library": library,
         "suite": suite,
         "diagnostic_build": args.diagnostic_build,
@@ -463,7 +491,9 @@ def main():
     )
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc/libvq2a8_ascendc.so")
     parser.add_argument("--cann", type=Path, default=Path("/usr/local/Ascend/cann-9.1.0"))
-    parser.add_argument("--soc", default="Ascend950PR_957d")
+    parser.add_argument("--soc", help="Default: pinned build manifest SOC; never assume another 950 variant.")
+    parser.add_argument("--projection-path", choices=["fused", "grouped"], default="fused")
+    parser.add_argument("--output-dir", type=Path, help="New persistent report directory; never overwrite.")
     parser.add_argument(
         "--timeout-minutes",
         type=int,
@@ -473,7 +503,9 @@ def main():
     parser.add_argument("--application-report", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--expected-library-sha256", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if not 1 <= args.timeout_minutes <= MAX_TIMEOUT_MINUTES or not re.fullmatch(r"Ascend950[A-Za-z0-9_]+", args.soc):
+    if not 1 <= args.timeout_minutes <= MAX_TIMEOUT_MINUTES or (
+        args.soc is not None and not re.fullmatch(r"Ascend950[A-Za-z0-9_]+", args.soc)
+    ):
         parser.error(f"Require Ascend950 SOC and 1..{MAX_TIMEOUT_MINUTES} simulator timeout minutes.")
     if args.application_report:
         return run_application(args)
