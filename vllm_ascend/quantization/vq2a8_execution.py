@@ -16,13 +16,17 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
-from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
-from vllm_ascend.quantization.vq2a8_reference import prepare_repacked_vq2a8_activation_reference
+from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE, mix_vq2a8_routes
+from vllm_ascend.quantization.vq2a8_reference import (
+    deepseek_v4_swiglu_reference,
+    prepare_repacked_vq2a8_activation_reference,
+)
 from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_TORCH_DTYPES
 
 GIB = 1024**3
 ALLOCATION_GRANULARITY = 512
 ASCENDC_MAX_ROWS = 32
+ASCENDC_MAX_JOBS = 6
 
 
 def synchronize_execution(device: torch.device) -> None:
@@ -249,7 +253,7 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
         before = dict(self.timing)
         cache_before = self.cache_stats()
         rows, batches = self.projection_rows, self.prepare_batches
-        result = super().forward(hidden, input_ids)
+        result = self._forward(hidden, input_ids)
         synchronize_execution(self.device)
         report = {
             "layer": self.layer_index,
@@ -271,13 +275,16 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             print("MODEL_MOE_TIMING " + json.dumps(report), flush=True)
         return result
 
+    def _forward(self, hidden, input_ids):
+        return super().forward(hidden, input_ids)
+
 
 class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
     """Opt-in eager native projections; routing/cache/shared math is unchanged.
 
-    Preparation retains the accepted one-row rounding geometry. Only prepared
-    rows of the same expert are batched for the native projection, never dense
-    expert weights. This is integration bring-up, not a serving fast path.
+    Preparation retains the accepted one-row rounding geometry. Up to six
+    independent expert projections share one native launch; their compressed
+    weights remain separate. This is an eager path, not verified serving.
     """
 
     execution_policy = "ascendc"
@@ -289,11 +296,13 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         self.native_calls = 0
         self.native_rows = 0
         self.native_experts = 0
+        self.native_launches = 0
         self.native_steps = []
         self.trace_native = False
 
     def reset_native_trace(self):
         self.native_calls = self.native_rows = self.native_experts = 0
+        self.native_launches = 0
         self.native_steps = []
         self.trace_native = True
 
@@ -328,6 +337,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
             self.timing["packed_projection_s"] += time.perf_counter() - start
             self.projection_rows += chunk.shape[0]
             self.native_calls += 1
+            self.native_launches += 1
             self.native_rows += chunk.shape[0]
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
 
@@ -336,9 +346,112 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
         self.native_experts += 1  # both gate/up and down completed
         return output
 
+    def _projections_many(self, requests):
+        from vllm_ascend.quantization.vq2a8_ascendc import grouped_projection
+
+        if self.device.type != "npu":
+            raise ValueError("AscendC projections never fall back to CPU/CUDA.")
+        if len(requests) == 1:
+            return [self._projection(*requests[0])]
+        if not hasattr(self, "_row_preparation"):
+            self._row_preparation = RowwiseVQ2A8Preparation()
+        start = time.perf_counter()
+        with torch.device("cpu"):
+            prepared = self._row_preparation.many(requests)
+        synchronize_execution(self.device)
+        rows = sum(hidden.shape[0] for hidden, _, _ in requests)
+        self.timing["prepare_s"] += time.perf_counter() - start
+        self.prepare_batches += rows
+        inputs = [
+            (*values, *(payload[name] for name in ("packed_indices", "codebooks", "codebook_tile_ids")))
+            for values, (_, payload, _) in zip(prepared, requests)
+        ]
+        start = time.perf_counter()
+        output = grouped_projection(inputs)
+        synchronize_execution(self.device)
+        self.timing["packed_projection_s"] += time.perf_counter() - start
+        self.native_calls += len(requests)  # logical projections, not launches
+        self.native_launches += 1
+        self.native_rows += rows
+        self.projection_rows += rows
+        return output
+
+    def _forward(self, hidden, input_ids):
+        """Reuse the unchanged router, slot reduction and shared-expert math.
+
+        The reference mixer requests experts in insertion order. A bounded
+        callback computes up to six of those requests together and returns
+        them to the original slot writer. No cross-token reduction is moved.
+        """
+        if self.token_chunk > ASCENDC_MAX_ROWS:
+            # Do not silently change shared-expert GEMM geometry for callers
+            # outside the bounded offline grouped path.
+            return super()._forward(hidden, input_ids)
+        weights, ids = self.route(hidden, input_ids)
+        host_ids = ids.cpu().tolist()
+        if not {index for row in host_ids for index in row}.issubset(self.layer.expert_ids):
+            raise ValueError("Router selected experts missing from this artifact.")
+        if not hidden.shape[0]:
+            return torch.empty_like(hidden)
+        outputs = []
+        # Respect the original token chunk (including shared GEMM geometry).
+        chunk_size = self.token_chunk
+        for start in range(0, hidden.shape[0], chunk_size):
+            chunk = hidden[start : start + chunk_size]
+            route_ids = ids[start : start + chunk_size]
+            plan = {}
+            for token, token_ids in enumerate(host_ids[start : start + chunk_size]):
+                for expert_id in token_ids:
+                    plan.setdefault(expert_id, {}).setdefault(token, None)
+            pending = list(plan)
+            ready = {}
+
+            def expert(expert_id, selected, *, ready=ready, pending=pending, chunk=chunk, plan=plan):
+                if expert_id not in ready:
+                    count = min(ASCENDC_MAX_JOBS, self.cache_experts, len(pending))
+                    batch = pending[:count]
+                    del pending[:count]
+                    if not batch or batch[0] != expert_id:
+                        raise RuntimeError("Grouped expert schedule disagrees with the reference mixer.")
+                    verbose = self.progress and self.verbose_experts
+                    if verbose:
+                        started = time.perf_counter()
+                        self._emit("expert_group_start", experts=",".join(map(str, batch)), jobs=len(batch))
+                    # Holding <=cache_experts jobs cannot pin weights evicted
+                    # by this batch. Payload owners are released before refill.
+                    payloads = [self._get_expert(index) for index in batch]
+                    rows = [selected] + [
+                        chunk.index_select(0, torch.tensor(list(plan[index]), device=chunk.device, dtype=torch.int64))
+                        for index in batch[1:]
+                    ]
+                    gates = self._projections_many([(row, *p["gate_up"]) for row, p in zip(rows, payloads)])
+                    activated = [deepseek_v4_swiglu_reference(gate, self.config.swiglu_limit) for gate in gates]
+                    values = self._projections_many([(row, *p["down"]) for row, p in zip(activated, payloads)])
+                    ready.update(zip(batch, values))
+                    self.native_experts += len(batch)  # both projections completed
+                    if verbose:
+                        self._emit(
+                            "expert_group_done", jobs=len(batch), elapsed_s=f"{time.perf_counter() - started:.3f}"
+                        )
+                return ready.pop(expert_id)
+
+            outputs.append(
+                mix_vq2a8_routes(
+                    chunk,
+                    weights[start : start + chunk_size],
+                    route_ids,
+                    expert,
+                    routed_scale=self.config.routed_scale,
+                    shared=self.shared if self.config.num_shared else None,
+                )
+            )
+            if pending or ready:
+                raise RuntimeError("Grouped expert schedule did not consume every route.")
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
     @torch.inference_mode()
     def forward(self, hidden, input_ids=None):
-        before = self.native_calls, self.native_rows, self.native_experts
+        before = self.native_calls, self.native_rows, self.native_experts, self.native_launches
         output = super().forward(hidden, input_ids)
         if self.trace_native:
             if len(self.native_steps) >= 128:
@@ -349,6 +462,7 @@ class AscendCVQ2TP1MoE(CachedVQ2TP1MoE):
                     "projection_calls": self.native_calls - before[0],
                     "projection_rows": self.native_rows - before[1],
                     "expert_calls": self.native_experts - before[2],
+                    "kernel_launches": self.native_launches - before[3],
                 }
             )
         return output

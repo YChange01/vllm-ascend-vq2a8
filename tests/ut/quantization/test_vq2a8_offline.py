@@ -260,7 +260,26 @@ def test_model_evidence_requires_all_layers_real_steps_and_greedy_logits():
     assert result["decode_steps"] == 3 and result["layers_executed"] == 2
 
 
-@pytest.mark.parametrize("bad", [None, "policy", "hash", "layer", "profile", "step", "calls", "rows", "fallback"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "policy",
+        "hash",
+        "layer",
+        "profile",
+        "step",
+        "calls",
+        "rows",
+        "fallback",
+        "launch_missing",
+        "launch_zero",
+        "launch_bool",
+        "launch_odd",
+        "launch_excess",
+        "launch_capacity",
+    ],
+)
 def test_native_model_evidence_requires_each_real_step_and_no_fallback(bad):
     data = evidence()
     data["expert_backend"] = {
@@ -276,6 +295,7 @@ def test_native_model_evidence_requires_each_real_step_and_no_fallback(bad):
                         "projection_calls": 2,
                         "projection_rows": 2 * s["tokens"],
                         "expert_calls": 1,
+                        "kernel_launches": 2,
                     }
                     for s in data["steps"]
                 ],
@@ -301,6 +321,12 @@ def test_native_model_evidence_requires_each_real_step_and_no_fallback(bad):
         steps[1]["projection_rows"] = 0
     elif bad == "fallback":
         backend["fallback_enabled"] = True
+    elif bad == "launch_missing":
+        del steps[1]["kernel_launches"]
+    elif bad in ("launch_zero", "launch_bool", "launch_odd", "launch_excess"):
+        steps[1]["kernel_launches"] = {"launch_zero": 0, "launch_bool": True, "launch_odd": 1, "launch_excess": 4}[bad]
+    elif bad == "launch_capacity":
+        steps[1].update(projection_calls=14, expert_calls=7, projection_rows=14)
     if bad:
         with pytest.raises(ValueError):
             validate_offline_evidence(

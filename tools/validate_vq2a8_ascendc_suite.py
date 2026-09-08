@@ -223,7 +223,7 @@ def run_step(args, step, directory, digest):
         str(args.repeats),
     ]
     env = gate.acceptance_environment(REPO, args.physical_npu, "npu:0")
-    if step["stage"] == "timing":
+    if step["stage"] in ("timing", "grouped"):
         env["ASCEND_LAUNCH_BLOCKING"] = "0"  # child only; never change the parent
     result = {
         **step,

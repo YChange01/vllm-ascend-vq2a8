@@ -44,6 +44,16 @@ def child_evidence(stage):
                 "accepted_baseline": {"allclose": True},
                 "independent_chain": {"allclose": True},
                 "row_preparation_exact": True,
+                "separate_exact": True,
+                "permutation_exact": True,
+                "logical_projections": int(key.split(":")[0][4:]) if stage == "grouped" else 1,
+                "kernel_launches": 1,
+                "descriptor_bytes": (int(key.split(":")[0][4:]) if stage == "grouped" else 1) * 96,
+                "launch_blocking": False,
+                "timing_scope": "prepared_projections_including_grouped_descriptor_h2d",
+                "grouped_timings": {
+                    name: [stats, stats] for name in ("grouped", "separate", "prepare_grouped", "prepare_separate")
+                },
                 "timings": {
                     "candidate": stats,
                     "accepted_baseline": stats,
@@ -57,7 +67,7 @@ def child_evidence(stage):
     }
 
 
-@pytest.mark.parametrize("failure", [None, "fused", "timing", "runtime", "hash"])
+@pytest.mark.parametrize("failure", [None, "fused", "grouped", "timing", "runtime", "hash"])
 def test_short_model_preflight_never_runs_simulator_or_rebuild(tmp_path, monkeypatch, failure):
     monkeypatch.setattr(native, "require_hardware_runtime", lambda: None)
     monkeypatch.setattr(native, "library_evidence", lambda p: {"sha256": "a" * 64})
@@ -87,8 +97,51 @@ def test_short_model_preflight_never_runs_simulator_or_rebuild(tmp_path, monkeyp
             native.checked_model_preflight(Path("/lib.so"), receipt)
     report = json.loads((tmp_path / "preflight/preflight.json").read_text())
     assert report["status"] == ("failed" if failure else "passed")
-    assert calls == (["fused"] if failure == "fused" else ["fused", "timing"])
-    assert len(native.expected_keys("fused")) + len(native.expected_keys("timing")) == 34
+    assert calls == (
+        ["fused"]
+        if failure == "fused"
+        else ["fused", "grouped"]
+        if failure == "grouped"
+        else ["fused", "grouped", "timing"]
+    )
+    assert sum(len(native.expected_keys(stage)) for stage in ("fused", "grouped", "timing")) == 38
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "row_preparation_exact",
+        "separate_exact",
+        "permutation_exact",
+        "kernel_launches",
+        "logical_projections",
+        "descriptor_bytes",
+        "grouped_timings",
+        "launch_blocking",
+    ],
+)
+def test_grouped_preflight_fails_closed_on_missing_execution_evidence(tmp_path, field):
+    report = child_evidence("grouped")
+    report["results"][0].pop(field)
+    path = tmp_path / "grouped.json"
+    path.write_text(json.dumps(report))
+    assert not native.evidence_passed(path, "grouped", "a" * 64)
+
+
+def test_grouped_wrapper_requires_new_operator_without_fallback(monkeypatch):
+    import torch
+
+    calls = []
+    ops = NS(vq2a8_ascendc=NS(projection=lambda *args: pytest.fail("silent sequential fallback"), cube_control=None))
+    monkeypatch.setattr(torch, "ops", ops)
+    with pytest.raises(RuntimeError, match="Rebuild"):
+        wrapper.grouped_projection([(1, 2, 3, 4, 5, 6)])
+    ops.vq2a8_ascendc.grouped_projection = lambda *args: calls.append(args) or ["native"]
+    assert wrapper.grouped_projection([(1, 2, 3, 4, 5, 6), (7, 8, 9, 10, 11, 12)]) == ["native"]
+    assert calls == [([1, 7], [2, 8], [3, 9], [4, 10], [5, 11], [6, 12])]
+    for invalid in ([], [(1, 2)], [(1, 2, 3, 4, 5, 6)] * 7):
+        with pytest.raises(ValueError):
+            wrapper.grouped_projection(invalid)
 
 
 @pytest.mark.parametrize("source", ["mapped", "config", "preload", "clean"])
@@ -218,3 +271,44 @@ def test_native_model_summary_separates_execution_from_isa_and_quality():
     assert "QUALITY_VERIFIED=False" in text and "SERVING_VERIFIED=False" in text
     summary["results"][0]["passed"] = False
     assert "ASCENDC_MODEL_EXECUTION_VERIFIED=False" in acceptance.format_compact_summary(summary)
+
+
+@pytest.mark.parametrize("coverage", ["complete", "old", "partial", "failed"])
+def test_native_summary_counts_launches_separately_from_logical_projections(coverage):
+    layers = [
+        {"steps": [{"tokens": 1, "projection_calls": 2 if i < 3 else 12, "kernel_launches": 2}]} for i in range(43)
+    ]
+    if coverage == "old":
+        del layers[-1]["steps"][0]["kernel_launches"]
+    elif coverage == "partial":
+        layers[-1]["steps"].clear()
+    summary = {
+        "stage": "model",
+        "execution_policy": "ascendc",
+        "probes": ["full_model"],
+        "results": [
+            {
+                "passed": coverage != "failed",
+                "records": [
+                    {
+                        "type": "VQ2A8_TP1_OFFLINE_EXECUTION_GATE=PASS",
+                        "data": {"ascendc_model_execution_verified": True},
+                    },
+                    {
+                        "type": "MODEL_RESULT",
+                        "data": {
+                            "expert_backend": {"layers": layers},
+                            "generated_token_ids": [1],
+                            "peak_allocated_bytes": 1024,
+                            "peak_reserved_bytes": 2048,
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+    text = acceptance.format_compact_summary(summary)
+    if coverage == "complete":
+        assert "NATIVE_DISPATCH step=0 tokens=1 logical_projections=486 kernel_launches=86" in text
+    else:
+        assert "NATIVE_DISPATCH" not in text

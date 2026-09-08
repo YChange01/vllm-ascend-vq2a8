@@ -18,6 +18,37 @@ struct PairReader {
   }
 };
 
+// Host emulation of the vector lane plan. Tests bytes/indices only, not the
+// NPU implementations of Gather, ShiftRight, Add or their synchronization.
+std::array<uint8_t, kHalfTileBytes> VectorDecode(const std::array<uint32_t, kPairs / 8>& words,
+                                                 const std::array<uint8_t, kK>& ids, const std::vector<uint8_t>& book) {
+  std::array<uint8_t, kMaxTiles * kN> padded;
+  padded.fill(kInvalidFp8);
+  std::copy(book.begin(), book.end(), padded.begin());
+  std::array<uint8_t, kHalfTileBytes> pairs{}, output{};
+  for (uint32_t i = 0; i < kPairs; ++i) {
+    auto wordOffset = PackedGatherOffset(i);
+    assert(wordOffset % 4 == 0 && wordOffset / 4 < words.size());
+    auto code = (words[wordOffset / 4] >> ((i % 8) * 4)) & 15u;
+    auto idOffset = IdGatherOffset(i);
+    assert(idOffset % 4 == 0 && idOffset + 3 < ids.size());
+    uint32_t idWord = 0;
+    for (uint32_t lane = 0; lane < 4; ++lane) {
+      idWord |= uint32_t(ids[idOffset + lane]) << (lane * 8);
+    }
+    auto tile = (idWord >> ((i % 4) * 8)) & 255u;
+    auto offset = (tile << 5) + (code << 1);
+    assert(offset % 2 == 0 && offset + 1 < padded.size());
+    pairs[2 * i] = padded[offset];
+    pairs[2 * i + 1] = padded[offset + 1];
+  }
+  for (uint32_t i = 0; i < kHalfTileBytes; ++i) {
+    assert(PairGatherOffset(i) < pairs.size());
+    output[i] = pairs[PairGatherOffset(i)];
+  }
+  return output;
+}
+
 int main() {
   static_assert(HalfRows(0, 0) == 0);
   static_assert(HalfRows(1, 0) == 1);
@@ -99,6 +130,10 @@ int main() {
               }
             }
           }
+          std::array<uint8_t, kK> tileIds{};
+          std::copy_n(ids.begin() + start, kK, tileIds.begin());
+          auto vectorOutput = VectorDecode(words, tileIds, compact);
+          assert(std::equal(ub.begin(), ub.end(), vectorOutput.begin()));
           // Four 512-byte UB->L1 blocks, 512-byte destination gaps.
           for (uint32_t block = 0; block < kK / 32; ++block) {
             for (uint32_t b = 0; b < 16 * 32; ++b) {
@@ -118,6 +153,26 @@ int main() {
             assert(writes[offset] == 1);
             assert(l1[offset] == expected);
           }
+        }
+      }
+    }
+  }
+  // Invalid IDs in the vector path must read sentinel bytes for both rows,
+  // including unsigned 255; all 256 codebook encodings are preserved.
+  for (uint32_t tiles : {1u, 3u, 32u, 256u}) {
+    std::vector<uint8_t> book(tiles * 32);
+    for (uint32_t i = 0; i < book.size(); ++i) book[i] = i % 256;
+    std::array<uint32_t, kPairs / 8> words{};
+    for (uint32_t i = 0; i < words.size(); ++i) words[i] = 0xfedcba98u - i;
+    for (uint32_t base : {0u, 128u}) {
+      std::array<uint8_t, kK> ids{};
+      for (uint32_t i = 0; i < kK; ++i) ids[i] = base + i;
+      auto output = VectorDecode(words, ids, book);
+      for (uint32_t row = 0; row < 16; ++row) {
+        for (uint32_t col = 0; col < kK; ++col) {
+          auto code = (words[(row / 2) * 16 + col / 8] >> ((col % 8) * 4)) & 15;
+          auto expected = ids[col] < tiles ? book[ids[col] * 32 + code * 2 + row % 2] : kInvalidFp8;
+          assert(output[HalfNz(row, col)] == expected);
         }
       }
     }
@@ -154,6 +209,7 @@ int main() {
         }
         for (uint32_t col = 0; col < kK; col += 4) {
           nz[HalfNz(row, col) / 4] = ndTile[(row * kK + col) / 4];
+          assert(NdGatherOffset(HalfNz(row, col) / 4) == row * kK + col);
         }
       }
       for (uint32_t row = 0; row < 16; ++row) {
@@ -165,6 +221,22 @@ int main() {
           }
         }
       }
+    }
+  }
+  // Flattened (expert, N-group) work reaches each output tile exactly once,
+  // with both AIVs assigned to the same job as their paired Cube core.
+  for (uint32_t jobs : {1u, 2u, 6u}) {
+    for (uint32_t groups : {1u, 3u, 32u, 33u, 256u, 2048u}) {
+      uint32_t blocks = std::min(32u, jobs * groups);
+      std::vector<uint32_t> visited(jobs * groups, 0);
+      for (uint32_t core = 0; core < blocks; ++core) {
+        for (uint32_t work = core; work < jobs * groups; work += blocks) {
+          assert(work / groups < jobs && (work / groups) * kJobWords + 10 < jobs * kJobWords);
+          ++visited[work];
+          assert((core * 2) / 2 == core && (core * 2 + 1) / 2 == core);
+        }
+      }
+      assert(std::all_of(visited.begin(), visited.end(), [](uint32_t n) { return n == 1; }));
     }
   }
   // AIC block scheduling visits every N group once, including >core-count N.

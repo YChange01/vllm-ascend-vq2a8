@@ -17,6 +17,23 @@ constexpr uint32_t kHalfTileBytes = kHalf * kK;
 constexpr uint32_t kMaxTiles = 256;
 constexpr uint32_t kMaxDimension = 65536;
 constexpr uint8_t kInvalidFp8 = 0x7f;  // fail closed on an invalid tile ID
+constexpr uint32_t kPairs = kHalfTileBytes / 2;
+constexpr uint32_t kMaxJobs = 6;
+// Seven pointers, four dimensions, one reserved word. Host-only construction.
+constexpr uint32_t kJobWords = 12;
+
+// Gather offsets are BYTES, not elements. These pure index functions are
+// tested on host and used to build bounded per-core constant UB tables.
+VQ2A8_LAYOUT_FN constexpr uint32_t NzRow(uint32_t byte) { return (byte / kC0) % kHalf; }
+VQ2A8_LAYOUT_FN constexpr uint32_t NzCol(uint32_t byte) { return byte / (kHalf * kC0) * kC0 + byte % kC0; }
+VQ2A8_LAYOUT_FN constexpr uint32_t NdGatherOffset(uint32_t word) { return NzRow(word * 4) * kK + NzCol(word * 4); }
+VQ2A8_LAYOUT_FN constexpr uint32_t PackedGatherOffset(uint32_t pair) {
+  return (pair / kK * (kK / 8) + pair % kK / 8) * 4;
+}
+VQ2A8_LAYOUT_FN constexpr uint32_t IdGatherOffset(uint32_t pair) { return (pair % kK / 4) * 4; }
+VQ2A8_LAYOUT_FN constexpr uint32_t PairGatherOffset(uint32_t byte) {
+  return (NzRow(byte) / 2 * kK + NzCol(byte)) * 2 + NzRow(byte) % 2;
+}
 
 // Scalar row clipping, shared with host tests. AscendC::Min is a vector
 // tensor API, not a two-scalar overload. Guard before unsigned subtraction.
@@ -49,8 +66,8 @@ VQ2A8_LAYOUT_FN constexpr uint32_t PackedOffset(uint32_t row, uint32_t col, uint
 // FP8 value. This same implementation is exercised by the host layout test.
 // Invalid tile IDs produce NaNs without reading beyond the compact UB table.
 template <typename Reader>
-VQ2A8_LAYOUT_FN void DecodeFour(uint32_t codes, uint32_t tileIds, uint32_t tiles,
-                              const Reader& table, uint32_t& even, uint32_t& odd) {
+VQ2A8_LAYOUT_FN void DecodeFour(uint32_t codes, uint32_t tileIds, uint32_t tiles, const Reader& table, uint32_t& even,
+                                uint32_t& odd) {
   even = 0;
   odd = 0;
   for (uint32_t lane = 0; lane < 4; ++lane) {

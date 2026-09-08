@@ -11,8 +11,7 @@
   #error "VQ2A8 requires native A5 1C:2V UB-to-L1, not TSCM GM compatibility"
 #endif
 
-// A5-only, single-buffer correctness prototype. Decode uses scalar accesses
-// to UB, not scalar GM gathers. Vectorized lookup/pipelining are future work.
+// A5-only: vector UB lookup and one-tile look-ahead with single-buffer L1.
 // API/layout precedents: attention/kv_quant_sparse_attn_sharedkv/op_kernel/arch35
 // common/{matmul,buffer,FixpipeOut}.h. No Triton, MX scales or dense workspace.
 namespace vq2a8_ascendc {
@@ -34,6 +33,12 @@ class ProjectionKernel {
  public:
   __aicore__ inline void Init(GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR packed, GM_ADDR book, GM_ADDR ids,
                               GM_ADDR dense, GM_ADDR y, uint32_t m, uint32_t n, uint32_t k, uint32_t tiles) {
+    Bind(x, scale, bias, packed, book, ids, dense, y, m, n, k, tiles);
+    InitBuffers();
+  }
+
+  __aicore__ inline void Bind(GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR packed, GM_ADDR book, GM_ADDR ids,
+                              GM_ADDR dense, GM_ADDR y, uint32_t m, uint32_t n, uint32_t k, uint32_t tiles) {
     m_ = m;
     n_ = n;
     k_ = k;
@@ -54,6 +59,9 @@ class ProjectionKernel {
     scale_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scale));
     bias_.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(bias));
     y_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(y));
+  }
+
+  __aicore__ inline void InitBuffers() {
     // Identical buffer allocation order on AIC/AIV: Fixpipe addresses the
     // result UB at offset zero on BOTH AIVs. L1 is shared by the core group.
     pipe_.InitBuffer(result_, kHalf * kN * sizeof(float));
@@ -71,6 +79,54 @@ class ProjectionKernel {
     pipe_.InitBuffer(scaleUb_, kHalf * sizeof(float));
     pipe_.InitBuffer(biasUb_, kHalf * sizeof(float));
     pipe_.InitBuffer(outUb_, kHalf * kN * sizeof(bfloat16_t));
+    pipe_.InitBuffer(ndOffsets_, kHalfTileBytes);
+    pipe_.InitBuffer(packedOffsets_, kPairs * sizeof(uint32_t));
+    pipe_.InitBuffer(idOffsets_, kPairs * sizeof(uint32_t));
+    pipe_.InitBuffer(codeShifts_, kPairs * sizeof(int32_t));
+    pipe_.InitBuffer(idShifts_, kPairs * sizeof(int32_t));
+    pipe_.InitBuffer(pairOffsets_, kHalfTileBytes * sizeof(uint32_t));
+    pipe_.InitBuffer(codes_, kPairs * sizeof(uint32_t));
+    pipe_.InitBuffer(tileValues_, kPairs * sizeof(uint32_t));
+    pipe_.InitBuffer(pairs_, kHalfTileBytes);
+    if ASCEND_IS_AIV {
+      for (uint32_t i = 0; i < kHalfTileBytes / 4; ++i) {
+        ndOffsets_.Get<uint32_t>().SetValue(i, NdGatherOffset(i));
+      }
+      for (uint32_t i = 0; i < kPairs; ++i) {
+        packedOffsets_.Get<uint32_t>().SetValue(i, PackedGatherOffset(i));
+        idOffsets_.Get<uint32_t>().SetValue(i, IdGatherOffset(i));
+        codeShifts_.Get<int32_t>().SetValue(i, (i % 8) * 4);
+        idShifts_.Get<int32_t>().SetValue(i, (i % 4) * 8);
+      }
+      for (uint32_t i = 0; i < kHalfTileBytes; ++i) {
+        pairOffsets_.Get<uint32_t>().SetValue(i, PairGatherOffset(i));
+      }
+      Fence<HardEvent::S_V>();
+    }
+  }
+
+  __aicore__ inline void ProcessGrouped(GM_ADDR descriptors, uint32_t jobs, uint32_t groups, uint32_t cores) {
+    GlobalTensor<uint64_t> records;
+    records.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(descriptors));
+    uint32_t core = GetBlockIdx();
+    if ASCEND_IS_AIV {
+      core /= 2;
+    }
+    // All jobs share N/K; M and codebook tile counts may differ. Each work
+    // item owns one output [M,32] tile. No cross-expert weight copy or GM decode.
+    for (uint32_t work = core; work < jobs * groups; work += cores) {
+      uint32_t base = (work / groups) * kJobWords;
+      Bind(reinterpret_cast<GM_ADDR>(records.GetValue(base)), reinterpret_cast<GM_ADDR>(records.GetValue(base + 1)),
+           reinterpret_cast<GM_ADDR>(records.GetValue(base + 2)), reinterpret_cast<GM_ADDR>(records.GetValue(base + 3)),
+           reinterpret_cast<GM_ADDR>(records.GetValue(base + 4)), reinterpret_cast<GM_ADDR>(records.GetValue(base + 5)),
+           nullptr, reinterpret_cast<GM_ADDR>(records.GetValue(base + 6)), records.GetValue(base + 7),
+           records.GetValue(base + 8), records.GetValue(base + 9), records.GetValue(base + 10));
+      if ASCEND_IS_AIC {
+        Cube();
+      } else {
+        Vector<2>(work % groups);
+      }
+    }
   }
 
   template <uint32_t Mode>
@@ -109,17 +165,19 @@ class ProjectionKernel {
       p.dstStride = 0;
       DataCopy(ndTile, src[offset], p);
     }
-    Fence<HardEvent::MTE2_S>();
+    Fence<HardEvent::MTE2_V>();
     auto source = ndTile.ReinterpretCast<uint32_t>();
     auto target = dst.ReinterpretCast<uint32_t>();
-    for (uint32_t row = 0; row < kHalf; ++row) {
-      for (uint32_t col = 0; col < kK; col += 4) {
-        uint32_t value = source.GetValue((row * kK + col) / 4);
-        target.SetValue(HalfNz(row, col) / 4, value ^ (flip ? 0x80808080u : 0u));
+    Gather(target, source, ndOffsets_.Get<uint32_t>(), uint32_t(0), kHalfTileBytes / 4);
+    if (flip) {
+      // Synthetic bridge only; the fused path has no scalar word loop.
+      Fence<HardEvent::V_S>();
+      for (uint32_t i = 0; i < kHalfTileBytes / 4; ++i) {
+        target.SetValue(i, target.GetValue(i) ^ 0x80808080u);
       }
+      Fence<HardEvent::S_V>();
     }
-    // Scalar reads of ND must finish before the next Vector zero-fill.
-    Fence<HardEvent::S_V>();
+    PipeBarrier<PIPE_V>();  // complete ND reads before the next zero-fill
   }
 
   __aicore__ inline void Decode(uint32_t group, uint32_t start, uint32_t half) {
@@ -132,25 +190,27 @@ class ProjectionKernel {
     p.dstStride = 0;
     DataCopy(words, packed_[PackedOffset(group * kN + half * kHalf, start, k_)], p);
     DataCopy(ids, ids_[start], kK);
-    Fence<HardEvent::MTE2_S>();
-    auto table = bookUb_.Get<uint16_t>();
-    auto dst = bUb_.Get<uint32_t>();
-    auto tileWords = ids.ReinterpretCast<uint32_t>();
-    // Reuse each packed word for both rows and all eight columns. Lookup
-    // both FP8 bytes together and write four adjacent NZ bytes at a time.
-    // Still scalar UB decode, but no longer a GetValue/SetValue per byte.
-    for (uint32_t row = 0; row < kHalf; row += 2) {
-      for (uint32_t col = 0; col < kK; col += 8) {
-        uint32_t codes = words.GetValue(PackedOffset(row, col, kK));
-        for (uint32_t offset = 0; offset < 8; offset += 4) {
-          uint32_t even, odd;
-          DecodeFour(codes >> (offset * 4), tileWords.GetValue((col + offset) / 4), tiles_, table, even, odd);
-          dst.SetValue(HalfNz(row, col + offset) / 4, even);
-          dst.SetValue(HalfNz(row + 1, col + offset) / 4, odd);
-        }
-      }
-    }
-    Fence<HardEvent::S_MTE2>();  // packed/IDs can be overwritten next iteration
+    Fence<HardEvent::MTE2_V>();
+    auto codes = codes_.Get<uint32_t>();
+    auto tile = tileValues_.Get<uint32_t>();
+    Gather(codes, words, packedOffsets_.Get<uint32_t>(), uint32_t(0), kPairs);
+    Gather(tile, ids.ReinterpretCast<uint32_t>(), idOffsets_.Get<uint32_t>(), uint32_t(0), kPairs);
+    PipeBarrier<PIPE_V>();
+    ShiftRight(codes, codes, codeShifts_.Get<int32_t>(), int32_t(kPairs));
+    ShiftRight(tile, tile, idShifts_.Get<int32_t>(), int32_t(kPairs));
+    PipeBarrier<PIPE_V>();
+    Ands(codes, codes, uint32_t(15), kPairs);
+    Ands(tile, tile, uint32_t(255), kPairs);
+    PipeBarrier<PIPE_V>();
+    ShiftLeft(codes, codes, uint32_t(1), kPairs);
+    ShiftLeft(tile, tile, uint32_t(5), kPairs);
+    PipeBarrier<PIPE_V>();
+    Add(codes, codes, tile, kPairs);  // byte offset: tile*32 + code*2
+    PipeBarrier<PIPE_V>();
+    Gather(pairs_.Get<uint16_t>(), bookUb_.Get<uint16_t>(), codes, uint32_t(0), kPairs);
+    PipeBarrier<PIPE_V>();
+    Gather(bUb_.Get<uint8_t>(), pairs_.Get<uint8_t>(), pairOffsets_.Get<uint32_t>(), uint32_t(0), kHalfTileBytes);
+    Fence<HardEvent::V_MTE2>();  // release packed/IDs before DMA reuse
   }
 
   __aicore__ inline void CopyHalfToL1(LocalTensor<uint8_t> dst, LocalTensor<uint8_t> src, uint32_t half) {
@@ -168,6 +228,10 @@ class ProjectionKernel {
     uint32_t firstRow = half * kHalf;
     uint32_t rows = HalfRows(m_, firstRow);
     if constexpr (Mode == 2) {
+      // Every possible uint8 tile ID is in bounds. Invalid IDs read a NaN
+      // sentinel, not an uninitialized or out-of-bounds codebook entry.
+      Duplicate(bookUb_.Get<uint32_t>(), uint32_t(0x7f7f7f7f), kMaxTiles * kN / 4);
+      Fence<HardEvent::V_MTE2>();
       DataCopyParams p;
       p.blockCount = tiles_;
       p.blockLen = 1;
@@ -190,14 +254,18 @@ class ProjectionKernel {
       } else {
         LoadNd(dense_, uint64_t(group * kN + half * kHalf) * k_ + start, kHalf, bUb_.Get<uint8_t>(), Mode == 1);
       }
-      Fence<HardEvent::S_MTE3>();
+      // Decode tile k+1 while Cube consumes tile k. L1 cannot be overwritten
+      // until its previous MTE1 read is acknowledged; UB has its own fence.
+      if (start != 0) {
+        CrossCoreWaitFlag<4, PIPE_MTE3>(kRead);
+      }
+      Fence<HardEvent::V_MTE3>();
       CopyHalfToL1(aL1_.Get<uint8_t>(), aUb_.Get<uint8_t>(), half);
       CopyHalfToL1(bL1_.Get<uint8_t>(), bUb_.Get<uint8_t>(), half);
       CrossCoreSetFlag<4, PIPE_MTE3>(kReady);
-      CrossCoreWaitFlag<4, PIPE_MTE3>(kRead);
-      // Drain both the L1 handoff and UB reads before scalar reuse.
-      Fence<HardEvent::MTE3_S>();
+      Fence<HardEvent::MTE3_V>();  // drain UB reads, not the later L1 read
     }
+    CrossCoreWaitFlag<4, PIPE_MTE3>(kRead);  // balance the final acknowledgement
     CrossCoreWaitFlag<4, PIPE_V>(kResult);
     auto result = result_.Get<float>();
     auto out = outUb_.Get<bfloat16_t>();
@@ -276,6 +344,8 @@ class ProjectionKernel {
   TBuf<TPosition::CO1> cL0_;
   TBuf<TPosition::VECIN> result_;
   TBuf<TPosition::VECCALC> nd_, aUb_, bUb_, bookUb_, packedUb_, idsUb_, scaleUb_, biasUb_, outUb_;
+  TBuf<TPosition::VECCALC> ndOffsets_, packedOffsets_, idOffsets_, codeShifts_, idShifts_, pairOffsets_;
+  TBuf<TPosition::VECCALC> codes_, tileValues_, pairs_;
   GlobalTensor<uint8_t> x_, book_, ids_, dense_;
   GlobalTensor<uint32_t> packed_;
   GlobalTensor<float> scale_, bias_;
@@ -298,7 +368,18 @@ VQ2_KERNEL(vq2a8_ascendc_bridge, 1)
 VQ2_KERNEL(vq2a8_ascendc_fused, 2)
 #undef VQ2_KERNEL
 
+extern "C" __global__ __aicore__ void vq2a8_ascendc_grouped(GM_ADDR descriptors, uint32_t jobs, uint32_t groups,
+                                                            uint32_t cores) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  vq2a8_ascendc::ProjectionKernel op;
+  op.InitBuffers();
+  op.ProcessGrouped(descriptors, jobs, groups, cores);
+}
+
 namespace vq2a8_ascendc {
+void LaunchGrouped(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t groups) {
+  vq2a8_ascendc_grouped<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs, groups, blocks);
+}
 void Launch(void* stream, uint32_t blocks, void* x, void* scale, void* bias, void* packed, void* book, void* ids,
             void* dense, void* y, uint32_t m, uint32_t n, uint32_t k, uint32_t tiles, uint32_t mode) {
 #define VQ2_ARGS                                                                                                      \

@@ -54,6 +54,7 @@ BOUNDARY_SHAPES = (
     (1, 32, 65536, 256),
 )
 TIMING_ROWS = (1, 17, 32)
+GROUPED_CASES = ((1, 64, 512), (6, 64, 512), (1, 1056, 1024), (6, 1056, 1024))
 
 
 def library_evidence(library):
@@ -206,6 +207,89 @@ def run_expert(args, device, emit):
                     accepted_hidden = deepseek_v4_swiglu_reference(accepted, limit)
 
 
+def run_grouped(args, device, emit):
+    import torch
+
+    from tools.validate_vq2a8_phase4_kernel import (
+        benchmark,
+        bitwise_equal,
+        compare,
+        prepare_rows,
+        same_fp8_oracle,
+        synthetic_dense_oracle,
+        synthetic_inputs,
+    )
+    from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
+    from vllm_ascend.quantization.vq2a8_ascendc import grouped_projection, vq2a8_ascendc
+
+    preparation = RowwiseVQ2A8Preparation()
+    for jobs, n, k in GROUPED_CASES:
+        key = f"jobs{jobs}:n{n}:k{k}"
+        print(f"ASCENDC_START stage=grouped key={key}", flush=True)
+        requests, packs, dense = [], [], []
+        for index in range(jobs):
+            m, tiles = (1, 2, 15, 16, 17, 32)[index], (1, 3, 32, 256, 3, 32)[index]
+            values = synthetic_inputs(m, n, k, tiles)
+            dense.append(synthetic_dense_oracle(*values[3:]))
+            packs.append(tuple(t.to(device) for t in values[3:]))
+            hidden = ((torch.arange(m * k).reshape(m, k) % 23 - 11) * (index + 1) / 32).bfloat16().to(device)
+            column = torch.arange(k, device=device)
+            payload = {
+                "weight_scale": (column.float() % 7 + index + 1) / 8,
+                "weight_bias": (column.float() % 13 - 6) / 64,
+                "rht_sign": torch.where((column + index) % 3 == 0, -1, 1).to(torch.int8),
+            }
+            requests.append((hidden, payload, SimpleNamespace(columns=k, rht_true_columns=k, rht_block_size=128)))
+        prepared = preparation.many(requests)
+        references = [prepare_rows(*request) for request in requests]
+        if not all(bitwise_equal(a, b) for got, want in zip(prepared, references) for a, b in zip(got, want)):
+            raise AssertionError("Grouped preparation changed row-wise FP8/scale/bias bits.")
+        inputs = [(*a, *b) for a, b in zip(prepared, packs)]
+        separate = [vq2a8_ascendc(*value) for value in inputs]
+        actual = grouped_projection(inputs)
+        comparisons = [
+            compare(same_fp8_oracle(ref, weight), got) for ref, weight, got in zip(references, dense, actual)
+        ]
+        if len(actual) != jobs or not all(bitwise_equal(a, b) for a, b in zip(actual, separate)):
+            raise AssertionError("Grouped projections differ from separate native launches.")
+        for _ in range(3):
+            repeated = grouped_projection(inputs)
+            if not all(bitwise_equal(a, b) for a, b in zip(actual, repeated)):
+                raise AssertionError("Grouped projection repeat mismatch.")
+        reversed_output = grouped_projection(list(reversed(inputs)))
+        if not all(bitwise_equal(a, b) for a, b in zip(actual, reversed(reversed_output))):
+            raise AssertionError("Grouped projection depends on descriptor ordering.")
+        timings = {"grouped": [], "separate": [], "prepare_grouped": [], "prepare_separate": []}
+        calls = {
+            "grouped": lambda inputs=inputs: grouped_projection(inputs),
+            "separate": lambda inputs=inputs: [vq2a8_ascendc(*v) for v in inputs],
+            "prepare_grouped": lambda requests=requests: preparation.many(requests),
+            "prepare_separate": lambda requests=requests: [preparation.rows(*r) for r in requests],
+        }
+        for order in (
+            ("separate", "grouped", "prepare_separate", "prepare_grouped"),
+            ("prepare_grouped", "prepare_separate", "grouped", "separate"),
+        ):
+            for name in order:
+                timings[name].append(benchmark(calls[name], device, args.warmups, args.repeats))
+        emit(
+            key,
+            {
+                "oracle": {"allclose": all(c["allclose"] for c in comparisons), "jobs": comparisons},
+                "repeat_exact": True,
+                "separate_exact": True,
+                "permutation_exact": True,
+                "row_preparation_exact": True,
+                "logical_projections": jobs,
+                "kernel_launches": 1,
+                "descriptor_bytes": jobs * 12 * 8,
+                "grouped_timings": timings,
+                "launch_blocking": False,
+                "timing_scope": "prepared_projections_including_grouped_descriptor_h2d",
+            },
+        )
+
+
 def run_child(args):
     report = {
         "status": "running",
@@ -289,6 +373,10 @@ def run_child(args):
             if args.stage == "timing" and os.environ.get("ASCEND_LAUNCH_BLOCKING") != "0":
                 raise RuntimeError("Timing requires a separate child with ASCEND_LAUNCH_BLOCKING=0.")
             run_expert(args, device, emit)
+        elif args.stage == "grouped":
+            if os.environ.get("ASCEND_LAUNCH_BLOCKING") != "0":
+                raise RuntimeError("Grouped timing requires ASCEND_LAUNCH_BLOCKING=0.")
+            run_grouped(args, device, emit)
         report["status"] = "passed"
         save()
         return 0
@@ -299,6 +387,8 @@ def run_child(args):
 
 
 def expected_keys(stage):
+    if stage == "grouped":
+        return {f"jobs{jobs}:n{n}:k{k}" for jobs, n, k in GROUPED_CASES}
     if stage in ("direct", "bridge"):
         return {f"m{m}" for m in ROWS}
     if stage in ("fused", "boundaries"):
@@ -367,6 +457,7 @@ def evidence_passed(path, stage, digest, probe="0:0"):
             and all(r["independent_chain"]["allclose"] is True for r in rows if stage in ("expert", "timing"))
             and all(r.get("row_preparation_exact") is True for r in rows if stage in ("expert", "timing"))
             and all(timing_evidence_passed(r) for r in rows if stage == "timing")
+            and all(grouped_evidence_passed(r) for r in rows if stage == "grouped")
             and all(
                 evidence[name] is False
                 for name in (
@@ -381,13 +472,47 @@ def evidence_passed(path, stage, digest, probe="0:0"):
         return False
 
 
+def grouped_evidence_passed(record):
+    jobs = int(record["key"].split(":")[0].removeprefix("jobs"))
+    if (
+        record.get("separate_exact") is not True
+        or record.get("permutation_exact") is not True
+        or record.get("row_preparation_exact") is not True
+        or type(record.get("kernel_launches")) is not int
+        or record["kernel_launches"] != 1
+        or type(record.get("logical_projections")) is not int
+        or record.get("logical_projections") != jobs
+        or type(record.get("descriptor_bytes")) is not int
+        or record.get("descriptor_bytes") != jobs * 96
+        or record.get("launch_blocking") is not False
+        or record.get("timing_scope") != "prepared_projections_including_grouped_descriptor_h2d"
+    ):
+        return False
+    for name in ("grouped", "separate", "prepare_grouped", "prepare_separate"):
+        samples = record["grouped_timings"][name]
+        if len(samples) != 2:
+            return False
+        for sample in samples:
+            if type(sample["warmups"]) is not int or type(sample["repeats"]) is not int:
+                return False
+            if sample["warmups"] < 3 or sample["repeats"] < 10:
+                return False
+            for clock in ("event_ms", "wall_ms"):
+                values = [sample[clock][key] for key in ("min", "median", "p95")]
+                if not all(type(v) in (int, float) and math.isfinite(v) and v > 0 for v in values) or values != sorted(
+                    values
+                ):
+                    return False
+    return True
+
+
 def checked_model_preflight(library_path, receipt_path):
-    """Bind both small hardware gates to the library the model worker will load."""
+    """Bind all short hardware gates to the library the model worker will load."""
     library = library_evidence(library_path)
     receipt = json.loads(receipt_path.read_text())
     if receipt.get("status") != "passed" or receipt.get("library_sha256") != library["sha256"]:
         raise ValueError("AscendC model requires a passing same-library short hardware preflight.")
-    for stage in ("fused", "timing"):
+    for stage in ("fused", "grouped", "timing"):
         path = receipt_path.parent / f"{stage}.json"
         if not evidence_passed(path, stage, library["sha256"], "0:0"):
             raise ValueError(f"AscendC model preflight is missing/incomplete: {stage}.")
@@ -400,7 +525,7 @@ def checked_model_preflight(library_path, receipt_path):
 
 
 def run_model_preflight(library_path, model, physical_npu, directory, timeout=600):
-    """28 synthetic + six real expert timing/numerical cases; no simulation."""
+    """28 synthetic + four grouped + six real expert cases; no simulation."""
     from tools.validate_vq2a8_ascendc_suite import run_step
 
     require_hardware_runtime()
@@ -411,9 +536,9 @@ def run_model_preflight(library_path, model, physical_npu, directory, timeout=60
     args = SimpleNamespace(
         library=library_path, model=model, physical_npu=physical_npu, timeout=timeout, warmups=3, repeats=10
     )
-    print(f"ASCENDC_MODEL_PREFLIGHT cases=34 simulator_reruns=0 REPORT={receipt_path}", flush=True)
+    print(f"ASCENDC_MODEL_PREFLIGHT cases=38 simulator_reruns=0 REPORT={receipt_path}", flush=True)
     try:
-        for stage in ("fused", "timing"):
+        for stage in ("fused", "grouped", "timing"):
             receipt_path.write_text(json.dumps(receipt, indent=2) + "\n")
             step = {"id": stage, "stage": stage, "probe": "0:0"}
             result = run_step(args, step, directory, library["sha256"])
@@ -527,7 +652,9 @@ def main():
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument(
-        "--stage", choices=("direct", "bridge", "fused", "boundaries", "expert", "timing"), help=argparse.SUPPRESS
+        "--stage",
+        choices=("direct", "bridge", "fused", "boundaries", "expert", "timing", "grouped"),
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()

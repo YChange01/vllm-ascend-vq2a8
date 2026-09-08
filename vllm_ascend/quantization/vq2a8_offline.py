@@ -412,13 +412,16 @@ def validate_offline_evidence(
                 if (
                     any(
                         type(step.get(k)) is not int
-                        for k in ("tokens", "projection_calls", "projection_rows", "expert_calls")
+                        for k in ("tokens", "projection_calls", "projection_rows", "expert_calls", "kernel_launches")
                     )
                     or step["tokens"] != expected["tokens"]
                     or step["expert_calls"] < 1
                     or step["projection_calls"] != 2 * step["expert_calls"]
                     or step["projection_rows"] < 2 * step["tokens"]
                     or step["projection_rows"] % 2
+                    or not 2 <= step["kernel_launches"] <= step["projection_calls"]
+                    or step["projection_calls"] > 6 * step["kernel_launches"]
+                    or step["kernel_launches"] % 2
                 ):
                     raise ValueError("AscendC gate/up and down coverage is incomplete for a real model step.")
     calls = {int(index): count for index, count in evidence["cache"]["layer_calls"].items()}

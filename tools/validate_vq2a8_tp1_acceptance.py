@@ -106,6 +106,21 @@ def format_compact_summary(summary: dict[str, Any]) -> str:
                     f"ASCENDC_MODEL_EXECUTION_VERIFIED={executed} "
                     f"LIBRARY_SHA256={library.get('sha256', 'unknown')}"
                 )
+                layers = latest.get("expert_backend", {}).get("layers", [])
+                if executed and layers:
+                    for index, _ in enumerate(layers[0].get("steps", [])):
+                        if any(index >= len(layer.get("steps", [])) for layer in layers):
+                            break
+                        steps = [layer["steps"][index] for layer in layers]
+                        if all(
+                            all(type(step.get(key)) is int for key in ("kernel_launches", "tokens", "projection_calls"))
+                            for step in steps
+                        ):
+                            lines.append(
+                                f"NATIVE_DISPATCH step={index} tokens={steps[0]['tokens']} "
+                                f"logical_projections={sum(step['projection_calls'] for step in steps)} "
+                                f"kernel_launches={sum(step['kernel_launches'] for step in steps)}"
+                            )
             lines.append(
                 f"PROBE={result.get('probe', '?')} {'PASS' if result.get('passed') is True else 'FAIL'} "
                 f"runs={len(runs)} layers={latest.get('layers_executed', '?')} "

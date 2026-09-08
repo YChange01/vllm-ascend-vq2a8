@@ -317,12 +317,15 @@ def test_native_trace_reset_excludes_profile_and_preserves_cache(monkeypatch):
         self.native_calls += 2
         self.native_rows += 2 * len(hidden)
         self.native_experts += 1
+        self.native_launches += 2
         return hidden
 
     monkeypatch.setattr(execution.CachedVQ2TP1MoE, "forward", forward)
     hidden = torch.zeros(3, 4)
     assert runtime.forward(hidden) is hidden
-    assert runtime.native_steps == [{"tokens": 3, "projection_calls": 2, "projection_rows": 6, "expert_calls": 1}]
+    assert runtime.native_steps == [
+        {"tokens": 3, "projection_calls": 2, "projection_rows": 6, "expert_calls": 1, "kernel_launches": 2}
+    ]
     runtime.reset_native_trace()
     assert runtime.native_steps == [] and runtime.native_calls == 0
     assert runtime._cache == {0: "packed"}
@@ -330,7 +333,9 @@ def test_native_trace_reset_excludes_profile_and_preserves_cache(monkeypatch):
 
 @pytest.mark.parametrize("hashed", [True, False])
 @pytest.mark.parametrize("verbose_experts", [False, True])
-def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monkeypatch, hashed, verbose_experts):
+def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(
+    monkeypatch, capsys, hashed, verbose_experts
+):
     """Real scheduler/preparation/SwiGLU with a CPU projection stand-in, not NPU evidence."""
     monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
 
@@ -339,7 +344,11 @@ def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monk
         return torch.cat((value, value / 2), dim=1) if packed == "gate_up" else value
 
     monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_triton", NS(vq2a8_tp1_m1_packed_gemm=projection))
-    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(vq2a8_ascendc=projection))
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm_ascend.quantization.vq2a8_ascendc",
+        NS(vq2a8_ascendc=projection, grouped_projection=lambda inputs: [projection(*args) for args in inputs]),
+    )
     baseline = cache_only_runtime()
     candidate = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
     candidate.__dict__.update(cache_only_runtime().__dict__)
@@ -375,13 +384,126 @@ def test_native_policy_preserves_full_routed_chain_and_shared_scale_on_host(monk
     hidden = ((torch.arange(3 * 512).reshape(3, 512) % 11 - 5) / 16).bfloat16()
     ids = torch.tensor([0, 1, 0])
     expected = baseline.forward(hidden, ids)
+    capsys.readouterr()
     actual = candidate.forward(hidden, ids)
+    output = capsys.readouterr().out
+    assert ("stage=expert_group_start" in output) is verbose_experts
+    assert ("stage=expert_group_done" in output) is verbose_experts
+    assert "MODEL_MOE_TIMING" in output
     assert torch.equal(actual, expected)
     assert candidate.cache_loads == 0  # existing packed residency reused
     step = candidate.native_steps[0]
     assert step["projection_calls"] == 2 * step["expert_calls"]
     assert step["projection_rows"] == (8 if hashed else 12)
     assert step["tokens"] == 3
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 6, 12])
+@pytest.mark.parametrize("tokens", [1, 5])
+def test_grouped_scheduler_preserves_duplicate_slots_and_bounds_pinned_payloads(monkeypatch, capacity, tokens):
+    """Exercise real preparation/activation/mixer; native calls are CPU stand-ins."""
+    monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
+    launches = []
+
+    def projection(q, scale, bias, packed, book, ids):
+        kind, index = packed
+        value = (q.float() * scale[:, None] + bias[:, None] + index / 16).bfloat16()
+        return torch.cat((value, value / 2), dim=1) if kind == "gate_up" else value
+
+    def single(*args):
+        launches.append(1)
+        return projection(*args)
+
+    def grouped(inputs):
+        launches.append(len(inputs))
+        assert 2 <= len(inputs) <= min(6, capacity)
+        return [projection(*values) for values in inputs]
+
+    monkeypatch.setitem(
+        sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(vq2a8_ascendc=single, grouped_projection=grouped)
+    )
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.__dict__.update(cache_only_runtime(limit=capacity).__dict__)
+    runtime.layer = NS(expert_ids=tuple(range(12)))
+    runtime.reset_native_trace()
+    runtime.device = NS(type="npu")
+    runtime.token_chunk = 2
+    runtime.config = NS(routed_scale=1.5, swiglu_limit=None, num_shared=1)
+    runtime.shared = lambda hidden: hidden / 8
+    hidden = ((torch.arange(tokens * 512).reshape(tokens, 512) % 17 - 8) / 16).bfloat16()
+    # Two duplicate slots in each token must not disappear from the reduction.
+    ids = torch.tensor([[((row * 5 + i) % 12) for i in (0, 1, 2, 2, 3, 4, 5, 5)] for row in range(tokens)])
+    weights = (torch.arange(tokens * 8).reshape(tokens, 8).float() % 7 + 1) / 32
+    runtime.route = lambda h, inputs: (weights, ids)
+    loaded = []
+
+    def get_expert(index):
+        loaded.append(index)
+        if index not in runtime._cache:
+            if len(runtime._cache) == capacity:
+                runtime._cache.popitem(last=False)
+            runtime._cache[index] = {
+                kind: (
+                    {
+                        "weight_scale": torch.full((512,), 1 + index / 32),
+                        "weight_bias": torch.zeros(512),
+                        "rht_sign": torch.ones(512, dtype=torch.int8),
+                        "packed_indices": (kind, index),
+                        "codebooks": None,
+                        "codebook_tile_ids": None,
+                    },
+                    NS(columns=512, rht_true_columns=512, rht_block_size=128),
+                )
+                for kind in ("gate_up", "down")
+            }
+        runtime._cache.move_to_end(index)
+        return runtime._cache[index]
+
+    runtime._get_expert = get_expert
+    # Accepted per-expert schedule with the same native projection stand-in.
+    expected = execution.VQ2TP1MoE.forward(runtime, hidden)
+    expected_order = list(loaded)
+    runtime.reset_native_trace()
+    launches.clear()
+    loaded.clear()
+    actual = runtime.forward(hidden)
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert loaded == expected_order
+    assert len(runtime._cache) <= capacity
+    record = runtime.native_steps[0]
+    assert record["projection_calls"] == 2 * len(loaded) == sum(launches)
+    assert record["kernel_launches"] == len(launches)
+    if tokens == 1 and capacity >= 6:
+        assert record["projection_calls"] == 12 and record["kernel_launches"] == 2
+    if capacity == 1:
+        assert record["kernel_launches"] == record["projection_calls"]
+
+
+def test_grouped_projection_failure_cannot_count_as_completed_work(monkeypatch):
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.__dict__.update(cache_only_runtime().__dict__)
+    runtime.reset_native_trace()
+    runtime.device = NS(type="npu")
+    monkeypatch.setattr(execution, "synchronize_execution", lambda device: None)
+    runtime._row_preparation = NS(many=lambda requests: [(None, None, None)] * len(requests))
+    payload = dict.fromkeys(("packed_indices", "codebooks", "codebook_tile_ids"))
+
+    def failure(inputs):
+        raise RuntimeError("device failure")
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend.quantization.vq2a8_ascendc", NS(grouped_projection=failure))
+    with pytest.raises(RuntimeError, match="device failure"):
+        runtime._projections_many([(torch.zeros(1, 512), payload, None)] * 2)
+    assert runtime.native_calls == runtime.native_rows == runtime.native_experts == runtime.native_launches == 0
+
+
+def test_grouped_schedule_rejects_missing_expert_before_any_projection():
+    runtime = execution.AscendCVQ2TP1MoE.__new__(execution.AscendCVQ2TP1MoE)
+    runtime.layer = NS(expert_ids=(0, 1))
+    runtime.token_chunk = 2
+    runtime.route = lambda hidden, inputs: (torch.ones(1, 2), torch.tensor([[0, 2]]))
+    with pytest.raises(ValueError, match="Router selected experts missing"):
+        runtime._forward(torch.zeros(1, 512), None)
 
 
 def test_owner_configures_actual_layer_limits_before_any_expert_is_loaded(monkeypatch):

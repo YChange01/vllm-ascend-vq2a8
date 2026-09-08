@@ -64,3 +64,13 @@ def vq2a8_ascendc(activation, activation_scale, bias_correction, packed_indices,
 def cube_control(activation, synthetic_weight, *, bridge=False):
     _require_loaded()
     return torch.ops.vq2a8_ascendc.cube_control(activation, synthetic_weight, bridge)
+
+
+def grouped_projection(inputs):
+    """One native launch for <=6 same-N/K projections; no Python fallback."""
+    _require_loaded()
+    if not hasattr(torch.ops.vq2a8_ascendc, "grouped_projection"):
+        raise RuntimeError("Rebuild the standalone AscendC library for grouped_projection.")
+    if not 1 <= len(inputs) <= 6 or any(len(value) != 6 for value in inputs):
+        raise ValueError("Grouped projection expects 1..6 six-tensor inputs.")
+    return torch.ops.vq2a8_ascendc.grouped_projection(*(list(values) for values in zip(*inputs)))

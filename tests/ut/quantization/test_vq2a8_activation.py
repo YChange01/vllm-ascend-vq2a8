@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace as NS
+
 import pytest
 import torch
 
@@ -90,3 +92,88 @@ def test_one_host_validity_decision_and_no_batch_geometry_change(monkeypatch):
     values[0] = values[0].repeat(2, 1)
     with pytest.raises(ValueError, match="exactly one"):
         RowwiseVQ2A8Preparation()(*values, 128)
+
+
+def requests(count=6, width=512, true_width=512):
+    result = []
+    for i in range(count):
+        x, scale, bias, sign = inputs(width)
+        hidden = torch.cat([x[:, :true_width] * (i + j + 1) / 8 for j in range((1, 2, 15, 16, 17, 32)[i])])
+        result.append(
+            (
+                hidden,
+                {"weight_scale": scale * (i + 1), "weight_bias": bias, "rht_sign": sign},
+                NS(columns=width, rht_true_columns=true_width, rht_block_size=128),
+            )
+        )
+    return result
+
+
+@pytest.mark.parametrize("width,true_width", [(512, 512), (512, 480), (2048, 2048), (4096, 4000)])
+@pytest.mark.parametrize("case", ["normal", "zero", "impulse", "small"])
+def test_grouped_preparation_exact_for_distinct_experts_and_mixed_rows(width, true_width, case):
+    batch = requests(width=width, true_width=true_width)
+    for hidden, _, _ in batch:
+        if case in ("zero", "impulse"):
+            hidden.zero_()
+        if case == "impulse":
+            hidden[:, -1] = -2
+        if case == "small":
+            hidden *= 1e-7
+    prepare = RowwiseVQ2A8Preparation()
+    expected = [prepare.rows(*request) for request in batch]
+    for order in (batch, batch, list(reversed(batch))):
+        got = prepare.many(order)
+        want = list(reversed(expected)) if order is not batch else expected
+        for actual, reference in zip(got, want):
+            for a, b in zip(actual, reference):
+                assert a.is_contiguous() and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@pytest.mark.parametrize("field", ["hidden", "weight_scale", "weight_bias", "rht_sign"])
+def test_grouped_input_value_validation_not_cached(field):
+    batch = requests()
+    prepare = RowwiseVQ2A8Preparation()
+    prepare.many(batch)
+    tensor = batch[-1][0] if field == "hidden" else batch[-1][1][field]
+    tensor.view(-1)[-1] = 0 if field == "rht_sign" else float("nan")
+    with pytest.raises(ValueError, match="Invalid activation"):
+        prepare.many(batch)
+
+
+def test_grouped_validation_one_decision_and_reference_matmul_shapes(monkeypatch):
+    batch = requests(count=2)
+    decisions, shapes = [], []
+    old_bool, old_matmul = torch.Tensor.__bool__, torch.Tensor.__matmul__
+
+    def boolean(t):
+        decisions.append(t.numel())
+        return old_bool(t)
+
+    def matmul(a, b):
+        shapes.append((tuple(a.shape), tuple(b.shape)))
+        return old_matmul(a, b)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", boolean)
+    monkeypatch.setattr(torch.Tensor, "__matmul__", matmul)
+    RowwiseVQ2A8Preparation().many(batch)
+    assert decisions == [1]
+    assert shapes == [((1, 4, 128), (128, 128))] * 3 + [((1, 512), (512,))] * 3
+
+
+@pytest.mark.parametrize("bad", ["empty", "too_many", "m0", "m33", "width", "sign_dtype", "block"])
+def test_grouped_metadata_fails_before_compute(bad):
+    batch = requests(count=2)
+    if bad == "empty":
+        batch = []
+    elif bad == "too_many":
+        batch = batch * 4
+    elif bad in ("m0", "m33", "width"):
+        x = torch.zeros(0 if bad == "m0" else 33 if bad == "m33" else 1, 500 if bad == "width" else 512)
+        batch[-1] = (x, *batch[-1][1:])
+    elif bad == "sign_dtype":
+        batch[-1][1]["rht_sign"] = batch[-1][1]["rht_sign"].float()
+    elif bad == "block":
+        batch[-1][2].rht_block_size = 3
+    with pytest.raises(ValueError):
+        RowwiseVQ2A8Preparation().many(batch)

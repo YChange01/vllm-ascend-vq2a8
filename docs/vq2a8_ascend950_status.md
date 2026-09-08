@@ -2403,3 +2403,98 @@ threads). This is a CPU-only microbenchmark, not a measurement of the user's
 Changed-file Ruff, Markdown and spelling checks pass; the full
 `bash format.sh ci` hook runner remains unavailable because local
 `pre-commit` is not installed.
+
+### 198 opt1 acceptance and grouped/vector opt2 candidate
+
+The user reported opt1 PASS at code
+`9f3e46bbaa4aead53f5e1a3aedab05282c648b02`, report
+`/tmp/vq2a8-acceptance-tleb7p9m`, on **Ascend950PR_958b** (physical NPU 0).
+The library `build/vq2a8-ascendc-opt1-198/libvq2a8_ascendc.so` has SHA256
+`665d90f9e8e9fba5e58ee2fb01735d969f4857fd4cf64e103c3a11d06fe3cda2`.
+Both short 43-layer model runs matched the prior AscendC baseline's tokens
+and logits exactly. Last decode was 1.755 s; second-run generation was
+19.346 s, versus 59.501 s in the prior report. Cumulative preparation was
+27.514 s and packed projection 38.430 s across recorded completed calls.
+These totals include multiple phases/runs, not just a decode token.
+Peak allocated/reserved memory was 24.862/25.020 GiB with lazy packed caching.
+This is offline regression evidence, not independent quality or serving acceptance.
+
+Opt2 addresses the remaining preparation, dispatch and device-decode work:
+
+- Preparation batches pointwise operations, reductions and input validation
+  across at most six same-width expert requests (at most 32 rows each).
+  It retains one-row RHT and bias GEMV geometry and all original input checks.
+  Validation decisions are never cached. Temporary activation/metadata
+  tensors are bounded; no decoded expert weights are cached or copied.
+- The AscendC policy groups up to six gate/up projections into one native
+  launch, applies the unchanged SwiGLU per expert, then groups their down
+  projections into a second launch. A maximum 576-byte descriptor transfers
+  pointers/dimensions, not weights. This transfer is included in timing.
+  Group size is capped by the existing per-layer cache limit. The reference
+  router, duplicate route slots, reduction order, shared experts and original
+  token chunk are unchanged. Missing experts fail before any projection.
+  Group start/done diagnostics are quiet by default and enabled only with
+  `--verbose-experts`; layer/forward timings and errors remain visible.
+- The new `vq2a8_ascendc_grouped` kernel distributes `(expert, N-tile)` work
+  across paired Cube/vector cores. Logical projection counts are retained
+  separately from `kernel_launches`. For the reported decode route (three
+  single-expert layers plus forty six-expert layers), the schedule is
+  **486 logical projections in 86 native launches**, provided cache limits
+  allow six jobs. This is a host-tested scheduling count, not a measured
+  speedup or a claim that routing/preparation needs no other kernels.
+- Weight decode uses vector shifts, masks and UB Gather operations for packed
+  nibbles, tile IDs, codebook pairs and NZ ordering. Activation ND-to-NZ also
+  uses Gather. Constant index tables are initialized once per core/launch;
+  the decode K-loop no longer uses scalar `GetValue`/`SetValue`. Invalid tile
+  IDs read in-bounds NaN sentinel bytes. Source-level decoded weight tiles
+  stay in UB/L1; Cube still consumes E4M3 operands and accumulates in the
+  original K order. Complete binary/on-chip forensic acceptance remains open.
+- A bounded one-tile look-ahead allows the vector core to prepare the next
+  UB tile while Cube consumes the current tile. L1 remains single-buffered:
+  its prior read acknowledgment is required before overwrite, and UB DMA
+  reads are fenced before reuse. Final read/result/store flags are drained
+  for every output tile. Event IDs remain owned by TPipe; no fixed hard-event
+  ID is introduced. Overlap and synchronization still require NPU validation.
+
+The implementation follows the documented byte-offset, separate-buffer and
+A5 dtype constraints of
+[AscendC Gather](https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/scatter_gather/Gather.html)
+and the signed shift-count tensor overload of
+[AscendC ShiftRight](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta2/API/ascendcopapi/atlasascendc_api_07_00252.html).
+Host tests exercise the same offset helpers, all FP8 byte encodings, packed
+nibbles/tile IDs, invalid-ID sentinels, row halves and flattened job ownership.
+They do not execute AscendC instructions or establish device synchronization.
+
+The existing model acceptance command now runs **38 short cases** before
+loading the model: 28 fused cases, four grouped cases and six real-expert
+timing cases. Grouped cases cover 1/6 jobs, mixed M=1/2/15/16/17/32, varying
+codebook sizes, K=512/1024 and N=64/1056 (including work crossing a core wave).
+They require exact preparation versus the unchanged row reference, exact
+grouped/separate native outputs, repeat and reversed-job agreement, plus an
+FP64 oracle comparison. Alternating-order timings record preparation and
+projection separately with three warmups and ten repeats. Missing grouped
+evidence or an old library without the grouped operator fails before loading.
+No long simulator run or exhaustive expert enumeration is requested.
+
+Keep the opt1 library, build manifest and report intact. Build only the
+standalone opt2 library and run the preflight plus two full-model A/B runs:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8 &&
+git pull --ff-only &&
+/usr/local/python3.11.10/bin/python3 -u tools/build_vq2a8_ascendc.py --soc Ascend950PR_958b --build-dir build/vq2a8-ascendc-opt2-198 &&
+/usr/local/python3.11.10/bin/python3 -u tools/validate_vq2a8_tp1_acceptance.py --stage model --execution-policy ascendc --ascendc-library build/vq2a8-ascendc-opt2-198/libvq2a8_ascendc.so --model /home/g00872988/DeepSeek-V4-Flash-VQ2A8-32x256 --physical-npu 0 --baseline-report /tmp/vq2a8-acceptance-tleb7p9m
+```
+
+Review `ACCEPTANCE=PASS`, `BASELINE_EXACT=PASS`, `NATIVE_DISPATCH`, preparation
+and projection totals, decode/generation times and peak memory together.
+Native compile, bit-exact NPU regression and opt2 performance are **pending**;
+no quality, serving or new native-instruction verification flag is promoted.
+
+All **1058 VQ2A8 host tests pass** (21.00 s on the Linux development host),
+including preparation bit preservation, duplicate-slot routing, cache-limited
+group scheduling, launch-count evidence, grouped-preflight failure handling
+and shared C++ indexing/event-ownership tests. Changed-file Ruff, Markdown,
+spelling and C++ formatting checks pass. `bash format.sh ci` was attempted
+but its full hook runner is unavailable because `pre-commit` is not installed.
+These are development-host results, not an AscendC compile or NPU benchmark.
