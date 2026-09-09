@@ -1,0 +1,131 @@
+{
+  "status": "passed",
+  "scope": "cpu_layout_bytes_only",
+  "checkpoint_modified": false,
+  "kernel_compiled": false,
+  "device_execution_verified": false,
+  "model_accuracy_verified": false,
+  "drop_in_replacement_ready": false,
+  "files": [
+    {
+      "path": "D:\\projects\\2-bits\\models\\vp2a8\\experts_vq_ascend_v2\\tp1\\rank0\\experts_vq_layer_3.safetensors",
+      "status": "passed",
+      "matrices": [
+        {
+          "prefix": "gate_up",
+          "expert_index": 0,
+          "source_layout": "batched_projection",
+          "status": "passed",
+          "contract": {
+            "scope": "cpu_layout_contract_only",
+            "n": 4096,
+            "k": 4096,
+            "mixed_k256_blocks": 16,
+            "total_k256_blocks": 16,
+            "max_codebooks_per_k256": 16,
+            "tile_populations": [
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256
+            ],
+            "stable_grouping_can_form_k256": true,
+            "packed_bytes_preserved": true,
+            "original_host_shape_supported": true,
+            "fixed_k256_lut_compatible_without_k_reorder": false,
+            "fp32_row_scale_bias_epilogue_required": true,
+            "drop_in_replacement_ready": false,
+            "device_execution_verified": false
+          },
+          "modes": {
+            "preserve": {
+              "status": "passed",
+              "codes_exact": true,
+              "weight_bytes_exact": true,
+              "source_order_roundtrip_exact": true,
+              "k_reordered": false,
+              "fixed_k256_lut_available": false,
+              "packed_bytes": 4194304,
+              "decoded_weight_bytes_checked": 16777216
+            },
+            "codebook": {
+              "status": "passed",
+              "codes_exact": true,
+              "weight_bytes_exact": true,
+              "source_order_roundtrip_exact": true,
+              "k_reordered": true,
+              "fixed_k256_lut_available": true,
+              "packed_bytes": 4194304,
+              "decoded_weight_bytes_checked": 16777216
+            }
+          }
+        },
+        {
+          "prefix": "down",
+          "expert_index": 0,
+          "source_layout": "batched_projection",
+          "status": "passed",
+          "contract": {
+            "scope": "cpu_layout_contract_only",
+            "n": 4096,
+            "k": 2048,
+            "mixed_k256_blocks": 8,
+            "total_k256_blocks": 8,
+            "max_codebooks_per_k256": 8,
+            "tile_populations": [
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256,
+              256
+            ],
+            "stable_grouping_can_form_k256": true,
+            "packed_bytes_preserved": true,
+            "original_host_shape_supported": true,
+            "fixed_k256_lut_compatible_without_k_reorder": false,
+            "fp32_row_scale_bias_epilogue_required": true,
+            "drop_in_replacement_ready": false,
+            "device_execution_verified": false
+          },
+          "modes": {
+            "preserve": {
+              "status": "passed",
+              "codes_exact": true,
+              "weight_bytes_exact": true,
+              "source_order_roundtrip_exact": true,
+              "k_reordered": false,
+              "fixed_k256_lut_available": false,
+              "packed_bytes": 2097152,
+              "decoded_weight_bytes_checked": 8388608
+            },
+            "codebook": {
+              "status": "passed",
+              "codes_exact": true,
+              "weight_bytes_exact": true,
+              "source_order_roundtrip_exact": true,
+              "k_reordered": true,
+              "fixed_k256_lut_available": true,
+              "packed_bytes": 2097152,
+              "decoded_weight_bytes_checked": 8388608
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

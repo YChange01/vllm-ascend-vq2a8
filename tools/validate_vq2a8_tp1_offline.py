@@ -37,6 +37,10 @@ def capture_worker_trace(worker):
     return worker.get_model().offline_evidence()
 
 
+def configure_v2_worker(worker, preset):
+    return worker.get_model().configure_performance_probe(measurement=False, compact=False, optimization=preset)
+
+
 def single_worker_result(results):
     if len(results) != 1:
         raise ValueError("The offline gate requires exactly one worker result.")
@@ -53,9 +57,12 @@ def main() -> None:
     parser.add_argument("--audit-model", action="store_true")
     parser.add_argument("--verify-tensor-hashes", action="store_true")
     parser.add_argument("--verbose-experts", action="store_true", help="Print per-expert load/execution diagnostics.")
-    parser.add_argument("--execution-policy", choices=["baseline", "cached", "ascendc"], default="cached")
+    parser.add_argument("--execution-policy", choices=["baseline", "cached", "ascendc", "ascendc_v2"], default="cached")
     parser.add_argument("--ascendc-library", type=Path)
     parser.add_argument("--ascendc-preflight", type=Path)
+    parser.add_argument("--ascendc-v2-library", type=Path)
+    parser.add_argument("--ascendc-v2-preflight", type=Path)
+    parser.add_argument("--ascendc-v2-preset", choices=["fast", "batched"], default=None)
     parser.add_argument("--root-linear-mode", choices=["bf16", "online_fp8_sm90"], default="bf16")
     parser.add_argument("--cache-budget-gib", type=float, default=0.0, help="0: auto budget after root loading.")
     parser.add_argument(
@@ -67,6 +74,13 @@ def main() -> None:
             parser.error("AscendC requires --ascendc-library and the short --ascendc-preflight receipt.")
     elif args.ascendc_library or args.ascendc_preflight:
         parser.error("Native library/preflight options require execution-policy ascendc.")
+    if args.execution_policy == "ascendc_v2":
+        if args.ascendc_v2_library is None or args.ascendc_v2_preflight is None:
+            parser.error("V2 requires --ascendc-v2-library and --ascendc-v2-preflight.")
+        if args.root_linear_mode != "bf16":
+            parser.error("V2 bring-up requires BF16 roots.")
+    elif args.ascendc_v2_library or args.ascendc_v2_preflight or args.ascendc_v2_preset:
+        parser.error("V2 options require explicit execution-policy ascendc_v2.")
     from tools.validate_vq2a8_v026_environment import check_scheduler_apis, require_v026_stack
 
     print("MODEL_V026_ENVIRONMENT " + json.dumps(require_v026_stack()), flush=True)
@@ -82,6 +96,15 @@ def main() -> None:
         require_hardware_runtime()
         native_library = checked_model_preflight(args.ascendc_library, args.ascendc_preflight)
         print("MODEL_ASCENDC_LIBRARY " + json.dumps(native_library), flush=True)
+    elif args.execution_policy == "ascendc_v2":
+        from tools.validate_vq2a8_ascendc import require_hardware_runtime
+        from tools.validate_vq2a8_ascendc_v2 import checked_model_preflight
+
+        require_hardware_runtime()
+        if artifact_root != model_root / "experts_vq_ascend_v2":
+            raise ValueError("V2 preflight and model must use the same canonical artifact.")
+        native_library = checked_model_preflight(args.ascendc_v2_library, args.ascendc_v2_preflight, model_root)
+        print("MODEL_ASCENDC_V2_LIBRARY " + json.dumps(native_library), flush=True)
     # Existing vLLM diagnostic control: the single worker stays in this
     # supervised process. A timeout/abort must not leave an EngineCore orphan.
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
@@ -167,8 +190,10 @@ def main() -> None:
         cache_budget_gib=args.cache_budget_gib,
         cache_reserve_gib=args.cache_reserve_gib,
         root_linear_mode=args.root_linear_mode,
-        ascendc_library=native_library["path"] if native_library else None,
-        ascendc_sha256=native_library["sha256"] if native_library else None,
+        ascendc_library=native_library["path"] if args.execution_policy == "ascendc" else None,
+        ascendc_sha256=native_library["sha256"] if args.execution_policy == "ascendc" else None,
+        ascendc_v2_library=native_library["path"] if args.execution_policy == "ascendc_v2" else None,
+        ascendc_v2_sha256=native_library["sha256"] if args.execution_policy == "ascendc_v2" else None,
         verbose_experts=args.verbose_experts,
     )
     missing = set(options) - set(inspect.signature(EngineArgs).parameters)
@@ -178,6 +203,8 @@ def main() -> None:
     print("MODEL stage=construct_load_profile_kv_cache", flush=True)
     engine_start = time.perf_counter()
     llm = LLM(**options)
+    if args.ascendc_v2_preset is not None:
+        single_worker_result(llm.collective_rpc(configure_v2_worker, args=(args.ascendc_v2_preset,)))
     print("MODEL stage=engine_ready", flush=True)
     print(
         "MODEL_STARTUP_TIMING "
@@ -219,6 +246,7 @@ def main() -> None:
             config["vocab_size"],
             execution_policy=args.execution_policy,
             ascendc_sha256=native_library["sha256"] if native_library else None,
+            ascendc_v2_sha256=native_library["sha256"] if args.execution_policy == "ascendc_v2" else None,
         )
         logits = evidence["logits"]
         path = output / f"run-{run}-logits.safetensors"
@@ -280,6 +308,7 @@ def main() -> None:
                 "offline_execution_verified": True,
                 "expert_execution_policy": args.execution_policy,
                 "ascendc_model_execution_verified": args.execution_policy == "ascendc",
+                "ascendc_v2_model_execution_verified": args.execution_policy == "ascendc_v2",
                 "on_chip_decode_verified": False,
                 "logits_reference_verified": False,
                 "quality_verified": False,

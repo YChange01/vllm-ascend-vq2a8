@@ -1,0 +1,247 @@
+// Internal expert reference, restored from damaged chat text. See README.md.
+// RegTensor template parameters below are INFERRED, not verified original source.
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+#include "kernel_operator.h"
+#include "kernel_tensor.h"
+#include "mat_fp4_tiling.h"
+using namespace AscendC;
+using namespace MicroAPI;
+#ifdef __DAV_C310_VEC__
+class MatFP4 {
+private:
+    __aicore__ inline void init_spr() {
+        set_atomic_none(); set_pcie_wr_ctrl(0); set_pcie_rd_ctrl(0);
+    }
+    // One LUT per K256xN32; retain one padding row per K1 to avoid UB bank conflict.
+    __aicore__ inline void run_lut(__ubuf__ void *a, __ubuf__ void *table, __ubuf__ void *out,
+                                  uint16_t n1_blocks, uint16_t k1_blocks) {
+        constexpr uint16_t kK0 = 16;
+        constexpr uint16_t kPackedN0Bytes = 8;
+        constexpr uint16_t kK1BlocksPerLut = 16;
+        constexpr uint16_t kPackedBytesPerRepeat = 64;
+        constexpr uint16_t kDecodedBytesPerRepeat = 256;
+        constexpr uint16_t kRepeatsPerK1 = 2;
+        constexpr uint16_t kBankStrideRows = 1;
+        __VEC_SCOPE__ {
+            MaskReg mask_all32 = CreateMask<uint32_t, MaskPattern::ALL>();
+            MaskReg mask_all8 = CreateMask<uint8_t, MaskPattern::ALL>();
+            // RESTORATION INFERENCE: types erased by chat formatting; confirm with author.
+            RegTensor<uint16_t> reg_table;
+            RegTensor<uint32_t> reg_packed_w32, reg_high_nibble, reg_high_index, reg_index_word;
+            RegTensor<uint32_t> reg_index_mask, reg_shift_right4, reg_shift_left16;
+            RegTensor<uint16_t> reg_value;
+            Duplicate(reg_shift_right4, static_cast<uint32_t>(4), mask_all32);
+            Duplicate(reg_shift_left16, static_cast<uint32_t>(16), mask_all32);
+            Duplicate(reg_index_mask, static_cast<uint32_t>(0x000F000F), mask_all32);
+            for (uint16_t n1 = 0; n1 < n1_blocks; ++n1) {
+                for (uint16_t lut_k = 0; lut_k < k1_blocks / kK1BlocksPerLut; ++lut_k) {
+                    const uint16_t table_index = lut_k * n1_blocks + n1;
+                    DataCopy(reg_table, (__ubuf__ uint16_t *)table + table_index * 16);
+                    for (uint16_t local_k1 = 0; local_k1 < kK1BlocksPerLut; ++local_k1) {
+                        const uint16_t k1 = lut_k * kK1BlocksPerLut + local_k1;
+                        const uint64_t packed_k1_offset =
+                            (static_cast<uint64_t>(n1) * k1_blocks + k1) * kK0 * kPackedN0Bytes;
+                        const uint64_t output_k1_offset =
+                            (static_cast<uint64_t>(n1) * k1_blocks + k1) * (kK0 + kBankStrideRows) * 32;
+                        for (uint16_t repeat = 0; repeat < kRepeatsPerK1; ++repeat) {
+                            DataCopy<uint32_t, MicroAPI::LoadDist::DIST_UNPACK4_B8>(
+                                reg_packed_w32, (__ubuf__ uint32_t *)a +
+                                (packed_k1_offset + repeat * kPackedBytesPerRepeat) / sizeof(uint32_t));
+                            ShiftRight(reg_high_nibble, reg_packed_w32, reg_shift_right4, mask_all32);
+                            ShiftLeft(reg_high_index, reg_high_nibble, reg_shift_left16, mask_all32);
+                            Or(reg_index_word, reg_packed_w32, reg_high_index, mask_all32);
+                            And(reg_index_word, reg_index_word, reg_index_mask, mask_all32);
+                            Gather(reg_value, reg_table, (RegTensor<uint16_t> &)reg_index_word);
+                            DataCopy((__ubuf__ uint8_t *)out + output_k1_offset + repeat * kDecodedBytesPerRepeat,
+                                     (RegTensor<uint8_t> &)reg_value, mask_all8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    __aicore__ inline void gm_ub(__ubuf__ void *ub, __gm__ void *gm, uint64_t burst_count,
+                                uint64_t burst_bytes, uint64_t destination_stride, uint64_t source_stride) {
+        uint64_t cfg0 = 0;
+        cfg0 |= burst_count << 4;
+        cfg0 |= burst_bytes << 25;
+        uint64_t cfg1 = source_stride;
+        cfg1 |= destination_stride << 40;
+        uint64_t loop_size = 1;
+        loop_size |= static_cast<uint64_t>(1) << 21;
+        set_loop_size_outtoub(loop_size);
+        set_loop1_stride_outtoub(0); set_loop2_stride_outtoub(0);
+        copy_gm_to_ubuf_align_v2((__ubuf__ float *)ub, (__gm__ float *)gm, cfg0, cfg1);
+    }
+    __aicore__ inline void ub_l1(__cbuf__ void *l1, __ubuf__ void *ub, uint64_t burst_count,
+                                uint64_t burst_length, uint64_t destination_stride, uint64_t source_stride) {
+        uint64_t cfg = 0;
+        cfg |= burst_count << 4;
+        cfg |= burst_length << 16;
+        cfg |= source_stride << 32;
+        cfg |= destination_stride << 48;
+        // Transcription repaired original malformed **cbuf*_ token only.
+        copy_ubuf_to_cbuf((__cbuf__ uint8_t *)l1, (__ubuf__ uint8_t *)ub, cfg);
+    }
+    __aicore__ inline void InitBuffer() {
+        const uint64_t small_elements = narrow_nbs * small_aiv_kbs;
+        const uint64_t middle_elements = narrow_nbs * middle_aiv_kbs;
+        const uint64_t wide_elements = wide_nbs * middle_aiv_kbs;
+        const uint64_t narrow_elements = small_elements > middle_elements ? small_elements : middle_elements;
+        const uint64_t max_elements = narrow_elements > wide_elements ? narrow_elements : wide_elements;
+        const uint64_t packed_bytes = max_elements / 4;
+        const uint64_t decoded_bytes = max_elements * 17 / 16;
+        const uint64_t small_lut_count = (small_aiv_kbs / 256) * (narrow_nbs / 32);
+        const uint64_t middle_lut_count = (middle_aiv_kbs / 256) * (narrow_nbs / 32);
+        const uint64_t wide_lut_count = (middle_aiv_kbs / 256) * (wide_nbs / 32);
+        const uint64_t narrow_lut_count = small_lut_count > middle_lut_count ? small_lut_count : middle_lut_count;
+        const uint64_t lut_count = narrow_lut_count > wide_lut_count ? narrow_lut_count : wide_lut_count;
+        const uint64_t table_bytes = (lut_count + 7) * 32;
+        __ubuf__ uint8_t *ub_base = (__ubuf__ uint8_t *)get_imm(0);
+        a[0] = (__ubuf__ void *)ub_base;
+        a[1] = (__ubuf__ void *)(ub_base + packed_bytes);
+        b[0] = (__ubuf__ void *)(ub_base + 2 * packed_bytes);
+        b[1] = (__ubuf__ void *)(ub_base + 2 * packed_bytes + decoded_bytes);
+        table[0] = (__ubuf__ void *)(ub_base + 2 * packed_bytes + 2 * decoded_bytes);
+        table[1] = (__ubuf__ void *)(ub_base + 2 * packed_bytes + 2 * decoded_bytes + table_bytes);
+        l1_base = (__cbuf__ void *)get_imm(0);
+    }
+    __aicore__ inline void process_tile(__gm__ uint8_t *group_b, __gm__ uint8_t *group_table,
+                                       uint64_t n_begin, uint64_t mode, uint64_t &cnt_k) {
+        const uint64_t k0 = 16, n0 = 32, codebook_k = 256, codebook_n = 32;
+        const bool small_tile = mode == MAT_FP4_SMALL;
+        const bool wide_tile = mode == MAT_FP4_WIDE;
+        const uint64_t tile_n = wide_tile ? wide_nbs : narrow_nbs;
+        const uint64_t aiv_kbs = small_tile ? small_aiv_kbs : middle_aiv_kbs;
+        const uint64_t aic_kbs = small_tile ? small_aic_kbs : middle_aic_kbs;
+        const uint64_t a1_m_capacity = small_tile ? small_m_limit :
+            (wide_tile ? kMatFP4WideTileM : kMatFP4MaxTileM);
+        const uint64_t a1_bytes = a1_m_capacity * aic_kbs;
+        const uint64_t n1_blocks = tile_n / n0;
+        const uint64_t k0_blocks = aiv_kbs / k0;
+        const uint64_t codebook_k_blocks = aiv_kbs / codebook_k;
+        const uint64_t kb = K / aic_kbs;
+        const uint64_t n_group_count = N / codebook_n;
+        for (uint64_t ki = 0; ki < kb; ++ki) {
+            const uint64_t id = cnt_k & 1;
+            const uint64_t k0_block_begin = (ki * 2 + static_cast<uint64_t>(subid)) * k0_blocks;
+            wait_flag(PIPE_V, PIPE_MTE2, id);
+            const uint64_t n1_begin = n_begin / n0;
+            __gm__ uint8_t *packed_source = group_b +
+                (n1_begin * (K / k0) + k0_block_begin) * k0 * (n0 / 4);
+            gm_ub(a[id], packed_source, n1_blocks, aiv_kbs * (n0 / 4), aiv_kbs * (n0 / 4), K * (n0 / 4));
+            const uint64_t n_group = n_begin / codebook_n;
+            const uint64_t codebook_k_block_begin = k0_block_begin / (codebook_k / k0);
+            __gm__ uint8_t *table_source = group_table + (codebook_k_block_begin * n_group_count + n_group) * 32;
+            gm_ub(table[id], table_source, codebook_k_blocks, n1_blocks * 32, n1_blocks * 32, n_group_count * 32);
+            set_flag(PIPE_MTE2, PIPE_V, id); wait_flag(PIPE_MTE2, PIPE_V, id);
+            wait_flag(PIPE_MTE3, PIPE_V, id);
+            run_lut(a[id], table[id], b[id], static_cast<uint16_t>(n1_blocks), static_cast<uint16_t>(k0_blocks));
+            set_flag(PIPE_V, PIPE_MTE3, id); wait_flag(PIPE_V, PIPE_MTE3, id);
+            set_flag(PIPE_V, PIPE_MTE2, id);
+            wait_intra_block(PIPE_MTE3, id * 2);
+            for (uint64_t n1 = 0; n1 < n1_blocks; ++n1) {
+                __cbuf__ uint8_t *l1_destination = (__cbuf__ uint8_t *)l1_base +
+                    id * kMatFP4L1SlotBytes + a1_bytes +
+                    (n1 * (2 * k0_blocks) + static_cast<uint64_t>(subid) * k0_blocks) * k0 * n0;
+                __ubuf__ uint8_t *ub_source = (__ubuf__ uint8_t *)b[id] + n1 * k0_blocks * (k0 + 1) * n0;
+                ub_l1(l1_destination, ub_source, k0_blocks, k0, 0, 1);
+            }
+            set_flag(PIPE_MTE3, PIPE_V, id);
+            set_intra_block(PIPE_MTE3, id * 2 + 1);
+            ++cnt_k;
+        }
+    }
+public:
+    __aicore__ inline void Init(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+                               __gm__ void *a, __gm__ void *a_scale, __gm__ void *b, __gm__ void *table,
+                               __gm__ void *c, __gm__ void *tiling) {
+        G = g; K = k; N = n;
+        group_list_gm = group_list; a_gm = a; a_scale_gm = a_scale; b_gm = b; table_gm = table; c_gm = c;
+        __gm__ MatFP4TilingData *tiling_data = (__gm__ MatFP4TilingData *)tiling;
+        narrow_nbs = tiling_data->narrow_nbs; wide_nbs = tiling_data->wide_nbs;
+        small_m_limit = tiling_data->small_m_limit; n_only_mode = tiling_data->n_only_mode;
+        small_aiv_kbs = tiling_data->small_aiv_kbs; small_aic_kbs = tiling_data->small_aic_kbs;
+        middle_aiv_kbs = tiling_data->middle_aiv_kbs; middle_aic_kbs = tiling_data->middle_aic_kbs;
+        coreid = get_block_idx(); subid = get_subblockid() & 1;
+        InitBuffer(); init_spr();
+    }
+    __aicore__ inline void process() {
+        const uint64_t codebook_k = 256, codebook_n = 32;
+        const uint64_t n_group_count = N / codebook_n;
+        set_flag(PIPE_V, PIPE_MTE2, 0); set_flag(PIPE_MTE3, PIPE_V, 0);
+        set_flag(PIPE_V, PIPE_MTE2, 1); set_flag(PIPE_MTE3, PIPE_V, 1);
+        __gm__ uint8_t *b_base = (__gm__ uint8_t *)b_gm;
+        __gm__ uint8_t *table_base = (__gm__ uint8_t *)table_gm;
+        __gm__ int64_t *group_list = (__gm__ int64_t *)group_list_gm;
+        const uint64_t b_group_bytes = N * K / 4;
+        const uint64_t table_group_bytes = (K / codebook_k) * n_group_count * 32;
+        for (uint64_t group_id = 0; group_id < G; ++group_id) {
+            const int64_t signed_group_m = group_list[group_id];
+            if (signed_group_m <= 0) continue;
+            const uint64_t group_m = static_cast<uint64_t>(signed_group_m);
+            const bool wide_group = n_only_mode == 0 && group_m >= kMatFP4WideMThreshold;
+            uint64_t cnt_k = 0;
+            __gm__ uint8_t *group_b = b_base + group_id * b_group_bytes;
+            __gm__ uint8_t *group_table = table_base + group_id * table_group_bytes;
+            if (n_only_mode != 0) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NOnlyTileCount(group_m);
+                for (uint64_t ni = static_cast<uint64_t>(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    const uint64_t n_begin = ni * narrow_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi)
+                        process_tile(group_b, group_table, n_begin,
+                                     MatFP4GetNOnlyTile(group_m, mi, small_m_limit).mode, cnt_k);
+                }
+            } else if (!wide_group) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NarrowTileCount(group_m);
+                for (uint64_t ni = static_cast<uint64_t>(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    const uint64_t n_begin = ni * narrow_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi)
+                        process_tile(group_b, group_table, n_begin,
+                                     MatFP4GetNarrowTile(group_m, mi, small_m_limit).mode, cnt_k);
+                }
+            } else {
+                const uint64_t m_lane = static_cast<uint64_t>(coreid) / kMatFP4WideNCoreCount;
+                const uint64_t n_lane = static_cast<uint64_t>(coreid) % kMatFP4WideNCoreCount;
+                const uint64_t first_local_m = MatFP4SplitNearHalf16(group_m);
+                const uint64_t local_m = m_lane == 0 ? first_local_m : group_m - first_local_m;
+                const uint64_t nb = N / wide_nbs;
+                const uint64_t m_tile_count = MatFP4WideTileCount(local_m);
+                for (uint64_t ni = n_lane; ni < nb; ni += kMatFP4WideNCoreCount) {
+                    const uint64_t n_begin = ni * wide_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi)
+                        process_tile(group_b, group_table, n_begin, MatFP4GetWideTile(local_m, mi).mode, cnt_k);
+                }
+            }
+        }
+    }
+public:
+    uint64_t G = 0, K = 0, N = 0;
+    uint64_t narrow_nbs = 0, wide_nbs = 0, small_m_limit = 0, n_only_mode = 0;
+    uint64_t small_aiv_kbs = 0, small_aic_kbs = 0, middle_aiv_kbs = 0, middle_aic_kbs = 0;
+    int32_t coreid = 0, subid = 0;
+    __gm__ void *group_list_gm = nullptr;
+    __gm__ void *a_gm = nullptr;
+    __gm__ void *a_scale_gm = nullptr;
+    __gm__ void *b_gm = nullptr;
+    __gm__ void *table_gm = nullptr;
+    __gm__ void *c_gm = nullptr;
+    __ubuf__ void *a[2] {};
+    __ubuf__ void *b[2] {};
+    __ubuf__ void *table[2] {};
+    __cbuf__ void *l1_base = nullptr;
+};
+extern "C" __global__ __aicore__ void mat_fp4_mix_aiv(uint64_t g, uint64_t k, uint64_t n,
+    __gm__ void *group_list, __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
+    __gm__ void *table, __gm__ void *c, __gm__ void *tiling) {
+    MatFP4 mat;
+    mat.Init(g, k, n, group_list, a, a_scale, b, table, c, tiling);
+    mat.process();
+}
+#endif

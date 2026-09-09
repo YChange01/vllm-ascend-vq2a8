@@ -1,0 +1,2353 @@
+########## [1/9] data_utils.h ##########
+/**
+
+- @file data_utils.h
+- 
+- Copyright (C) 2024. Huawei Technologies Co., Ltd. All rights reserved.
+- 
+- This program is distributed in the hope that it will be useful,
+- but WITHOUT ANY WARRANTY; without even the implied warranty of
+- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+#ifndef DATA_UTILS_H
+#define DATA_UTILS_H
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include "acl/acl.h"
+typedef enum {
+    DT_UNDEFINED = -1,
+    FLOAT = 0,
+    HALF = 1,
+    INT8_T = 2,
+    INT32_T = 3,
+    UINT8_T = 4,
+    INT16_T = 6,
+    UINT16_T = 7,
+    UINT32_T = 8,
+    INT64_T = 9,
+    UINT64_T = 10,
+    DOUBLE = 11,
+    BOOL = 12,
+    STRING = 13,
+    COMPLEX64 = 16,
+    COMPLEX128 = 17,
+    BF16 = 27
+} printDataType;
+#define INFO_LOG(fmt, args...) fprintf(stdout, "[INFO]  " fmt "\n", ##args)
+#define WARN_LOG(fmt, args...) fprintf(stdout, "[WARN]  " fmt "\n", ##args)
+#define ERROR_LOG(fmt, args...) fprintf(stdout, "[ERROR]  " fmt "\n", ##args)
+#define CHECK_ACL(x)                                                                          
+    do {                                                                                      
+        aclError __ret = x;                                                                   
+        if (__ret != ACL_ERROR_NONE) {                                                        
+            std::cerr << **FILE** << ":" << **LINE** << " aclError:" << __ret << std::endl;   
+        }                                                                                     
+    } while (0);
+/**
+
+- @brief Read data from file
+- @param [in] filePath: file path
+- @param [out] fileSize: file size
+- @return read result
+ */
+bool ReadFile(const std::string &filePath, size_t &fileSize, void *buffer, size_t bufferSize)
+{
+ struct stat sBuf;
+ int fileStatus = stat(filePath.data(), &sBuf);
+ if (fileStatus == -1) {
+ ERROR_LOG("failed to get file");
+ return false;
+ }
+ if (S_ISREG(sBuf.st_mode) == 0) {
+ ERROR_LOG("%s is not a file, please enter a file", filePath.c_str());
+ return false;
+ }
+ std::ifstream file;
+ file.open(filePath, std::ios::binary);
+ if (!file.is_open()) {
+ ERROR_LOG("Open file failed. path = %s", filePath.c_str());
+ return false;
+ }
+ std::filebuf *buf = file.rdbuf();
+ size_t size = buf->pubseekoff(0, std::ios::end, std::ios::in);
+ if (size == 0) {
+ ERROR_LOG("file size is 0");
+ file.close();
+ return false;
+ }
+ if (size > bufferSize) {
+ ERROR_LOG("file size is larger than buffer size");
+ file.close();
+ return false;
+ }
+ buf->pubseekpos(0, std::ios::in);
+ buf->sgetn(static_cast<char *>(buffer), size);
+ fileSize = size;
+ file.close();
+ return true;
+}
+/**
+- @brief Write data to file
+- @param [in] filePath: file path
+- @param [in] buffer: data to write to file
+- @param [in] size: size to write
+- @return write result
+ */
+bool WriteFile(const std::string &filePath, const void *buffer, size_t size)
+{
+ if (buffer == nullptr) {
+ ERROR_LOG("Write file failed. buffer is nullptr");
+ return false;
+ }
+ int fd = open(filePath.c_str(), O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWRITE);
+ if (fd < 0) {
+ ERROR_LOG("Open file failed. path = %s", filePath.c_str());
+ return false;
+ }
+ const char *source = static_cast<const char *>(buffer);
+ size_t totalWritten = 0;
+ while (totalWritten < size) {
+ ssize_t written = write(fd, source + totalWritten, size - totalWritten);
+ if (written <= 0) {
+     (void)close(fd);
+     ERROR_LOG("Write file failed. path = %s", filePath.c_str());
+     return false;
+ }
+ totalWritten += static_cast(written);
+ }
+ (void)close(fd);
+ return true;
+}
+template  void DoPrintData(const T *data, size_t count, size_t elementsPerRow)
+{
+ assert(elementsPerRow != 0);
+ for (size_t i = 0; i < count; ++i) {
+ std::cout << std::setw(10) << data[i];
+ if (i % elementsPerRow == elementsPerRow - 1) {
+     std::cout << std::endl;
+ }
+ }
+}
+void DoPrintHalfData(const aclFloat16 *data, size_t count, size_t elementsPerRow)
+{
+ assert(elementsPerRow != 0);
+ for (size_t i = 0; i < count; ++i) {
+ std::cout << std::setw(10) << std::setprecision(6) << aclFloat16ToFloat(data[i]);
+ if (i % elementsPerRow == elementsPerRow - 1) {
+     std::cout << std::endl;
+ }
+ }
+}
+void PrintData(const void *data, size_t count, printDataType dataType, size_t elementsPerRow = 16)
+{
+ if (data == nullptr) {
+ ERROR_LOG("Print data failed. data is nullptr");
+ return;
+ }
+ switch (dataType) {
+ case BOOL:
+     DoPrintData(reinterpret_cast<const bool *>(data), count, elementsPerRow);
+     break;
+ case INT8_T:
+     DoPrintData(reinterpret_cast<const int8_t *>(data), count, elementsPerRow);
+     break;
+ case UINT8_T:
+     DoPrintData(reinterpret_cast<const uint8_t *>(data), count, elementsPerRow);
+     break;
+ case INT16_T:
+     DoPrintData(reinterpret_cast<const int16_t *>(data), count, elementsPerRow);
+     break;
+ case UINT16_T:
+     DoPrintData(reinterpret_cast<const uint16_t *>(data), count, elementsPerRow);
+     break;
+ case INT32_T:
+     DoPrintData(reinterpret_cast<const int32_t *>(data), count, elementsPerRow);
+     break;
+ case UINT32_T:
+     DoPrintData(reinterpret_cast<const uint32_t *>(data), count, elementsPerRow);
+     break;
+ case INT64_T:
+     DoPrintData(reinterpret_cast<const int64_t *>(data), count, elementsPerRow);
+     break;
+ case UINT64_T:
+     DoPrintData(reinterpret_cast<const uint64_t *>(data), count, elementsPerRow);
+     break;
+ case HALF:
+     DoPrintHalfData(reinterpret_cast<const aclFloat16 *>(data), count, elementsPerRow);
+     break;
+ case FLOAT:
+     DoPrintData(reinterpret_cast<const float *>(data), count, elementsPerRow);
+     break;
+ case DOUBLE:
+     DoPrintData(reinterpret_cast<const double *>(data), count, elementsPerRow);
+     break;
+ default:
+     ERROR_LOG("Unsupported type: %d", dataType);
+ }
+ std::cout << std::endl;
+}
+
+#endif // DATA_UTILS_H
+########## [2/9] hacl_rt.h ##########
+#ifndef **HACL_RUNTIME_RT_H**
+#define **HACL_RUNTIME_RT_H**
+#include <stdint.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+// If you need export the function of this library in Win32 dll, use __declspec(dllexport)
+#ifndef RTS_API
+#ifdef RTS_DLL_EXPORT
+#define RTS_API __declspec(dllexport)
+#else
+#define RTS_API
+#endif
+#endif
+/**
+
+- @ingroup dvrt_base
+- @brief stream handle.
+ */
+typedef void *rtStream_t;
+/**
+- @ingroup dvrt_base
+- @brief runtime error numbers.
+ */
+typedef enum tagRtError {
+ RT_ERROR_NONE = 0x0,                      // success
+ RT_ERROR_INVALID_VALUE = 0x1,             // invalid value
+ RT_ERROR_MEMORY_ALLOCATION = 0x2,         // memory allocation fail
+ RT_ERROR_INVALID_RESOURCE_HANDLE = 0x3,   // invalid handle
+ RT_ERROR_INVALID_DEVICE_POINTER = 0x4,    // invalid device point
+ RT_ERROR_INVALID_MEMCPY_DIRECTION = 0x5,  // invalid memory copy dirction
+ RT_ERROR_INVALID_DEVICE = 0x6,            // invalid device
+ RT_ERROR_NO_DEVICE = 0x7,                 // no valid device
+ RT_ERROR_CMD_OCCUPY_FAILURE = 0x8,        // command occpuy failure
+ RT_ERROR_SET_SIGNAL_FAILURE = 0x9,        // set signal failure
+ RT_ERROR_UNSET_SIGNAL_FAILURE = 0xA,      // unset signal failure
+ RT_ERROR_OPEN_FILE_FAILURE = 0xB,         // unset signal failure
+ RT_ERROR_WRITE_FILE_FAILURE = 0xC,
+ RT_ERROR_MEMORY_ADDRESS_UNALIGNED = 0xD,
+ RT_ERROR_DRV_ERR = 0xE,
+ RT_ERROR_LOST_HEARTBEAT = 0xF,
+ RT_ERROR_REPORT_TIMEOUT = 0x10,
+ RT_ERROR_NOT_READY = 0x11,
+ RT_ERROR_DATA_OPERATION_FAIL = 0x12,
+ RT_ERROR_INVALID_L2_INSTR_SIZE = 0x13,
+ RT_ERROR_DEVICE_PROC_HANG_OUT = 0x14,
+ RT_ERROR_DEVICE_POWER_UP_FAIL = 0x15,
+ RT_ERROR_DEVICE_POWER_DOWN_FAIL = 0x16,
+ RT_ERROR_FEATURE_NOT_SUPPROT = 0x17,
+ RT_ERROR_KERNEL_DUPLICATE = 0x18,         // register same kernel repeatly
+ RT_ERROR_MODEL_STREAM_EXE_FAILED = 0x91,  // the model stream failed
+ RT_ERROR_MODEL_LOAD_FAILED = 0x94,        // the model stream failed
+ RT_ERROR_END_OF_SEQUENCE = 0x95,          // end of sequence
+ RT_ERROR_NO_STREAM_CB_REG = 0x96,         // no callback register info for stream
+ RT_ERROR_DATA_DUMP_LOAD_FAILED = 0x97,    // data dump load info fail
+ RT_ERROR_CALLBACK_THREAD_UNSUBSTRIBE = 0x98,    // callback thread unsubstribe
+ RT_ERROR_RESERVED
+} rtError_t;
+/**
+- @ingroup rt_kernel
+- @brief device binary type
+ */
+typedef struct tagRtDevBinary {
+  uint32_t magic;    // magic number
+  uint32_t version;  // version of binary
+  const void *data;  // binary data
+  uint64_t length;   // binary length
+} rtDevBinary_t;
+/**
+- @ingroup rt_kernel
+- @brief shared memory data control
+ */
+typedef struct tagRtSmData {
+  uint64_t L2_mirror_addr;          // preload or swap source address
+  uint32_t L2_data_section_size;    // every data size
+  uint8_t L2_preload;               // 1 - preload from mirrorAddr, 0 - no preload
+  uint8_t modified;                 // 1 - data will be modified by kernel, 0 - no modified
+  uint8_t priority;                 // data priority
+  int8_t prev_L2_page_offset_base;  // remap source section offset
+  uint8_t L2_page_offset_base;      // remap destination section offset
+  uint8_t L2_load_to_ddr;           // 1 - need load out, 0 - no need
+  uint8_t reserved[2];              // reserved
+} rtSmData_t;
+/**
+- @ingroup rt_kernel
+- @brief shared memory description
+ */
+typedef struct tagRtSmCtrl {
+  rtSmData_t data[8];  // data description
+  uint64_t size;       // max page Num
+  uint8_t remap[64];   /* just using for static remap mode, default:0xFF
+                   array index: virtual l2 page id, array value: physic l2 page id */
+
+  uint8_t l2_in_main;  // 0-DDR, 1-L2, default:0xFF
+  uint8_t reserved[3];
+} rtSmDesc_t;
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of plain binary for aicore
+ */
+
+#define RT_DEV_BINARY_MAGIC_PLAIN 0xabceed50
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of plain binary for aicpu
+ */
+
+#define RT_DEV_BINARY_MAGIC_PLAIN_AICPU 0xabceed51
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of plain binary for aivector
+ */
+
+#define RT_DEV_BINARY_MAGIC_PLAIN_AIVEC 0xabceed52
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of elf binary for aicore
+ */
+
+#define RT_DEV_BINARY_MAGIC_ELF 0x43554245
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of elf binary for aicpu
+ */
+
+#define RT_DEV_BINARY_MAGIC_ELF_AICPU 0x41415243
+/**
+
+- @ingroup rt_kernel
+- @brief magic number of elf binary for aivector
+ */
+
+#define RT_DEV_BINARY_MAGIC_ELF_AIVEC 0x41415246
+/**
+
+- @ingroup rt_kernel
+- @brief register device binary
+- @param [in] bin   device binary description
+- @param [out] handle   device binary handle
+- @return RT_ERROR_NONE for ok
+- @note:if this interface is changed, pls notify the compiler changing at the same time.
+ */
+RTS_API rtError_t rtDevBinaryRegister(const rtDevBinary_t *bin, void **handle);
+/**
+- @ingroup rt_kernel
+- @brief register device function
+- @param [in] binHandle   device binary handle
+- @param [in] stubFunc   stub function
+- @param [in] stubName   stub function name
+- @param [in] devFunc   device function description. symbol name or address
+- ```
+                  offset, depending binary type.
+```
+- @return RT_ERROR_NONE for ok
+- @note:if this interface is changed, pls notify the compiler changing at the same time.
+ */
+RTS_API rtError_t rtFunctionRegister(void *binHandle, const void *stubFunc, const char *stubName, const void *devFunc,
+                              uint32_t funcMode);
+
+/**
+
+- @ingroup rt_kernel
+- @brief launch kernel to device
+- @param [in] stubFunc   stub function
+- @param [in] blockDim   block dimentions
+- @param [in] args   argments address for kernel function
+- @param [in] argsSize   argements size
+- @param [in] smDesc   shared memory description
+- @param [in] stream   associated stream
+- @return RT_ERROR_NONE for ok, errno for failed
+ */
+RTS_API rtError_t rtKernelLaunch(const void *stubFunc, uint32_t blockDim, void *args, uint32_t argsSize,
+                          rtSmDesc_t *smDesc, rtStream_t stream);
+
+typedef struct tagRtArgsEx {
+    void *args;                     // input + output + scalar + tiling addr + tiling data
+    void *hostInputInfoPtr;         // nullptr
+    uint32_t argsSize;              // input addr size + output addr size + scalar size + tiling addr size + tiling data size
+    uint16_t tilingAddrOffset;      // size to tiling addr
+    uint16_t tilingDataOffset;      // size to tiling data
+    uint16_t hostInputInfoNum;      // 0
+    uint8_t hasTiling;              // has tiling
+    uint8_t isNoNeedH2DCopy;        // not need rtKernelLaunchWithFlag copy tiling from host to device 
+    uint8_t reserved[4];
+} rtArgsEx_t;
+/**
+
+- @ingroup rt_kernel
+- @brief launch kernel and tiling to device
+- @param [in] stubFunc   stub function
+- @param [in] blockDim   block dimentions
+- @param [in] argsInfo   argments address for kernel function
+- @param [in] smDesc     shared memory description
+- @param [in] stream     associated stream
+- @param [in] flag       not use, set 0
+- @note:if this interface is changed, pls notify the compiler changing at the same time.
+ */
+RTS_API rtError_t rtKernelLaunchWithFlag(const void *stubFunc, uint32_t blockDim, rtArgsEx_t *argsInfo,
+                            rtSmDesc_t *smDesc, rtStream_t stream, uint32_t flag = 0);
+
+/**
+
+- @ingroup dvrt_mem
+- @brief memory type
+ */
+
+#define RT_MEMORY_DEFAULT ((uint32_t)0x0)   // default memory on device
+#define RT_MEMORY_HBM ((uint32_t)0x2)       // HBM memory on device
+#define RT_MEMORY_DDR ((uint32_t)0x4)       // DDR memory on device
+#define RT_MEMORY_SPM ((uint32_t)0x8)       // shared physical memory on device
+#define RT_MEMORY_P2P_HBM ((uint32_t)0x10)  // HBM memory on other 4P device
+#define RT_MEMORY_P2P_DDR ((uint32_t)0x11)  // DDR memory on other device
+#define RT_MEMORY_DDR_NC ((uint32_t)0x20)   // DDR memory of non-cache
+#define RT_MEMORY_TS_4G ((uint32_t)0x40)
+#define RT_MEMORY_TS ((uint32_t)0x80)
+#define RT_MEMORY_RESERVED ((uint32_t)0x100)
+#define RT_MEMORY_L1 ((uint32_t)0x1<<16)
+#define RT_MEMORY_L2 ((uint32_t)0x1<<17)
+/**
+
+- @ingroup dvrt_mem
+- @brief memory type | memory Policy
+ */
+typedef uint32_t rtMemType_t;
+/**
+- @ingroup dvrt_mem
+- @brief memory copy type
+ */
+typedef enum tagRtMemcpyKind {
+  RT_MEMCPY_HOST_TO_HOST = 0,  // host to host
+  RT_MEMCPY_HOST_TO_DEVICE,    // host to device
+  RT_MEMCPY_DEVICE_TO_HOST,    // device to host
+  RT_MEMCPY_DEVICE_TO_DEVICE,  // device to device, 1P && P2P
+  RT_MEMCPY_MANAGED,           // managed memory
+  RT_MEMCPY_ADDR_DEVICE_TO_DEVICE,
+  RT_MEMCPY_HOST_TO_DEVICE_EX, // host  to device ex (only used for 8 bytes)
+  RT_MEMCPY_RESERVED,
+} rtMemcpyKind_t;
+/**
+- @ingroup dvrt_mem
+- @brief alloc device memory
+- @param [in|out] devPtr   memory pointer
+- @param [in] size   memory size
+- @param [in] type   memory type
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_MEMORY_ALLOCATION for memory allocation failed
+ */
+RTS_API rtError_t rtMalloc(void **devPtr, uint64_t size, rtMemType_t type);
+/**
+- @ingroup dvrt_mem
+- @brief free device memory
+- @param [in|out] devPtr   memory pointer
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_DEVICE_POINTER for error device memory pointer
+ */
+RTS_API rtError_t rtFree(void *devPtr);
+/**
+- @ingroup dvrt_mem
+- @brief alloc host memory
+- @param [in|out] hostPtr   memory pointer
+- @param [in] size   memory size
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_MEMORY_ALLOCATION for memory allocation failed
+ */
+RTS_API rtError_t rtMallocHost(void **hostPtr, uint64_t size);
+/**
+- @ingroup dvrt_mem
+- @brief free host memory
+- @param [in] hostPtr   memory pointer
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_DEVICE_POINTER for error device memory pointer
+ */
+RTS_API rtError_t rtFreeHost(void *hostPtr);
+/**
+- @ingroup dvrt_mem
+- @brief synchronized memcpy
+- @param [in] dst   destination address pointer
+- @param [in] Max length of destination address memory
+- @param [in] src   source address pointer
+- @param [in] count   the number of byte to copy
+- @param [in] kind   memcpy type
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_VALUE for error input of count
+- @return RT_ERROR_INVALID_DEVICE_POINTER for error input memory pointer of dst,src
+- @return RT_ERROR_INVALID_MEMCPY_DIRECTION for error copy direction of kind
+ */
+RTS_API rtError_t rtMemcpy(void *dst, uint64_t destMax, const void *src, uint64_t count, rtMemcpyKind_t kind);
+/**
+- @ingroup dvrt_mem
+- @brief asynchronized memcpy
+- @param [in] dst   destination address pointer
+- @param [in] Max length of destination address memory
+- @param [in] src   source address pointer
+- @param [in] count   the number of byte to copy
+- @param [in] kind   memcpy type
+- @param [in] stream   asynchronized task stream
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_VALUE for error input of count,stream
+- @return RT_ERROR_INVALID_DEVICE_POINTER for error input memory pointer of dst,src
+- @return RT_ERROR_INVALID_MEMCPY_DIRECTION for error copy direction of kind
+ */
+RTS_API rtError_t rtMemcpyAsync(void *dst, uint64_t destMax, const void *src, uint64_t count, rtMemcpyKind_t kind,
+                         rtStream_t stream);
+
+/**
+
+- @ingroup dvrt_stream
+- @brief create stream instance
+- @param [in|out] stream   created stream
+- @param [in] priority   stream priority
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_RESOURCE_HANDLE for error input stream handle
+- @return RT_ERROR_INVALID_VALUE for error input priority
+ */
+RTS_API rtError_t rtStreamCreate(rtStream_t *stream, int32_t priority);
+/**
+- @ingroup dvrt_stream
+- @brief destroy stream instance.
+- @param [in] stream   the stream to destroy
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_RESOURCE_HANDLE for error input stream handle
+ */
+RTS_API rtError_t rtStreamDestroy(rtStream_t stream);
+/**
+- @ingroup dvrt_stream
+- @brief wait stream to be complete
+- @param [in] stream   stream to wait
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_RESOURCE_HANDLE for error input stream or event handle
+ */
+RTS_API rtError_t rtStreamSynchronize(rtStream_t stream);
+/**
+- @ingroup dvrt_dev
+- @brief set target device for current thread
+- @param [int] device   the device id
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_DEVICE for can not match ID and device
+ */
+RTS_API rtError_t rtSetDevice(int32_t device);
+/**
+- @ingroup dvrt_dev
+- @brief reset all opened device
+- @return RT_ERROR_NONE for ok
+- @return RT_ERROR_INVALID_DEVICE if no device set
+ */
+RTS_API rtError_t rtDeviceReset(int32_t device);
+RTS_API rtError_t rtGetTaskIdAndStreamID(uint32_t *taskId, uint32_t *streamId);
+RTS_API rtError_t rtGetC2cCtrlAddr(uint64_t *addr, uint32_t *len);
+
+#ifdef __cplusplus
+}
+#endif
+#endif  // **HACL_RUNTIME_RT_H**
+########## [3/9] mat_fp4_aic.cce ##########
+#ifdef **CCE_KT_TEST**
+#define **aicore**
+#else
+#define **aicore** [aicore]
+#endif
+#include "mat_fp4_tiling.h"
+#ifdef **DAV_C310_CUBE**
+class MatFP4 {
+private:
+    static constexpr uint64_t kMxScaleGroupSize = 32;
+    static constexpr uint32_t kMxE8m0OneU32 = 0x7F7F7F7F;
+    // Ascend 950 上 L0B_MX 对当前 AIC 可见的映射窗口为 4 KiB：64 KiB L0B / 16。
+    static constexpr uint64_t kL0bMxMappedBytes = 4 * 1024;
+    static constexpr uint64_t kL0bMxFillN = 128;
+    static constexpr uint64_t kL0bMxFillK = 1024;
+    **aicore** inline void gm_l1_nd2nz(**cbuf** void *l1, **gm** void *gm, uint64_t actual_rows,
+                                      uint64_t aligned_rows, uint64_t reduction, uint64_t source_row_stride)
+    {
+        uint64_t cfg0 = 0;
+        cfg0 |= source_row_stride << 4;
+        cfg0 |= actual_rows << 48;
+        const uint64_t cfg1 = reduction;
+        uint64_t nz_parameter = 1;
+        nz_parameter |= static_cast(1) << 16;
+        nz_parameter |= aligned_rows << 32;
+        nz_parameter |= aligned_rows << 48;
+        set_mte2_nz_para(nz_parameter);
+        copy_gm_to_cbuf_multi_nd2nz((__cbuf__ float8_e4m3_t *)l1, (__gm__ float8_e4m3_t *)gm, cfg0, cfg1);
+    }
+    // A-scale 在 GM 中为 [M,K/64,2] E8M0；相邻两个 E8M0 reinterpret 为一个 BF16 后执行 DN2NZ。
+    // source_row_stride_bytes 是相邻两行首地址之间的 Byte stride，不是行尾 gap。
+    __aicore__ inline void gm_l1_scale_dn2nz(__cbuf__ void *l1, __gm__ void *gm, uint64_t actual_rows,
+                                             uint64_t aligned_rows, uint64_t tile_k,
+                                             uint64_t source_row_stride_bytes)
+    {
+        // GM scale按E8M0视角为[M, K/32]，reinterpret成BF16后为[D=M, N=K/64]。
+        const uint64_t scale_n_b16 = tile_k >> 6;
+        uint64_t cfg0 = 0;
+        // [43:4] loop1_src_stride：相邻D行首地址的Byte stride。
+        cfg0 |= source_row_stride_bytes << 4;
+        // [63:48] n_value：BF16视角下每行包含的元素数。
+        cfg0 |= scale_n_b16 << 48;
+        uint64_t cfg1 = 0;
+        // [20:0] d_value：DN矩阵的行数，使用实际M，硬件负责补齐到16行。
+        cfg1 |= actual_rows;
+        // [60:21] loop4_src_stride = 0；[61] smallc0_en = 0。
+        uint64_t nz_parameter = 1;
+        // [31:16] dstNzNStride：相邻D行在目的NZ矩阵中的间隔，单位C0。
+        nz_parameter |= static_cast(1) << 16;
+        // [47:32] dstNzC0Stride：同一D行的相邻K64分形间隔，单位32B。
+        nz_parameter |= scale_n_b16 << 32;
+        // [63:48] dstNzMatrixStride = 0，本次只搬一个DN矩阵。
+        set_mte2_nz_para(nz_parameter);
+        copy_gm_to_cbuf_multi_dn2nz((__cbuf__ bfloat16_t *)l1, (__gm__ bfloat16_t *)gm, cfg0, cfg1);
+        // aligned_rows仅用于目标空间大小和后续L1->L0A_MX的xStep计算。
+        (void)aligned_rows;
+    }
+    **aicore** inline void l1_l0a(**ca** void *l0a, **cbuf** void *l1, uint64_t row_offset, uint64_t reduction_offset,
+                                 uint64_t rows, uint64_t reduction, uint64_t source_row_stride)
+    {
+        uint64_t cfg0 = 0;
+        cfg0 |= row_offset >> 4;
+        cfg0 |= (reduction_offset >> 5) << 16;
+        cfg0 |= (rows >> 4) << 32;
+        cfg0 |= (reduction >> 5) << 40;
+        uint64_t cfg1 = source_row_stride >> 4;
+        cfg1 |= (rows >> 4) << 16;
+        load_cbuf_to_ca((__ca__ float8_e4m3_t *)l0a, (__cbuf__ float8_e4m3_t *)l1, cfg0, cfg1, false);
+    }
+    __aicore__ inline void l1_l0b(__cb__ void *l0b, __cbuf__ void *l1, uint64_t k_offset, uint64_t n_offset,
+                                 uint64_t k_extent, uint64_t n_extent, uint64_t source_k_stride)
+    {
+        uint64_t cfg0 = 0;
+        cfg0 |= k_offset >> 4;
+        cfg0 |= (n_offset >> 5) << 16;
+        cfg0 |= (k_extent >> 4) << 32;
+        cfg0 |= (n_extent >> 5) << 40;
+        uint64_t cfg1 = source_k_stride >> 4;
+        cfg1 |= (n_extent >> 4) << 16;
+        // MTE1 将 L1B zN [K0=16,N0=32] 转为 L0B nZ [K0=32,N0=16]。
+        load_cbuf_to_cb((__cb__ float8_e4m3_t *)l0b, (__cbuf__ float8_e4m3_t *)l1, cfg0, cfg1, true);
+    }
+    __aicore__ inline void l1_l0a_mx(__cbuf__ void *l1mx, __ca__ void *l0a, uint64_t m, uint64_t k,
+                                     uint64_t source_k, uint64_t k_offset)
+    {
+#ifdef test_sync
+        return;
+#endif
+        uint64_t cfg0 = 0;
+        // [31:16] Y start：在完整L1 scale tile中的K方向起点，单位32B/K64。
+        cfg0 |= (k_offset >> 6) << 16;
+        // [39:32] X step：M方向搬运的16行分形数。
+        cfg0 |= (m >> 4) << 32;
+        // [47:40] Y step：当前MAD在K方向搬运的32B/K64分形数。
+        cfg0 |= (k >> 6) << 40;
+        // srcStride必须保持完整L1源矩阵的行跨度；dst按当前mad_k紧密排布。
+        uint64_t cfg1 = source_k >> 6;
+        cfg1 |= (k >> 6) << 16;
+        load_cbuf_to_ca_mx(((uint64_t)l0a) >> 4, (**cbuf** void *)l1mx, cfg0, cfg1);
+    }
+    **aicore** inline void l1_l0b_mx(**cbuf** void *l1mx, **cb** void *l0b, uint64_t n, uint64_t k)
+    {
+#ifdef test_sync
+        return;
+#endif
+        // ScaleB 的一个 32B 分形包含 [16, 2] 个 E8M0：
+        // X 方向对应 N，每个分形覆盖 16 行；Y 方向对应 K，每个分形覆盖 K64。
+        const uint64_t x_step = n >> 4;
+        const uint64_t y_step = k >> 6;
+        uint64_t cfg0 = 0;
+        cfg0 |= x_step << 32;
+        cfg0 |= y_step << 40;
+        // stride 是相邻两个 X 分形首地址的间距，而不是每行搬运后的额外 gap。
+        // 当前 L1 源和 L0B_MX 目的均按紧密矩形排布，因此 row pitch 都等于 y_step。
+        const uint64_t src_stride = y_step;
+        const uint64_t dst_stride = y_step;
+        uint64_t cfg1 = src_stride;
+        cfg1 |= dst_stride << 16;
+        load_cbuf_to_cb_mx(((uint64_t)l0b) >> 4, (**cbuf** int8_t *)l1mx, cfg0, cfg1);
+    }
+    **aicore** inline void fill_cbuf(**cbuf** uint32_t *dst, uint64_t block_num, uint32_t value)
+    {
+#ifdef test_sync
+        return;
+#endif
+        uint64_t cfg0 = 0;
+        cfg0 |= 1ULL;  // [14:0] repeat times
+        cfg0 |= (block_num & 0x7FFFULL) << 16;  // [30:16] blocks/repeat，单位 32B
+        create_cbuf_matrix(dst, static_cast(cfg0), value);
+    }
+    **aicore** inline void init_l0b_mx_scale_one()
+    {
+        // 一次填满完整的 4 KiB L0B_MX 映射窗口。之后无论 L0B 数据使用 b0[0]
+        // 还是 b0[1]，其通过 l0b_addr / 16 推导出的 scale 地址都落在这份常驻全 1 区域内。
+        // 128 * 1024 / 32 = 4096 Byte；对应 x_step=8、y_step=16。
+        fill_cbuf((**cbuf** uint32_t *)l1_base, kL0bMxMappedBytes / 32, kMxE8m0OneU32);
+        set_flag(PIPE_MTE2, PIPE_MTE1, 2);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, 2);
+        l1_l0b_mx(l1_base, b0[0], kL0bMxFillN, kL0bMxFillK);
+        set_flag(PIPE_MTE1, PIPE_M, 2);
+        wait_flag(PIPE_MTE1, PIPE_M, 2);
+    }
+    **aicore** inline void l0c_gm(**gm** bfloat16_t *gm, **cc** void *l0c, uint64_t actual_rows,
+                                 uint64_t aligned_rows, uint64_t columns, uint64_t destination_row_stride)
+    {
+        uint64_t cfg0 = 0;
+        cfg0 |= columns << 4;
+        cfg0 |= actual_rows << 16;
+        cfg0 |= destination_row_stride << 32;
+        uint64_t cfg1 = aligned_rows;
+        cfg1 += (((uint64_t)0)<<29);
+        cfg1 += (((uint64_t)16)<<34);
+        //cfg1 |= static_cast(2) << 34;  // F322BF16：FP32 按 RINT 转为 BF16，无需 scale。
+        cfg1 |= static_cast(1) << 43;
+        set_loop3_para(1);
+        copy_matrix_cc_to_gm(gm, (**cc** float *)l0c, cfg0, cfg1);
+    }
+    **aicore** inline void mmad(**cc** void *l0c, **ca** void *l0a, **cb** void *l0b, uint64_t rows,
+                               uint64_t reduction, uint64_t columns, bool clear_accumulator)
+    {
+        uint64_t cfg = rows;
+        cfg |= reduction << 12;
+        cfg |= columns << 24;
+        // L1/L0A 将 M 对齐到 16，最终仅写回有效行。
+        cfg |= static_cast(1) << 61;
+        cfg |= static_cast(clear_accumulator) << 63;
+        // 当前实现沿用显式 PIPE_M/PIPE_FIX 同步，unit-flag 保持关闭。
+        mad_mx((__cc__ float *)l0c, (__ca__ float8_e4m3_t *)l0a, (__cb__ float8_e4m3_t *)l0b, cfg);
+    }
+    __aicore__ inline void InitBuffer()
+    {
+        // 两个 256 KiB 槽分别作为 ping/pong，槽内 A/B 分界由当前 tiling 档位决定。
+        l1_base = (__cbuf__ void *)get_imm(0);
+        const uint64_t small_a0_bytes = small_m_limit * small_mad_k;
+        const uint64_t middle_a0_bytes = kMatFP4MaxTileM * middle_mad_k;
+        const uint64_t a0_bytes = small_a0_bytes > middle_a0_bytes ? small_a0_bytes : middle_a0_bytes;
+        **ca** uint8_t *l0a_base = (**ca** uint8_t *)get_imm(0);
+        a0[0] = (**ca** void *)l0a_base;
+        a0[1] = (**ca** void *)(l0a_base + a0_bytes);
+        const uint64_t small_b0_bytes = narrow_nbs * small_mad_k;
+        const uint64_t middle_b0_bytes = narrow_nbs * middle_mad_k;
+        const uint64_t wide_b0_bytes = wide_nbs * middle_mad_k;
+        const uint64_t narrow_b0_bytes = small_b0_bytes > middle_b0_bytes ? small_b0_bytes : middle_b0_bytes;
+        const uint64_t b0_bytes = narrow_b0_bytes > wide_b0_bytes ? narrow_b0_bytes : wide_b0_bytes;
+        **cb** uint8_t *l0b_base = (**cb** uint8_t *)get_imm(0);
+        b0[0] = (**cb** void *)l0b_base;
+        b0[1] = (**cb** void *)(l0b_base + b0_bytes);
+        // N6144 仅小档双缓冲，中档与旧宽档使用 c0[0] 单缓冲。
+        const uint64_t double_c0_m = n_only_mode != 0 ? small_m_limit : kMatFP4MaxTileM;
+        const uint64_t c0_bytes = double_c0_m * narrow_nbs * sizeof(float);
+        **cc** uint8_t *l0c_base = (**cc** uint8_t *)get_imm(0);
+        c0[0] = (**cc** void *)l0c_base;
+        c0[1] = (**cc** void *)(l0c_base + c0_bytes);
+    }
+    **aicore** inline void sync_l0c_mode()
+    {
+        wait_flag(PIPE_FIX, PIPE_M, 0);
+        wait_flag(PIPE_FIX, PIPE_M, 1);
+        set_flag(PIPE_FIX, PIPE_M, 0);
+        set_flag(PIPE_FIX, PIPE_M, 1);
+    }
+    **aicore** inline void process_tile(**gm** uint8_t *group_a, **gm** uint8_t *group_a_scale,
+                                        **gm** bfloat16_t *group_c, uint64_t n_tile_id, MatFP4TileDesc tile,
+                                        uint64_t &cnt_c, uint64_t &cnt_k)
+    {
+        const bool small_tile = tile.mode == MAT_FP4_SMALL;
+        const bool wide_tile = tile.mode == MAT_FP4_WIDE;
+        const uint64_t tile_n = wide_tile ? wide_nbs : narrow_nbs;
+        const uint64_t aic_kbs = small_tile ? small_aic_kbs : middle_aic_kbs;
+        const uint64_t mad_k = small_tile ? small_mad_k : middle_mad_k;
+        const uint64_t a1_m_capacity =
+            small_tile ? small_m_limit : (wide_tile ? kMatFP4WideTileM : kMatFP4MaxTileM);
+        const uint64_t a1_bytes = a1_m_capacity * aic_kbs;
+        const uint64_t b1_bytes = tile_n * aic_kbs;
+        const uint64_t act_m = (tile.rows + 15) / 16 * 16;
+        const uint64_t a1_scale_bytes = act_m * aic_kbs / kMxScaleGroupSize;
+        const bool scale_fits_after_b = a1_bytes + b1_bytes + a1_scale_bytes <= kMatFP4L1SlotBytes;
+        const bool scale_fits_a_tail = act_m * aic_kbs + a1_scale_bytes <= a1_bytes;
+        // N=6144、49<=M<=64 时 A+B 占满 slot 且没有足够 A-tail，才按 mad_k 原位复用。
+        const bool scale_reuses_a1 = !scale_fits_after_b && !scale_fits_a_tail;
+        const uint64_t mad_kb = aic_kbs / mad_k;
+        const uint64_t kb = K / aic_kbs;
+        const bool single_l0c = wide_tile || (n_only_mode != 0 && !small_tile);
+        const uint64_t id_c = single_l0c ? 0 : (cnt_c & 1);
+        for (uint64_t ki = 0; ki < kb; ++ki) {
+            const uint64_t id = cnt_k & 1;
+            **cbuf** uint8_t *l1_slot = (**cbuf** uint8_t *)l1_base + id * kMatFP4L1SlotBytes;
+            **cbuf** void *a1_addr = (**cbuf** void *)l1_slot;
+            **cbuf** void *b1_addr = (**cbuf** void *)(l1_slot + a1_bytes);
+            **cbuf** void *a1_scale_addr = scale_fits_after_b ?
+                (**cbuf** void *)(l1_slot + a1_bytes + b1_bytes) :
+                (scale_fits_a_tail ? (**cbuf** void *)(l1_slot + act_m * aic_kbs) :
+                                      (**cbuf** void *)l1_slot);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, id);
+            gm_l1_nd2nz(a1_addr, (**gm** void *)(group_a + tile.offset * K + ki * aic_kbs), tile.rows,
+                        act_m, aic_kbs, K);
+            if (!scale_reuses_a1) {
+                **gm** uint8_t *scale_source = group_a_scale + tile.offset * (K / kMxScaleGroupSize) +
+                    ki * (aic_kbs / kMxScaleGroupSize);
+                gm_l1_scale_dn2nz(a1_scale_addr, (**gm** void *)scale_source, tile.rows, act_m, aic_kbs,
+                                  K / kMxScaleGroupSize);
+            }
+            set_flag(PIPE_MTE2, PIPE_MTE1, id);
+            // 等待两个 AIV 完成同一 N tile 的相邻 K 半区。
+            wait_intra_block(PIPE_MTE1, id * 2 + 1);
+            wait_intra_block(PIPE_MTE1, id * 2 + 1 + 16);
+            wait_flag(PIPE_MTE2, PIPE_MTE1, id);
+            if (ki == 0) {
+                wait_flag(PIPE_FIX, PIPE_M, id_c);
+            }
+            for (uint64_t ki2 = 0; ki2 < mad_kb; ++ki2) {
+                const uint64_t cnt = ki2 & 1;
+                wait_flag(PIPE_M, PIPE_MTE1, cnt);
+                l1_l0a(a0[cnt], a1_addr, 0, ki2 * mad_k, act_m, mad_k, act_m);
+                l1_l0b(b0[cnt], b1_addr, ki2 * mad_k, 0, mad_k, tile_n, aic_kbs);
+                if (scale_reuses_a1) {
+                    // 当前 A(mad_k) 已进入 L0A 后，其 L1 区间不再使用，可临时存放对应的 A-scale NZ块。
+                    set_flag(PIPE_MTE1, PIPE_MTE2, cnt + 4);
+                    wait_flag(PIPE_MTE1, PIPE_MTE2, cnt + 4);
+                    __cbuf__ uint8_t *scale_scratch = (__cbuf__ uint8_t *)a1_addr + act_m * ki2 * mad_k;
+                    __gm__ uint8_t *scale_source = group_a_scale + tile.offset * (K / kMxScaleGroupSize) +
+                        ki * (aic_kbs / kMxScaleGroupSize) + ki2 * (mad_k / kMxScaleGroupSize);
+                    gm_l1_scale_dn2nz((__cbuf__ void *)scale_scratch, (__gm__ void *)scale_source, tile.rows,
+                                      act_m, mad_k, K / kMxScaleGroupSize);
+                    set_flag(PIPE_MTE2, PIPE_MTE1, cnt + 4);
+                    wait_flag(PIPE_MTE2, PIPE_MTE1, cnt + 4);
+                    // Scratch中只保存当前mad_k，对源和目的都是紧密矩形。
+                    l1_l0a_mx((__cbuf__ void *)scale_scratch, a0[cnt], act_m, mad_k, mad_k, 0);
+                } else {
+                    // L1中常驻的是完整aic_kbs scale tile。切mad_k子块时通过Y start选择K窗口，
+                    // srcStride仍保持aic_kbs/64，不能把子块当作紧密矩形。
+                    l1_l0a_mx(a1_scale_addr, a0[cnt], act_m, mad_k, aic_kbs, ki2 * mad_k);
+                }
+                set_flag(PIPE_MTE1, PIPE_M, cnt);
+                wait_flag(PIPE_MTE1, PIPE_M, cnt);
+                __cc__ void *c0_addr = c0[id_c];
+                const bool clear_accumulator = ki == 0 && ki2 == 0;
+                // 操作数按 16 对齐存放，MAD 的 mbs 使用当前 tile 的实际 M。
+                this->mmad(c0_addr, a0[cnt], b0[cnt], tile.rows, mad_k, tile_n, clear_accumulator);
+                set_flag(PIPE_M, PIPE_MTE1, cnt);
+                const bool final_reduction = ki + 1 == kb && ki2 + 1 == mad_kb;
+                if (final_reduction) {
+                    set_flag(PIPE_M, PIPE_FIX, cnt);
+                    wait_flag(PIPE_M, PIPE_FIX, cnt);
+                    **gm** bfloat16_t *output_tile = group_c + tile.offset * N + n_tile_id * tile_n;
+                    l0c_gm(output_tile, c0_addr, tile.rows, act_m, tile_n, N);
+                }
+            }
+            if (ki + 1 == kb) {
+                set_flag(PIPE_FIX, PIPE_M, id_c);
+            }
+            // 释放共享 L1B，允许两个 AIV 覆盖写入。
+            set_intra_block(PIPE_MTE1, id * 2);
+            set_intra_block(PIPE_MTE1, id * 2 + 16);
+            set_flag(PIPE_MTE1, PIPE_MTE2, id);
+            ++cnt_k;
+        }
+        ++cnt_c;
+    }
+public:
+    **aicore** inline void Init(uint64_t g, uint64_t k, uint64_t n, **gm** void *group_list, **gm** void *a,
+                               **gm** void *a_scale, **gm** void *b, **gm** void *table, **gm** void *c,
+                               **gm** void *tiling)
+    {
+        G = g;
+        K = k;
+        N = n;
+        group_list_gm = group_list;
+        a_gm = a;
+        a_scale_gm = a_scale;
+        b_gm = b;
+        table_gm = table;
+        c_gm = c;
+        **gm** MatFP4TilingData *tiling_data = (**gm** MatFP4TilingData *)tiling;
+        narrow_nbs = tiling_data->narrow_nbs;
+        wide_nbs = tiling_data->wide_nbs;
+        small_m_limit = tiling_data->small_m_limit;
+        n_only_mode = tiling_data->n_only_mode;
+        small_aic_kbs = tiling_data->small_aic_kbs;
+        small_mad_k = tiling_data->small_mad_k;
+        middle_aic_kbs = tiling_data->middle_aic_kbs;
+        middle_mad_k = tiling_data->middle_mad_k;
+        coreid = get_block_idx();
+        InitBuffer();
+    }
+    **aicore** inline void process()
+    {
+        // 每个 AIC 在进入 expert/K 循环前一次性填满 4 KiB L0B_MX 映射窗口。
+        init_l0b_mx_scale_one();
+        // 初始化两个 AIV 对 L1B ping-pong buffer 的写权限；+16 表示第二个 AIV。
+        set_intra_block(PIPE_MTE1, 0);
+        set_intra_block(PIPE_MTE1, 2);
+        set_intra_block(PIPE_MTE1, 16);
+        set_intra_block(PIPE_MTE1, 18);
+        set_flag(PIPE_MTE1, PIPE_MTE2, 0);
+        set_flag(PIPE_MTE1, PIPE_MTE2, 1);
+        set_flag(PIPE_M, PIPE_MTE1, 0);
+        set_flag(PIPE_M, PIPE_MTE1, 1);
+        set_flag(PIPE_M, PIPE_MTE1, 4);
+        set_flag(PIPE_M, PIPE_MTE1, 5);
+        for (uint64_t event_id = 0; event_id < 8; ++event_id) {
+            set_flag(PIPE_FIX, PIPE_M, event_id);
+        }
+        **gm** int64_t *group_list = (**gm** int64_t *)group_list_gm;
+        **gm** uint8_t *a_base = (**gm** uint8_t *)a_gm;
+        **gm** uint8_t *a_scale_base = (**gm** uint8_t *)a_scale_gm;
+        **gm** bfloat16_t *c_base = (**gm** bfloat16_t *)c_gm;
+        uint64_t row_begin = 0;
+        bool has_previous_mode = false;
+        bool previous_single_l0c = false;
+        // group_list 保存非累计 M_i；A_i/C_i 起点为之前各组 M_i 之和。
+        for (uint64_t group_id = 0; group_id < G; ++group_id) {
+            const int64_t signed_group_m = group_list[group_id];
+            if (signed_group_m <= 0) {
+                continue;
+            }
+            const uint64_t group_m = static_cast(signed_group_m);
+            const bool wide_group = n_only_mode == 0 && group_m >= kMatFP4WideMThreshold;
+            const bool single_l0c_group = wide_group || (n_only_mode != 0 && group_m > small_m_limit);
+            if (has_previous_mode && previous_single_l0c != single_l0c_group) {
+                // 单缓冲会覆盖双缓冲区域，切档前等待所有 Fixpipe 完成。
+                sync_l0c_mode();
+            }
+            has_previous_mode = true;
+            previous_single_l0c = single_l0c_group;
+            uint64_t cnt_c = 0;
+            uint64_t cnt_k = 0;
+            **gm** uint8_t *group_a = a_base + row_begin * K;
+            **gm** uint8_t *group_a_scale = a_scale_base + row_begin * (K / kMxScaleGroupSize);
+            **gm** bfloat16_t *group_c = c_base + row_begin * N;
+            if (n_only_mode != 0) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NOnlyTileCount(group_m);
+                for (uint64_t ni = static_cast(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        process_tile(group_a, group_a_scale, group_c, ni,
+                                     MatFP4GetNOnlyTile(group_m, mi, small_m_limit), cnt_c, cnt_k);
+                    }
+                }
+            } else if (!wide_group) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NarrowTileCount(group_m);
+                for (uint64_t ni = static_cast(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        process_tile(group_a, group_a_scale, group_c, ni,
+                                     MatFP4GetNarrowTile(group_m, mi, small_m_limit), cnt_c, cnt_k);
+                    }
+                }
+            } else {
+                const uint64_t m_lane = static_cast(coreid) / kMatFP4WideNCoreCount;
+                const uint64_t n_lane = static_cast(coreid) % kMatFP4WideNCoreCount;
+                const uint64_t first_local_m = MatFP4SplitNearHalf16(group_m);
+                const uint64_t local_begin = m_lane == 0 ? 0 : first_local_m;
+                const uint64_t local_m = m_lane == 0 ? first_local_m : group_m - first_local_m;
+                const uint64_t nb = N / wide_nbs;
+                const uint64_t m_tile_count = MatFP4WideTileCount(local_m);
+                for (uint64_t ni = n_lane; ni < nb; ni += kMatFP4WideNCoreCount) {
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        MatFP4TileDesc tile = MatFP4GetWideTile(local_m, mi);
+                        tile.offset += local_begin;
+                        process_tile(group_a, group_a_scale, group_c, ni, tile, cnt_c, cnt_k);
+                    }
+                }
+            }
+            row_begin += group_m;
+        }
+    }
+public:
+    uint64_t G = 0;
+    uint64_t K = 0;
+    uint64_t N = 0;
+    uint64_t narrow_nbs = 0;
+    uint64_t wide_nbs = 0;
+    uint64_t small_m_limit = 0;
+    uint64_t n_only_mode = 0;
+    uint64_t small_aic_kbs = 0;
+    uint64_t small_mad_k = 0;
+    uint64_t middle_aic_kbs = 0;
+    uint64_t middle_mad_k = 0;
+    int32_t coreid = 0;
+    **gm** void *group_list_gm = nullptr;
+    **gm** void *a_gm = nullptr;
+    **gm** void *a_scale_gm = nullptr;
+    **gm** void *b_gm = nullptr;
+    **gm** void *table_gm = nullptr;
+    **gm** void *c_gm = nullptr;
+    **cbuf** void *l1_base = nullptr;
+    **ca** void *a0[2] {};
+    **cb** void *b0[2] {};
+    **cc** void *c0[2] {};
+};
+extern "C" **global** **aicore** void mat_fp4_mix_aic(uint64_t g, uint64_t k, uint64_t n, **gm** void *group_list,
+                                                       **gm** void *a, **gm** void *a_scale, **gm** void *b,
+                                                       **gm** void *table, **gm** void *c, **gm** void *tiling)
+{
+    MatFP4 mat;
+    mat.Init(g, k, n, group_list, a, a_scale, b, table, c, tiling);
+    mat.process();
+}
+#endif
+########## [4/9] mat_fp4_aiv.cce ##########
+#ifdef **CCE_KT_TEST**
+#define **aicore**
+#else
+#define **aicore** [aicore]
+#endif
+#include "kernel_operator.h"
+#include "kernel_tensor.h"
+#include "mat_fp4_tiling.h"
+using namespace AscendC;
+using namespace MicroAPI;
+#ifdef **DAV_C310_VEC**
+class MatFP4 {
+private:
+    **aicore** inline void init_spr()
+    {
+        set_atomic_none();
+        set_pcie_wr_ctrl(0);
+        set_pcie_rd_ctrl(0);
+    }
+    // 使用 DIST_UNPACK4_B8 解码动态 KxN tile。
+    // 每个 K256xN32 块共享一个 LUT；每个 K1 后保留一行 padding，避免 UB bank conflict。
+    **aicore** inline void run_lut(**ubuf** void *a, **ubuf** void *table, **ubuf** void *out,
+                                   uint16_t n1_blocks, uint16_t k1_blocks)
+    {
+        constexpr uint16_t kK0 = 16;
+        constexpr uint16_t kPackedN0Bytes = 8;
+        constexpr uint16_t kK1BlocksPerLut = 16;
+        constexpr uint16_t kPackedBytesPerRepeat = 64;
+        constexpr uint16_t kDecodedBytesPerRepeat = 256;
+        constexpr uint16_t kRepeatsPerK1 = 2;
+        constexpr uint16_t kBankStrideRows = 1;
+        **VEC_SCOPE** {
+            MaskReg mask_all32 = CreateMask<uint32_t, MaskPattern::ALL>();
+            MaskReg mask_all8 = CreateMask<uint8_t, MaskPattern::ALL>();
+            RegTensor reg_table;
+            RegTensor reg_packed_w32;
+            RegTensor reg_high_nibble;
+            RegTensor reg_high_index;
+            RegTensor reg_index_word;
+            RegTensor reg_index_mask;
+            RegTensor reg_shift_right4;
+            RegTensor reg_shift_left16;
+            RegTensor reg_value;
+            Duplicate(reg_shift_right4, static_cast(4), mask_all32);
+            Duplicate(reg_shift_left16, static_cast(16), mask_all32);
+            Duplicate(reg_index_mask, static_cast(0x000F000F), mask_all32);
+            for (uint16_t n1 = 0; n1 < n1_blocks; ++n1) {
+                for (uint16_t lut_k = 0; lut_k < k1_blocks / kK1BlocksPerLut; ++lut_k) {
+                    // 本地 LUT 为 [K/256,N/32,32 Byte]，每个 LUT 复用 16 个 K1 分形。
+                    const uint16_t table_index = lut_k * n1_blocks + n1;
+                    DataCopy(reg_table, (**ubuf** uint16_t *)table + table_index * 16);
+                    for (uint16_t local_k1 = 0; local_k1 < kK1BlocksPerLut; ++local_k1) {
+                        const uint16_t k1 = lut_k * kK1BlocksPerLut + local_k1;
+                        const uint64_t packed_k1_offset =
+                            (static_cast(n1) * k1_blocks + k1) * kK0 * kPackedN0Bytes;
+                        const uint64_t output_k1_offset =
+                            (static_cast(n1) * k1_blocks + k1) * (kK0 + kBankStrideRows) * 32;
+                        for (uint16_t repeat = 0; repeat < kRepeatsPerK1; ++repeat) {
+                            // 每次将 64 个 packed Byte 零扩展为 64 个 uint32 lane。
+                            DataCopy<uint32_t, MicroAPI::LoadDist::DIST_UNPACK4_B8>(
+                                reg_packed_w32, (**ubuf** uint32_t *)a +
+                                                    (packed_k1_offset + repeat * kPackedBytesPerRepeat) / sizeof(uint32_t));
+                            // 在 uint32 的低/高 16 bit 中直接构造两个 pair-LUT 索引。
+                            ShiftRight(reg_high_nibble, reg_packed_w32, reg_shift_right4, mask_all32);
+                            ShiftLeft(reg_high_index, reg_high_nibble, reg_shift_left16, mask_all32);
+                            Or(reg_index_word, reg_packed_w32, reg_high_index, mask_all32);
+                            And(reg_index_word, reg_index_word, reg_index_mask, mask_all32);
+                            Gather(reg_value, reg_table, (RegTensor &)reg_index_word);
+                            DataCopy((**ubuf** uint8_t *)out + output_k1_offset + repeat * kDecodedBytesPerRepeat,
+                                     (RegTensor &)reg_value, mask_all8);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    **aicore** inline void gm_ub(**ubuf** void *ub, **gm** void *gm, uint64_t burst_count, uint64_t burst_bytes,
+                                uint64_t destination_stride, uint64_t source_stride)
+    {
+        uint64_t cfg0 = 0;
+        cfg0 |= burst_count << 4;
+        cfg0 |= burst_bytes << 25;
+        uint64_t cfg1 = source_stride;
+        cfg1 |= destination_stride << 40;
+        uint64_t loop_size = 1;
+        loop_size |= static_cast(1) << 21;
+        set_loop_size_outtoub(loop_size);
+        set_loop1_stride_outtoub(0);
+        set_loop2_stride_outtoub(0);
+        copy_gm_to_ubuf_align_v2((**ubuf** float *)ub, (**gm** float *)gm, cfg0, cfg1);
+    }
+    **aicore** inline void ub_l1(**cbuf** void *l1, **ubuf** void *ub, uint64_t burst_count, uint64_t burst_length,
+                                uint64_t destination_stride, uint64_t source_stride)
+    {
+        uint64_t cfg = 0;
+        cfg |= burst_count << 4;
+        cfg |= burst_length << 16;
+        cfg |= source_stride << 32;
+        cfg |= destination_stride << 48;
+        copy_ubuf_to_cbuf((**cbuf*_ uint8_t *)l1, (**ubuf** uint8_t *)ub, cfg);
+    }
+    **aicore** inline void InitBuffer()
+    {
+        const uint64_t small_elements = narrow_nbs * small_aiv_kbs;
+        const uint64_t middle_elements = narrow_nbs * middle_aiv_kbs;
+        const uint64_t wide_elements = wide_nbs * middle_aiv_kbs;
+        const uint64_t narrow_elements = small_elements > middle_elements ? small_elements : middle_elements;
+        const uint64_t max_elements = narrow_elements > wide_elements ? narrow_elements : wide_elements;
+        const uint64_t packed_bytes = max_elements / 4;
+        const uint64_t decoded_bytes = max_elements * 17 / 16;
+        const uint64_t small_lut_count = (small_aiv_kbs / 256) * (narrow_nbs / 32);
+        const uint64_t middle_lut_count = (middle_aiv_kbs / 256) * (narrow_nbs / 32);
+        const uint64_t wide_lut_count = (middle_aiv_kbs / 256) * (wide_nbs / 32);
+        const uint64_t narrow_lut_count = small_lut_count > middle_lut_count ? small_lut_count : middle_lut_count;
+        const uint64_t lut_count = narrow_lut_count > wide_lut_count ? narrow_lut_count : wide_lut_count;
+        const uint64_t table_bytes = (lut_count + 7) * 32;
+        **ubuf** uint8_t *ub_base = (**ubuf** uint8_t *)get_imm(0);
+        // packed、decoded 与 LUT 均使用 ping-pong 双缓冲。
+        a[0] = (**ubuf** void *)ub_base;
+        a[1] = (**ubuf** void *)(ub_base + packed_bytes);
+        b[0] = (**ubuf** void *)(ub_base + 2 * packed_bytes);
+        b[1] = (**ubuf** void *)(ub_base + 2 * packed_bytes + decoded_bytes);
+        table[0] = (**ubuf** void *)(ub_base + 2 * packed_bytes + 2 * decoded_bytes);
+        table[1] = (**ubuf** void *)(ub_base + 2 * packed_bytes + 2 * decoded_bytes + table_bytes);
+        // 与 AIC 共用两个 256 KiB L1 槽，B 起点按当前档位的 A 容量计算。
+        l1_base = (**cbuf** void *)get_imm(0);
+    }
+    **aicore** inline void process_tile(**gm** uint8_t *group_b, **gm** uint8_t *group_table,
+                                        uint64_t n_begin, uint64_t mode, uint64_t &cnt_k)
+    {
+        const uint64_t k0 = 16;
+        const uint64_t n0 = 32;
+        const uint64_t codebook_k = 256;
+        const uint64_t codebook_n = 32;
+        const bool small_tile = mode == MAT_FP4_SMALL;
+        const bool wide_tile = mode == MAT_FP4_WIDE;
+        const uint64_t tile_n = wide_tile ? wide_nbs : narrow_nbs;
+        const uint64_t aiv_kbs = small_tile ? small_aiv_kbs : middle_aiv_kbs;
+        const uint64_t aic_kbs = small_tile ? small_aic_kbs : middle_aic_kbs;
+        const uint64_t a1_m_capacity =
+            small_tile ? small_m_limit : (wide_tile ? kMatFP4WideTileM : kMatFP4MaxTileM);
+        const uint64_t a1_bytes = a1_m_capacity * aic_kbs;
+        const uint64_t n1_blocks = tile_n / n0;
+        const uint64_t k0_blocks = aiv_kbs / k0;
+        const uint64_t codebook_k_blocks = aiv_kbs / codebook_k;
+        const uint64_t kb = K / aic_kbs;
+        const uint64_t n_group_count = N / codebook_n;
+        for (uint64_t ki = 0; ki < kb; ++ki) {
+            const uint64_t id = cnt_k & 1;
+            const uint64_t k0_block_begin = (ki * 2 + static_cast(subid)) * k0_blocks;
+            wait_flag(PIPE_V, PIPE_MTE2, id);
+            // 两个 AIV 读取同一 N tile 的相邻 K 半区。
+            const uint64_t n1_begin = n_begin / n0;
+            **gm** uint8_t *packed_source =
+                group_b + (n1_begin * (K / k0) + k0_block_begin) * k0 * (n0 / 4);
+            gm_ub(a[id], packed_source, n1_blocks, aiv_kbs * (n0 / 4), aiv_kbs * (n0 / 4),
+                  K * (n0 / 4));
+            // LUT 全局排布 [K/256,N/32,32]；当前 AIV 搬入动态局部块。
+            const uint64_t n_group = n_begin / codebook_n;
+            const uint64_t codebook_k_block_begin = k0_block_begin / (codebook_k / k0);
+            **gm** uint8_t *table_source =
+                group_table + (codebook_k_block_begin * n_group_count + n_group) * 32;
+            gm_ub(table[id], table_source, codebook_k_blocks, n1_blocks * 32, n1_blocks * 32,
+                  n_group_count * 32);
+            set_flag(PIPE_MTE2, PIPE_V, id);
+            wait_flag(PIPE_MTE2, PIPE_V, id);
+            wait_flag(PIPE_MTE3, PIPE_V, id);
+            run_lut(a[id], table[id], b[id], static_cast(n1_blocks),
+                    static_cast(k0_blocks));
+            set_flag(PIPE_V, PIPE_MTE3, id);
+            wait_flag(PIPE_V, PIPE_MTE3, id);
+            set_flag(PIPE_V, PIPE_MTE2, id);
+            // 等待 AIC 释放对应的 L1B ping-pong buffer。
+            wait_intra_block(PIPE_MTE3, id * 2);
+            // 两个 AIV 写入共享 L1B 的相邻 K1 半区，MTE3 同时去除 UB padding。
+            for (uint64_t n1 = 0; n1 < n1_blocks; ++n1) {
+                **cbuf** uint8_t *l1_destination = (**cbuf** uint8_t *)l1_base +
+                    id * kMatFP4L1SlotBytes + a1_bytes +
+                    (n1 * (2 * k0_blocks) + static_cast(subid) * k0_blocks) * k0 * n0;
+                **ubuf** uint8_t *ub_source =
+                    (**ubuf** uint8_t *)b[id] + n1 * k0_blocks * (k0 + 1) * n0;
+                ub_l1(l1_destination, ub_source, k0_blocks, k0, 0, 1);
+            }
+            set_flag(PIPE_MTE3, PIPE_V, id);
+            // 通知 AIC：当前 B 半区已就绪。
+            set_intra_block(PIPE_MTE3, id * 2 + 1);
+            ++cnt_k;
+        }
+    }
+public:
+    **aicore** inline void Init(uint64_t g, uint64_t k, uint64_t n, **gm** void *group_list, **gm** void *a,
+                               **gm** void *a_scale, **gm** void *b, **gm** void *table, **gm** void *c,
+                               **gm** void *tiling)
+    {
+        G = g;
+        K = k;
+        N = n;
+        group_list_gm = group_list;
+        a_gm = a;
+        a_scale_gm = a_scale;
+        b_gm = b;
+        table_gm = table;
+        c_gm = c;
+        **gm** MatFP4TilingData *tiling_data = (**gm** MatFP4TilingData *)tiling;
+        narrow_nbs = tiling_data->narrow_nbs;
+        wide_nbs = tiling_data->wide_nbs;
+        small_m_limit = tiling_data->small_m_limit;
+        n_only_mode = tiling_data->n_only_mode;
+        small_aiv_kbs = tiling_data->small_aiv_kbs;
+        small_aic_kbs = tiling_data->small_aic_kbs;
+        middle_aiv_kbs = tiling_data->middle_aiv_kbs;
+        middle_aic_kbs = tiling_data->middle_aic_kbs;
+        coreid = get_block_idx();
+        subid = get_subblockid() & 1;
+        InitBuffer();
+        init_spr();
+    }
+    **aicore** inline void process()
+    {
+        // AIC/AIV 使用同一组 M/N 映射，subid 选择相邻 K 半区。
+        const uint64_t codebook_k = 256;
+        const uint64_t codebook_n = 32;
+        const uint64_t n_group_count = N / codebook_n;
+        set_flag(PIPE_V, PIPE_MTE2, 0);
+        set_flag(PIPE_MTE3, PIPE_V, 0);
+        set_flag(PIPE_V, PIPE_MTE2, 1);
+        set_flag(PIPE_MTE3, PIPE_V, 1);
+        **gm** uint8_t *b_base = (**gm** uint8_t *)b_gm;
+        **gm** uint8_t *table_base = (**gm** uint8_t *)table_gm;
+        **gm** int64_t *group_list = (**gm** int64_t *)group_list_gm;
+        const uint64_t b_group_bytes = N * K / 4;
+        const uint64_t table_group_bytes = (K / codebook_k) * n_group_count * 32;
+        // AIC/AIV 同步跳过空组，event 保护跨组复用的共享 L1B。
+        for (uint64_t group_id = 0; group_id < G; ++group_id) {
+            const int64_t signed_group_m = group_list[group_id];
+            if (signed_group_m <= 0) {
+                continue;
+            }
+            const uint64_t group_m = static_cast(signed_group_m);
+            const bool wide_group = n_only_mode == 0 && group_m >= kMatFP4WideMThreshold;
+            uint64_t cnt_k = 0;
+            **gm** uint8_t *group_b = b_base + group_id * b_group_bytes;
+            **gm** uint8_t *group_table = table_base + group_id * table_group_bytes;
+            if (n_only_mode != 0) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NOnlyTileCount(group_m);
+                for (uint64_t ni = static_cast(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    const uint64_t n_begin = ni * narrow_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        process_tile(group_b, group_table, n_begin,
+                                     MatFP4GetNOnlyTile(group_m, mi, small_m_limit).mode, cnt_k);
+                    }
+                }
+            } else if (!wide_group) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NarrowTileCount(group_m);
+                for (uint64_t ni = static_cast(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount) {
+                    const uint64_t n_begin = ni * narrow_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        process_tile(group_b, group_table, n_begin,
+                                     MatFP4GetNarrowTile(group_m, mi, small_m_limit).mode, cnt_k);
+                    }
+                }
+            } else {
+                const uint64_t m_lane = static_cast(coreid) / kMatFP4WideNCoreCount;
+                const uint64_t n_lane = static_cast(coreid) % kMatFP4WideNCoreCount;
+                const uint64_t first_local_m = MatFP4SplitNearHalf16(group_m);
+                const uint64_t local_m = m_lane == 0 ? first_local_m : group_m - first_local_m;
+                const uint64_t nb = N / wide_nbs;
+                const uint64_t m_tile_count = MatFP4WideTileCount(local_m);
+                for (uint64_t ni = n_lane; ni < nb; ni += kMatFP4WideNCoreCount) {
+                    const uint64_t n_begin = ni * wide_nbs;
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        process_tile(group_b, group_table, n_begin, MatFP4GetWideTile(local_m, mi).mode, cnt_k);
+                    }
+                }
+            }
+        }
+    }
+public:
+    uint64_t G = 0;
+    uint64_t K = 0;
+    uint64_t N = 0;
+    uint64_t narrow_nbs = 0;
+    uint64_t wide_nbs = 0;
+    uint64_t small_m_limit = 0;
+    uint64_t n_only_mode = 0;
+    uint64_t small_aiv_kbs = 0;
+    uint64_t small_aic_kbs = 0;
+    uint64_t middle_aiv_kbs = 0;
+    uint64_t middle_aic_kbs = 0;
+    int32_t coreid = 0;
+    int32_t subid = 0;
+    **gm** void *group_list_gm = nullptr;
+    **gm** void *a_gm = nullptr;
+    **gm** void *a_scale_gm = nullptr;
+    **gm** void *b_gm = nullptr;
+    **gm** void *table_gm = nullptr;
+    **gm** void *c_gm = nullptr;
+    **ubuf** void *a[2] {};
+    **ubuf** void *b[2] {};
+    **ubuf** void *table[2] {};
+    **cbuf** void *l1_base = nullptr;
+};
+extern "C" **global** **aicore** void mat_fp4_mix_aiv(uint64_t g, uint64_t k, uint64_t n, **gm** void *group_list,
+                                                       **gm** void *a, **gm** void *a_scale, **gm** void *b,
+                                                       **gm** void *table, **gm** void *c, **gm** void *tiling)
+{
+    MatFP4 mat;
+    mat.Init(g, k, n, group_list, a, a_scale, b, table, c, tiling);
+    mat.process();
+}
+#endif
+########## [5/9] mat_fp4_host.cc ##########
+#include <acl/acl.h>
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include 
+#include <sys/stat.h>
+#include 
+#include "data_utils.h"
+#include "hacl_rt.h"
+#include "mat_fp4_tiling.h"
+namespace {
+static_assert(sizeof(MatFP4TilingData) == 10 * sizeof(uint64_t), "unexpected tiling data layout");
+constexpr uint64_t kMaxGroupCount = 128;
+constexpr uint64_t kKTile = 1024;
+constexpr uint64_t kZnK0 = 16;
+constexpr uint64_t kZnN0 = 32;
+constexpr uint64_t kCodebookK = 256;
+constexpr uint64_t kCodebookN = 32;
+constexpr uint64_t kMxScaleGroupSize = 32;
+constexpr uint32_t kKernelCoreCount = 32;
+constexpr uint64_t kNAlignment = kKernelCoreCount * kCodebookN;
+constexpr uint64_t kNarrowNBlock = 128;
+constexpr uint64_t kWideNBlock = 256;
+constexpr uint64_t kN6144 = 6144;
+constexpr uint64_t kN6144Block = 192;
+// N=4096: M=128 时 (A:128x1024 + B:1024x128) 恰好占满单个 256 KiB L1 slot。
+// 将 small 档上限降到 96，为每个 ping/pong slot 保留 32 KiB 空间。
+constexpr uint64_t kN4096SmallM = 96;
+constexpr uint64_t kN6144SmallM = 64;
+constexpr uint64_t kSmallAivK = 512;
+constexpr uint64_t kSmallAicK = 1024;
+constexpr uint64_t kSmallMadK = 256;
+constexpr uint64_t kN6144SmallMadK = 128;
+constexpr uint64_t kMiddleAivK = 256;
+constexpr uint64_t kMiddleAicK = 512;
+constexpr uint64_t kMiddleMadK = 128;
+constexpr uint64_t kLutPrefetchPadding = 7;
+constexpr uint64_t kUbCapacity = 256 * 1024;
+constexpr uint64_t kL1Capacity = 512 * 1024;
+constexpr uint64_t kL0ACapacity = 64 * 1024;
+constexpr uint64_t kL0BCapacity = 64 * 1024;
+constexpr uint64_t kL0CCapacity = 256 * 1024;
+static_assert(kL1Capacity == 2 * kMatFP4L1SlotBytes, "L1 slot layout must cover all L1 memory");
+using OutputStorage = uint16_t;
+static_assert(sizeof(OutputStorage) == 2, "BF16 output storage must occupy 2 bytes");
+constexpr const char *kKernelName = "mat_fp4";
+constexpr const char *kKernelBinary = "mat_fp4.o";
+struct MatFP4Args {
+    uint64_t group_count;
+    uint64_t k;
+    uint64_t n;
+    void *group_list;
+    void *a;
+    void *a_scale;
+    void *b;
+    void *table;
+    void *c;
+    void *tiling;
+};
+static_assert(sizeof(MatFP4Args) == 10 * sizeof(uint64_t), "unexpected kernel argument layout");
+[[noreturn]] void ThrowError(const std::string &action, int64_t code)
+{
+    throw std::runtime_error(action + " failed, error code=" + std::to_string(code));
+}
+void CheckRt(rtError_t status, const std::string &action)
+{
+    if (status != RT_ERROR_NONE) ThrowError(action, status);
+}
+void CheckAcl(aclError status, const std::string &action)
+{
+    if (status != ACL_SUCCESS) ThrowError(action, status);
+}
+uint64_t CheckedProduct(std::initializer_list values)
+{
+    uint64_t result = 1;
+    for (uint64_t value : values) {
+        if (value != 0 && result > std::numeric_limits::max() / value) {
+            throw std::overflow_error("tensor byte size overflow");
+        }
+        result *= value;
+    }
+    return result;
+}
+uint64_t CheckedSum(std::initializer_list values)
+{
+    uint64_t result = 0;
+    for (uint64_t value : values) {
+        if (result > std::numeric_limits::max() - value) {
+            throw std::overflow_error("tensor byte size overflow");
+        }
+        result += value;
+    }
+    return result;
+}
+uint64_t AivUbBytes(uint64_t nbs, uint64_t aiv_kbs)
+{
+    const uint64_t packed_bytes = CheckedProduct({nbs, aiv_kbs}) / 4;
+    const uint64_t decoded_bytes = CheckedProduct({nbs, aiv_kbs, kZnK0 + 1}) / kZnK0;
+    const uint64_t lut_count = CheckedProduct({aiv_kbs / kCodebookK, nbs / kCodebookN});
+    const uint64_t table_bytes = CheckedProduct({CheckedSum({lut_count, kLutPrefetchPadding}), uint64_t {32}});
+    return CheckedProduct({uint64_t {2}, CheckedSum({packed_bytes, decoded_bytes, table_bytes})});
+}
+uint64_t L1SlotBytes(uint64_t m, uint64_t n, uint64_t k)
+{
+    const uint64_t data_bytes = CheckedProduct({m + n, k});
+    const uint64_t scale_bytes = CheckedProduct({m, k}) / kMxScaleGroupSize;
+    // 只有 N=6144 small 档会超过 256 KiB；kernel 在 A(mad_k) 进入 L0A 后原位复用该段 L1A。
+    return data_bytes + scale_bytes <= kMatFP4L1SlotBytes ? data_bytes + scale_bytes : data_bytes;
+}
+bool L1ScaleReusesA(uint64_t m, uint64_t n, uint64_t k)
+{
+    const uint64_t data_bytes = CheckedProduct({m + n, k});
+    const uint64_t scale_bytes = CheckedProduct({m, k}) / kMxScaleGroupSize;
+    return data_bytes + scale_bytes > kMatFP4L1SlotBytes;
+}
+uint64_t L1SmallBytes(const MatFP4TilingData &tiling)
+{
+    return CheckedProduct({uint64_t {2}, L1SlotBytes(tiling.small_m_limit, tiling.narrow_nbs,
+                                                     tiling.small_aic_kbs)});
+}
+uint64_t L1MiddleBytes(const MatFP4TilingData &tiling)
+{
+    return CheckedProduct({uint64_t {2}, L1SlotBytes(kMatFP4MaxTileM, tiling.narrow_nbs,
+                                                     tiling.middle_aic_kbs)});
+}
+uint64_t L1WideBytes(const MatFP4TilingData &tiling)
+{
+    const uint64_t large_m = tiling.n_only_mode != 0 ? kMatFP4MaxTileM : kMatFP4WideTileM;
+    return CheckedProduct({uint64_t {2}, L1SlotBytes(large_m, tiling.wide_nbs, tiling.middle_aic_kbs)});
+}
+uint64_t L1Bytes(const MatFP4TilingData &tiling)
+{
+    return std::max({L1SmallBytes(tiling), L1MiddleBytes(tiling), L1WideBytes(tiling)});
+}
+uint64_t L0ABytes(const MatFP4TilingData &tiling)
+{
+    const uint64_t tile_bytes = std::max(CheckedProduct({tiling.small_m_limit, tiling.small_mad_k}),
+                                         CheckedProduct({kMatFP4MaxTileM, tiling.middle_mad_k}));
+    return CheckedProduct({uint64_t {2}, tile_bytes});
+}
+uint64_t L0BBytes(const MatFP4TilingData &tiling)
+{
+    const uint64_t narrow_tile_bytes =
+        std::max(CheckedProduct({tiling.narrow_nbs, tiling.small_mad_k}),
+                 CheckedProduct({tiling.narrow_nbs, tiling.middle_mad_k}));
+    const uint64_t tile_bytes =
+        std::max(narrow_tile_bytes, CheckedProduct({tiling.wide_nbs, tiling.middle_mad_k}));
+    return CheckedProduct({uint64_t {2}, tile_bytes});
+}
+uint64_t L0CBytes(const MatFP4TilingData &tiling)
+{
+    const uint64_t double_m = tiling.n_only_mode != 0 ? tiling.small_m_limit : kMatFP4MaxTileM;
+    const uint64_t large_m = tiling.n_only_mode != 0 ? kMatFP4MaxTileM : kMatFP4WideTileM;
+    const uint64_t narrow_bytes = CheckedProduct({uint64_t {2}, double_m, tiling.narrow_nbs, sizeof(float)});
+    const uint64_t middle_bytes = CheckedProduct({kMatFP4MaxTileM, tiling.narrow_nbs, sizeof(float)});
+    const uint64_t wide_bytes = CheckedProduct({large_m, tiling.wide_nbs, sizeof(float)});
+    return std::max({narrow_bytes, middle_bytes, wide_bytes});
+}
+uint64_t AivUbMaxBytes(const MatFP4TilingData &tiling)
+{
+    const uint64_t narrow_bytes =
+        std::max(AivUbBytes(tiling.narrow_nbs, tiling.small_aiv_kbs),
+                 AivUbBytes(tiling.narrow_nbs, tiling.middle_aiv_kbs));
+    return std::max(narrow_bytes, AivUbBytes(tiling.wide_nbs, tiling.middle_aiv_kbs));
+}
+MatFP4TilingData BuildTiling(uint64_t k, uint64_t n)
+{
+    MatFP4TilingData tiling {};
+    const bool n6144 = n == kN6144;
+    tiling.narrow_nbs = n6144 ? kN6144Block : kNarrowNBlock;
+    tiling.wide_nbs = n6144 ? kN6144Block : kWideNBlock;
+    tiling.small_m_limit = n6144 ? kN6144SmallM : kN4096SmallM;
+    tiling.n_only_mode = n6144 ? 1 : 0;
+    tiling.small_aiv_kbs = kSmallAivK;
+    tiling.small_aic_kbs = kSmallAicK;
+    tiling.small_mad_k = n6144 ? kN6144SmallMadK : kSmallMadK;
+    tiling.middle_aiv_kbs = kMiddleAivK;
+    tiling.middle_aic_kbs = kMiddleAicK;
+    tiling.middle_mad_k = kMiddleMadK;
+    if (n % tiling.narrow_nbs != 0 || n % tiling.wide_nbs != 0) {
+        throw std::invalid_argument("N must be divisible by the selected N tiles");
+    }
+    if (k % tiling.small_aic_kbs != 0 || k % tiling.middle_aic_kbs != 0) {
+        throw std::invalid_argument("K must be divisible by both AIC K tiles");
+    }
+    if (tiling.small_aic_kbs != 2 * tiling.small_aiv_kbs ||
+        tiling.middle_aic_kbs != 2 * tiling.middle_aiv_kbs ||
+        tiling.small_aic_kbs % tiling.small_mad_k != 0 ||
+        tiling.middle_aic_kbs % tiling.middle_mad_k != 0 ||
+        tiling.small_aic_kbs % 64 != 0 || tiling.middle_aic_kbs % 64 != 0) {
+        throw std::logic_error("invalid fixed AIV/AIC/MMAD tiling");
+    }
+    const uint64_t large_m = tiling.n_only_mode != 0 ? kMatFP4MaxTileM : kMatFP4WideTileM;
+    if (CheckedProduct({tiling.small_m_limit + tiling.narrow_nbs, tiling.small_aic_kbs}) >
+            kMatFP4L1SlotBytes ||
+        CheckedProduct({kMatFP4MaxTileM + tiling.narrow_nbs, tiling.middle_aic_kbs}) >
+            kMatFP4L1SlotBytes ||
+        CheckedProduct({large_m + tiling.wide_nbs, tiling.middle_aic_kbs}) > kMatFP4L1SlotBytes) {
+        throw std::logic_error("fixed A/B data tiling exceeds one 256 KiB L1 slot");
+    }
+    if (AivUbMaxBytes(tiling) > kUbCapacity) {
+        throw std::logic_error("fixed tiling exceeds 256 KiB UB capacity");
+    }
+    if (L1Bytes(tiling) > kL1Capacity) {
+        throw std::logic_error("fixed tiling exceeds 512 KiB L1 capacity");
+    }
+    if (L0ABytes(tiling) > kL0ACapacity) {
+        throw std::logic_error("fixed tiling exceeds 64 KiB L0A capacity");
+    }
+    if (L0BBytes(tiling) > kL0BCapacity) {
+        throw std::logic_error("fixed tiling exceeds 64 KiB L0B capacity");
+    }
+    if (L0CBytes(tiling) > kL0CCapacity) {
+        throw std::logic_error("fixed tiling exceeds 256 KiB L0C capacity");
+    }
+    return tiling;
+}
+size_t ToHostSize(uint64_t size)
+{
+    if (size > std::numeric_limits::max()) {
+        throw std::overflow_error("tensor is too large for host address space");
+    }
+    return static_cast(size);
+}
+void ReadExactFile(const std::string &path, void *destination, uint64_t expected_size)
+{
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("cannot open input file: " + path);
+    }
+    const std::streamoff actual_size = file.tellg();
+    if (actual_size < 0 || static_cast(actual_size) != expected_size) {
+        throw std::runtime_error(path + " has " + std::to_string(actual_size) + " bytes; expected " +
+                                 std::to_string(expected_size));
+    }
+    file.seekg(0, std::ios::beg);
+    file.read(static_cast<char *>(destination), static_caststd::streamsize(expected_size));
+    if (!file) {
+        throw std::runtime_error("failed to read complete input file: " + path);
+    }
+}
+class DeviceBuffer {
+public:
+    explicit DeviceBuffer(uint64_t bytes) : bytes_(bytes)
+    {
+        CheckRt(rtMalloc(&pointer*, bytes_, RT_MEMORY_HBM), "rtMalloc");
+    }
+    ~DeviceBuffer()
+    {
+        if (pointer_ != nullptr) {
+            (void)rtFree(pointer_);
+        }
+    }
+    DeviceBuffer(const DeviceBuffer &) = delete;
+    DeviceBuffer &operator=(const DeviceBuffer &) = delete;
+    void *data() const { return pointer_; }
+    uint64_t size() const { return bytes_; }
+private:
+    void *pointer_ = nullptr;
+    uint64_t bytes_ = 0;
+};
+class RuntimeStream {
+public:
+    RuntimeStream()
+    {
+        CheckRt(rtStreamCreate(&stream_, 0), "rtStreamCreate");
+    }
+    ~RuntimeStream()
+    {
+        if (stream_ != nullptr) {
+            (void)rtStreamDestroy(stream_);
+        }
+    }
+    RuntimeStream(const RuntimeStream &) = delete;
+    RuntimeStream &operator=(const RuntimeStream &) = delete;
+    rtStream_t get() const { return stream_; }
+    aclrtStream acl_get() const { return reinterpret_cast(stream_); }
+    void Synchronize(const char *phase) const
+    {
+        CheckRt(rtStreamSynchronize(stream_), std::string("rtStreamSynchronize(") + phase + ")");
+    }
+private:
+    rtStream_t stream_ = nullptr;
+};
+class RuntimeEvent {
+public:
+    RuntimeEvent()
+    {
+        CheckAcl(aclrtCreateEvent(&event_), "aclrtCreateEvent");
+    }
+    ~RuntimeEvent()
+    {
+        if (event_ != nullptr) {
+            (void)aclrtDestroyEvent(event_);
+        }
+    }
+    RuntimeEvent(const RuntimeEvent &) = delete;
+    RuntimeEvent &operator=(const RuntimeEvent &) = delete;
+    void Record(const RuntimeStream &stream) const
+    {
+        CheckAcl(aclrtRecordEvent(event_, stream.acl_get()), "aclrtRecordEvent");
+    }
+    float ElapsedMillisecondsTo(const RuntimeEvent &end) const
+    {
+        float elapsed_ms = 0.0F;
+        CheckAcl(aclrtEventElapsedTime(&elapsed_ms, event_, end.event_), "aclrtEventElapsedTime");
+        return elapsed_ms;
+    }
+private:
+    aclrtEvent event_ = nullptr;
+};
+class RegisteredKernel {
+public:
+    RegisteredKernel(const char *kernel_name, const char *binary_path)
+    {
+        std::ifstream file(binary_path, std::ios::binary | std::ios::ate);
+        if (!file) {
+            throw std::runtime_error(std::string("cannot open kernel binary: ") + binary_path);
+        }
+        const std::streamoff binary_size = file.tellg();
+        if (binary_size <= 0) {
+            throw std::runtime_error(std::string("empty kernel binary: ") + binary_path);
+        }
+        binary_.resize(static_cast(binary_size));
+        file.seekg(0, std::ios::beg);
+        file.read(binary_.data(), binary_size);
+        if (!file) {
+            throw std::runtime_error(std::string("failed to read kernel binary: ") + binary_path);
+        }
+        rtDevBinary_t binary_desc {};
+        binary_desc.magic = RT_DEV_BINARY_MAGIC_ELF;
+        binary_desc.version = 0;
+        binary_desc.data = binary_.data();
+        binary_desc.length = binary_.size();
+        CheckRt(rtDevBinaryRegister(&binary_desc, &binary_handle_), "rtDevBinaryRegister");
+        const void *stub = reinterpret_cast<const void *>(kernel_name);
+        CheckRt(rtFunctionRegister(binary_handle_, stub, kernel_name, const_cast<void *>(stub), 0), "rtFunctionRegister");
+    }
+    RegisteredKernel(const RegisteredKernel &) = delete;
+    RegisteredKernel &operator=(const RegisteredKernel &) = delete;
+private:
+    std::vector binary_;
+    void *binary_handle_ = nullptr;
+};
+void ValidateShape(uint64_t group_count, uint64_t k, uint64_t n)
+{
+    if (group_count == 0 || group_count > kMaxGroupCount) {
+        throw std::invalid_argument("group count G must be in [1, 128]");
+    }
+    if (k == 0 || k % kKTile != 0) {
+        throw std::invalid_argument("K must be a positive multiple of 1024");
+    }
+    if (n == 0 || n % kNAlignment != 0) {
+        throw std::invalid_argument("N must be a positive multiple of 1024");
+    }
+}
+void CopyHostToDevice(DeviceBuffer &destination, const void *source)
+{
+    CheckRt(rtMemcpy(destination.data(), destination.size(), source, destination.size(), RT_MEMCPY_HOST_TO_DEVICE),
+            "rtMemcpy(H2D)");
+}
+void LaunchGroupPass(const RuntimeStream &stream, uint64_t group_count, uint64_t k, uint64_t n,
+                     const DeviceBuffer &group_list, const DeviceBuffer &a, const DeviceBuffer &a_scale,
+                     const DeviceBuffer &all_b, const DeviceBuffer &all_tables, DeviceBuffer &all_c,
+                     const DeviceBuffer &tiling)
+{
+    // 单次 launch 处理全部 group；group_list[i] 为非累计 M_i，A/C 按行连续拼接。
+    MatFP4Args args {group_count, k, n, group_list.data(), a.data(), a_scale.data(), all_b.data(),
+                     all_tables.data(), all_c.data(), tiling.data()};
+    CheckRt(rtKernelLaunch(reinterpret_cast<const void *>(kKernelName), kKernelCoreCount, &args, sizeof(args), nullptr,
+                           stream.get()), "rtKernelLaunch(serial group pass)");
+}
+void RunTest(uint64_t group_count, uint64_t k, uint64_t n, uint64_t warmup_cycles, uint64_t test_cycles)
+{
+    ValidateShape(group_count, k, n);
+    if (test_cycles == 0) {
+        throw std::invalid_argument("test_cycles must be at least 1");
+    }
+    const uint64_t group_list_bytes = CheckedProduct({group_count, sizeof(int64_t)});
+    std::vector host_group_list(ToHostSize(group_count));
+    ReadExactFile("input/input_group_list.bin", host_group_list.data(), group_list_bytes);
+    uint64_t total_m = 0;
+    uint64_t active_group_count = 0;
+    for (uint64_t group_id = 0; group_id < group_count; ++group_id) {
+        const int64_t signed_group_m = host_group_list[ToHostSize(group_id)];
+        if (signed_group_m < 0) {
+            throw std::invalid_argument("every group_list[i] must be non-negative; group_list[" +
+                                        std::to_string(group_id) + "]=" + std::to_string(signed_group_m));
+        }
+        const uint64_t group_m = static_cast(signed_group_m);
+        if (total_m > std::numeric_limits::max() - group_m) {
+            throw std::overflow_error("sum(group_list) overflow");
+        }
+        total_m += group_m;
+        active_group_count += group_m != 0;
+    }
+    if (total_m == 0) {
+        throw std::invalid_argument("group_list must contain at least one token row");
+    }
+    const MatFP4TilingData tiling = BuildTiling(k, n);
+    const uint64_t a_bytes = CheckedProduct({total_m, k});
+    const uint64_t a_scale_bytes = CheckedProduct({total_m, k}) / kMxScaleGroupSize;
+    const uint64_t b_group_bytes = CheckedProduct({n, k}) / 4;
+    const uint64_t table_group_bytes = CheckedProduct({k / kCodebookK, n / kCodebookN, uint64_t {32}});
+    const uint64_t all_b_bytes = CheckedProduct({group_count, b_group_bytes});
+    const uint64_t all_table_bytes = CheckedProduct({group_count, table_group_bytes});
+    const uint64_t all_c_elements = CheckedProduct({total_m, n});
+    const uint64_t all_c_bytes = CheckedProduct({all_c_elements, sizeof(OutputStorage)});
+    std::vector host_a(ToHostSize(a_bytes));
+    std::vector host_a_scale(ToHostSize(a_scale_bytes));
+    std::vector host_b(ToHostSize(all_b_bytes));
+    std::vector host_tables(ToHostSize(all_table_bytes));
+    std::vector host_c(ToHostSize(all_c_elements), 0);
+    ReadExactFile("input/input_a.bin", host_a.data(), a_bytes);
+    ReadExactFile("input/input_a_scale.bin", host_a_scale.data(), a_scale_bytes);
+    ReadExactFile("input/input_b.bin", host_b.data(), all_b_bytes);
+    ReadExactFile("input/input_table.bin", host_tables.data(), all_table_bytes);
+    RegisteredKernel registered_kernel(kKernelName, kKernelBinary);
+    DeviceBuffer device_group_list(group_list_bytes);
+    DeviceBuffer device_a(a_bytes);
+    DeviceBuffer device_a_scale(a_scale_bytes);
+    DeviceBuffer device_b(all_b_bytes);
+    DeviceBuffer device_tables(all_table_bytes);
+    DeviceBuffer device_c(all_c_bytes);
+    DeviceBuffer device_tiling(sizeof(tiling));
+    RuntimeStream stream;
+    CopyHostToDevice(device_group_list, host_group_list.data());
+    CopyHostToDevice(device_a, host_a.data());
+    CopyHostToDevice(device_a_scale, host_a_scale.data());
+    CopyHostToDevice(device_b, host_b.data());
+    CopyHostToDevice(device_tables, host_tables.data());
+    CopyHostToDevice(device_c, host_c.data());
+    CopyHostToDevice(device_tiling, &tiling);
+    for (uint64_t cycle = 0; cycle < warmup_cycles; ++cycle) {
+        LaunchGroupPass(stream, group_count, k, n, device_group_list, device_a, device_a_scale, device_b,
+                        device_tables, device_c, device_tiling);
+    }
+    stream.Synchronize("after warmup kernels");
+    RuntimeEvent start_event;
+    RuntimeEvent end_event;
+    for (uint64_t cycle = 0; cycle < test_cycles; ++cycle) {
+        CopyHostToDevice(device_a, host_a.data());
+        CopyHostToDevice(device_a_scale, host_a_scale.data());
+        CopyHostToDevice(device_b, host_b.data());
+        stream.Synchronize("after timed-input H2D");
+        start_event.Record(stream);
+        LaunchGroupPass(stream, group_count, k, n, device_group_list, device_a, device_a_scale, device_b,
+                        device_tables, device_c, device_tiling);
+        end_event.Record(stream);
+    }
+    stream.Synchronize("after timed kernels");
+    CheckRt(rtMemcpy(host_c.data(), all_c_bytes, device_c.data(), all_c_bytes, RT_MEMCPY_DEVICE_TO_HOST),
+            "rtMemcpy(D2H output)");
+    if (mkdir("output", 0755) != 0 && errno != EEXIST) {
+        throw std::runtime_error("cannot create output directory: " + std::string(std::strerror(errno)));
+    }
+    if (!WriteFile("output/output_c.bin", host_c.data(), all_c_bytes)) {
+        throw std::runtime_error("failed to write output/output_c.bin");
+    }
+    const double elapsed_ms = static_cast(start_event.ElapsedMillisecondsTo(end_event));
+    const double pass_ms = elapsed_ms / static_cast(test_cycles);
+    const double group_ms = pass_ms / static_cast(active_group_count);
+    const double operations = 2.0 * static_cast(total_m) * static_cast(n) * static_cast(k);
+    const double throughput_tflops = operations / (pass_ms * 1.0e9);
+    std::string group_list_text = "[";
+    for (uint64_t group_id = 0; group_id < group_count; ++group_id) {
+        if (group_id != 0) {
+            group_list_text += ", ";
+        }
+        group_list_text += std::to_string(host_group_list[ToHostSize(group_id)]);
+    }
+    group_list_text += "]";
+    std::cout << "W2A8 grouped matmul run completed\n"
+              << "  group_list:           " << group_list_text
+              << " (non-cumulative M_i)\n"
+              << "  group count:          " << group_count << '\n'
+              << "  active group count:   " << active_group_count << '\n'
+              << "  total token rows:     " << total_m << '\n'
+              << "  A shape:              [" << total_m << ", " << k << "] MXFP8 E4M3\n"
+              << "  A-scale shape:        [" << total_m << ", " << k / 64
+              << ", 2] E8M0 (" << a_scale_bytes << " bytes)\n"
+              << "  B shape:              [" << group_count << ", " << n << ", "
+              << k << "] W2\n"
+              << "  B packed zN shape:    [" << group_count << ", "
+              << n / kZnN0 << ", " << k / kZnK0 << ", " << kZnK0
+              << ", " << kZnN0 / 4 << "] uint8\n"
+              << "  pair LUT shape:       [" << group_count << ", "
+              << k / kCodebookK << ", " << n / kCodebookN << ", 32] bytes\n"
+              << "  weights per LUT:      " << kCodebookK * kCodebookN
+              << " (K=256 x N=32)\n"
+              << "  zN fractal:           [K0=16, N0=32], N0 contiguous\n"
+              << "  L0B nZ fractal:       [K0=32, N0=16], K0 contiguous\n"
+              << "  A layout:             data GM ND -> L1 zN -> L0A; scale GM DN -> L1 NZ -> L0A_MX\n"
+              << "  B layout:             GM zN -> UB zN -> L1 zN -> L0B; L0B_MX is resident E8M0(1)\n"
+              << "  core policy:          "
+              << (tiling.n_only_mode != 0 ? "1x32, N-only for every M\n" : "1x32 for M<480; 2x16 for M>=480\n")
+              << "  small M tile:         L1[M<=" << tiling.small_m_limit << ",N=" << tiling.narrow_nbs
+              << ",K=" << tiling.small_aic_kbs
+              << "], AIV K=" << tiling.small_aiv_kbs << ", MMAD K=" << tiling.small_mad_k << '\n'
+              << "  middle M tile:        L1[" << tiling.small_m_limit << "<M<=256,N=" << tiling.narrow_nbs
+              << ",K=" << tiling.middle_aic_kbs
+              << "], AIV K=" << tiling.middle_aiv_kbs << ", MMAD K=" << tiling.middle_mad_k << '\n'
+              << "  large M tile:         L1[M<="
+              << (tiling.n_only_mode != 0 ? kMatFP4MaxTileM : kMatFP4WideTileM) << ",N="
+              << (tiling.n_only_mode != 0 ? tiling.narrow_nbs : tiling.wide_nbs)
+              << ",K=" << tiling.middle_aic_kbs
+              << "], AIV K=" << tiling.middle_aiv_kbs << ", MMAD K=" << tiling.middle_mad_k << '\n'
+              << "  AIV UB usage (max):   " << AivUbMaxBytes(tiling) << " / "
+              << kUbCapacity << " bytes\n"
+              << "  L1 small usage:       " << L1SmallBytes(tiling) << " / " << kL1Capacity
+              << " bytes (ping+pong)\n"
+              << "  L1 middle usage:      " << L1MiddleBytes(tiling) << " / " << kL1Capacity
+              << " bytes (ping+pong)\n"
+              << "  L1 large usage:       " << L1WideBytes(tiling) << " / " << kL1Capacity
+              << " bytes (ping+pong)\n"
+              << "  L1 worst-case usage:  " << L1Bytes(tiling) << " / " << kL1Capacity << " bytes\n"
+              << "  A-scale L1 policy:    "
+              << (L1ScaleReusesA(tiling.small_m_limit, tiling.narrow_nbs, tiling.small_aic_kbs)
+                      ? "small tile uses free A-tail, or reuses consumed L1A for aligned M=64; other tiles are resident\n"
+                      : "resident scale slots after L1B\n")
+              << "  B-scale policy:       fill the 4 KiB L0B_MX mapped window with E8M0(1) once per AIC\n"
+              << "  C shape:              [" << total_m << ", " << n
+              << "] BF16\n"
+              << "  physical core launch: " << kKernelCoreCount << '\n'
+              << "  timed group passes:   " << test_cycles << '\n'
+              << "  kernels per pass:     1\n"
+              << "  matmuls per pass:     " << active_group_count << '\n'
+              << "  timing source:        device events\n"
+              << "  average serial pass:  " << pass_ms << " ms\n"
+              << "  average active group: " << group_ms << " ms\n"
+              << "  aggregate throughput: " << throughput_tflops << " TFLOP/s\n";
+}
+uint64_t ParseUnsigned(const char *text, const char *name)
+{
+    try {
+        size_t parsed = 0;
+        const std::string value(text);
+        if (value.empty() || value.front() == '-') {
+            throw std::invalid_argument("negative or empty value");
+        }
+        const uint64_t result = std::stoull(value, &parsed);
+        if (parsed != value.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return result;
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string("invalid ") + name + ": " + text);
+    }
+}
+void PrintUsage(const char *program)
+{
+    std::cerr << "Usage: " << program
+              << " <G=groups,1..128>   [device_id=0] [warmup_cycles=0] [test_cycles=1]\n";
+}
+}
+int main(int argc, char *argv[])
+{
+    if (argc < 4 || argc > 7) {
+        PrintUsage(argv[0]);
+        return 2;
+    }
+    bool acl_initialized = false;
+    bool device_selected = false;
+    int32_t device_id = 0;
+    try {
+        const uint64_t group_count = ParseUnsigned(argv[1], "G");
+        const uint64_t k = ParseUnsigned(argv[2], "K");
+        const uint64_t n = ParseUnsigned(argv[3], "N");
+        const uint64_t raw_device_id = argc >= 5 ? ParseUnsigned(argv[4], "device_id") : 0;
+        if (raw_device_id > static_cast(std::numeric_limits::max())) {
+            throw std::invalid_argument("device_id is outside int32 range");
+        }
+        device_id = static_cast(raw_device_id);
+        const uint64_t warmup_cycles = argc >= 6 ? ParseUnsigned(argv[5], "warmup_cycles") : 0;
+        const uint64_t test_cycles = argc >= 7 ? ParseUnsigned(argv[6], "test_cycles") : 1;
+        CheckAcl(aclInit(nullptr), "aclInit");
+        acl_initialized = true;
+        CheckAcl(aclrtSetDevice(device_id), "aclrtSetDevice");
+        device_selected = true;
+        RunTest(group_count, k, n, warmup_cycles, test_cycles);
+        CheckAcl(aclrtResetDevice(device_id), "aclrtResetDevice");
+        device_selected = false;
+        CheckAcl(aclFinalize(), "aclFinalize");
+        acl_initialized = false;
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << "ERROR: " << error.what() << '\n';
+        if (device_selected) {
+            (void)aclrtResetDevice(device_id);
+        }
+        if (acl_initialized) {
+            (void)aclFinalize();
+        }
+        return 1;
+    }
+}
+########## [6/9] mat_fp4_tiling.h ##########
+#ifndef MAT_FP4_TILING_H
+#define MAT_FP4_TILING_H
+#include 
+// Host 统一计算后传给 AIC/AIV，避免两侧 tiling 不一致。
+struct MatFP4TilingData {
+    uint64_t narrow_nbs;
+    uint64_t wide_nbs;
+    uint64_t small_m_limit;
+    uint64_t n_only_mode;
+    uint64_t small_aiv_kbs;
+    uint64_t small_aic_kbs;
+    uint64_t small_mad_k;
+    uint64_t middle_aiv_kbs;
+    uint64_t middle_aic_kbs;
+    uint64_t middle_mad_k;
+};
+constexpr uint64_t kMatFP4MaxTileM = 256;
+constexpr uint64_t kMatFP4WideTileM = 240;
+constexpr uint64_t kMatFP4WideMThreshold = 480;
+constexpr uint64_t kMatFP4NarrowNCoreCount = 32;
+constexpr uint64_t kMatFP4WideNCoreCount = 16;
+constexpr uint64_t kMatFP4L1SlotBytes = 256 * 1024;
+enum MatFP4TileMode : uint64_t {
+    MAT_FP4_SMALL = 0,
+    MAT_FP4_MIDDLE = 1,
+    MAT_FP4_WIDE = 2,
+};
+struct MatFP4TileDesc {
+    uint64_t offset;
+    uint64_t rows;
+    uint64_t mode;
+};
+#ifdef **aicore**
+#define MAT_FP4_INLINE **aicore** inline
+#else
+#define MAT_FP4_INLINE inline
+#endif
+// 将 total 切成接近一半的两块，其中第一块取离 total/2 最近的 16 倍数，距离相同时取较小值。
+MAT_FP4_INLINE uint64_t MatFP4SplitNearHalf16(uint64_t total)
+{
+    const uint64_t lower = total / 32 * 16;
+    const uint64_t upper = lower + 16;
+    const uint64_t lower_twice = lower * 2;
+    const uint64_t upper_twice = upper * 2;
+    const uint64_t lower_distance = total >= lower_twice ? total - lower_twice : lower_twice - total;
+    const uint64_t upper_distance = total >= upper_twice ? total - upper_twice : upper_twice - total;
+    return lower_distance <= upper_distance ? lower : upper;
+}
+MAT_FP4_INLINE uint64_t MatFP4NarrowTileCount(uint64_t group_m)
+{
+    return group_m <= kMatFP4MaxTileM ? 1 : 2;
+}
+MAT_FP4_INLINE MatFP4TileDesc MatFP4GetNarrowTile(uint64_t group_m, uint64_t tile_id, uint64_t small_m_limit)
+{
+    if (group_m <= kMatFP4MaxTileM) {
+        const uint64_t mode = group_m <= small_m_limit ? MAT_FP4_SMALL : MAT_FP4_MIDDLE;
+        return {0, group_m, mode};
+    }
+    const uint64_t first_m = MatFP4SplitNearHalf16(group_m);
+    const uint64_t offset = tile_id == 0 ? 0 : first_m;
+    const uint64_t rows = tile_id == 0 ? first_m : group_m - first_m;
+    const uint64_t mode = rows <= small_m_limit ? MAT_FP4_SMALL : MAT_FP4_MIDDLE;
+    return {offset, rows, mode};
+}
+// 仅沿 N 轴分核时，保留 q-1 个 M256；剩余 256+r 在 r>0 时靠近一半切开。
+MAT_FP4_INLINE uint64_t MatFP4NOnlyTileCount(uint64_t group_m)
+{
+    if (group_m == 0) return 0;
+    if (group_m <= kMatFP4MaxTileM) return 1;
+    const uint64_t quotient = group_m / kMatFP4MaxTileM;
+    const uint64_t remainder = group_m % kMatFP4MaxTileM;
+    return quotient - 1 + (remainder == 0 ? 1 : 2);
+}
+MAT_FP4_INLINE MatFP4TileDesc MatFP4GetNOnlyTile(uint64_t group_m, uint64_t tile_id, uint64_t small_m_limit)
+{
+    if (group_m <= kMatFP4MaxTileM) {
+        const uint64_t mode = group_m <= small_m_limit ? MAT_FP4_SMALL : MAT_FP4_MIDDLE;
+        return {0, group_m, mode};
+    }
+    const uint64_t quotient = group_m / kMatFP4MaxTileM;
+    const uint64_t remainder = group_m % kMatFP4MaxTileM;
+    const uint64_t full_tile_count = quotient - 1;
+    if (tile_id < full_tile_count) {
+        return {tile_id * kMatFP4MaxTileM, kMatFP4MaxTileM, MAT_FP4_MIDDLE};
+    }
+    const uint64_t tail_offset = full_tile_count * kMatFP4MaxTileM;
+    const uint64_t tail_m = group_m - tail_offset;
+    if (remainder == 0) return {tail_offset, tail_m, MAT_FP4_MIDDLE};
+    const uint64_t first_m = MatFP4SplitNearHalf16(tail_m);
+    const uint64_t offset = tile_id == full_tile_count ? tail_offset : tail_offset + first_m;
+    const uint64_t rows = tile_id == full_tile_count ? first_m : tail_m - first_m;
+    const uint64_t mode = rows <= small_m_limit ? MAT_FP4_SMALL : MAT_FP4_MIDDLE;
+    return {offset, rows, mode};
+}
+// N=4096 且 M>=480 时先按 M 轴分成两个 lane；每个 lane 保留 q-1 个 M240，
+// 再将剩余的 240+r 按近半 16 对齐规则切成两块。
+MAT_FP4_INLINE uint64_t MatFP4WideTileCount(uint64_t local_m)
+{
+    return local_m / kMatFP4WideTileM + 1;
+}
+MAT_FP4_INLINE MatFP4TileDesc MatFP4GetWideTile(uint64_t local_m, uint64_t tile_id)
+{
+    const uint64_t full_tile_count = local_m / kMatFP4WideTileM - 1;
+    if (tile_id < full_tile_count) {
+        return {tile_id * kMatFP4WideTileM, kMatFP4WideTileM, MAT_FP4_WIDE};
+    }
+    const uint64_t tail_offset = full_tile_count * kMatFP4WideTileM;
+    const uint64_t tail_m = local_m - tail_offset;
+    const uint64_t first_m = MatFP4SplitNearHalf16(tail_m);
+    if (tile_id == full_tile_count) {
+        return {tail_offset, first_m, MAT_FP4_WIDE};
+    }
+    return {tail_offset + first_m, tail_m - first_m, MAT_FP4_WIDE};
+}
+#undef MAT_FP4_INLINE
+#endif
+########## [7/9] scripts\dump_code_to_txt.py ##########
+import os
+import sys
+CODE_EXTENSIONS = {
+    ".h", ".hpp", ".hxx",
+    ".c", ".cc", ".cpp", ".cxx", ".cce", ".cuh", ".cu",
+    ".py", ".sh", ".bat", ".cmake", ".mk",
+    ".proto", ".json", ".yaml", ".yml", ".toml", ".ini",
+}
+SKIP_DIRS = {
+    ".git", ".codegraph", ".opencode", ".vscode",
+    "**pycache**", "node_modules", "build", "out", "dist",
+    ".idea", ".vs",
+}
+SKIP_FILES = {
+    "code_dump.txt",
+}
+SKIP_BINARY_EXTENSIONS = {
+    ".db", ".db-shm", ".db-wal", ".lock", ".png", ".jpg",
+    ".jpeg", ".gif", ".ico", ".pdf", ".zip", ".tar", ".gz",
+    ".exe", ".dll", ".so", ".o", ".a", ".obj", ".bin", ".dat",
+    ".woff", ".ttf",
+}
+def dump_project(root):
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for name in filenames:
+            if name in SKIP_FILES:
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in SKIP_BINARY_EXTENSIONS:
+                continue
+            if ext not in CODE_EXTENSIONS:
+                continue
+            full_path = os.path.join(dirpath, name)
+            entries.append(full_path)
+    entries.sort()
+    output_path = os.path.join(root, "code_dump.txt")
+    with open(output_path, "w", encoding="utf-8") as out:
+        for idx, full_path in enumerate(entries, 1):
+            rel = os.path.relpath(full_path, root)
+            out.write(f"########## [{idx}/{len(entries)}] {rel} ##########\n")
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except (UnicodeDecodeError, OSError):
+                content = ""
+            out.write(content)
+            if not content.endswith("\n"):
+                out.write("\n")
+            out.write("\n")
+    return output_path, len(entries)
+if **name** == "**main**":
+    root = os.path.dirname(os.path.dirname(os.path.abspath(**file**)))
+    if len(sys.argv) > 1:
+        root = os.path.abspath(sys.argv[1])
+    out_file, count = dump_project(root)
+    print(f"Done: {count} files -> {out_file}")
+########## [8/9] scripts\gen_data.py ##########
+#!/usr/bin/env python3
+"""生成 grouped matmul 的 MXFP8 A/E8M0 scale、packed zN W2 输入与 FP32 Golden。"""
+from **future** import annotations
+import argparse
+import json
+from pathlib import Path
+import ml_dtypes
+import numpy as np
+from w2_layout import (CODEBOOK_K, CODEBOOK_N, ZN_K0, ZN_N0, build_pair_lut, pack_zn_2bit_codes,
+                       reshape_codes_by_codebook, restore_codes_from_codebook_groups)
+MAX_GROUP_COUNT = 128
+REDUCTION_TILE = 1024
+OUTPUT_TILE = 1024
+MX_SCALE_GROUP = 32
+E4M3FN_MAX = 448.0
+E8M0_EXP_BIAS = 127
+E8M0_MIN_EXP = -127
+E8M0_MAX_EXP = 127
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="生成 MXFP8 A/E8M0 scale、packed zN B、pair LUT、group_list 和 FP32 Golden"
+    )
+    parser.add_argument("G", type=int, help=f"组/专家数，范围 1..{MAX_GROUP_COUNT}")
+    parser.add_argument("K", type=int, help=f"归约维，必须是 {REDUCTION_TILE} 的倍数")
+    parser.add_argument("N", type=int, help=f"输出维，必须是 {OUTPUT_TILE} 的倍数")
+    parser.add_argument("--group-list", help="逗号分隔的非累计 M_i；默认每组 1 行，如 2,1,0,3,0,0,1,1")
+    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--save-dequant-weight", action="store_true", help="额外保存较大的 output/golden_b_fp8.bin")
+    return parser.parse_args()
+def parse_group_list(text: str | None, group_count: int) -> np.ndarray:
+    if text is None:
+        return np.ones(group_count, dtype=np.int64)
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != group_count or any(not part for part in parts):
+        raise ValueError(f"--group-list 必须恰好包含 {group_count} 个逗号分隔整数，实际为 {text!r}")
+    try:
+        return np.asarray([int(part) for part in parts], dtype=np.int64)
+    except ValueError as error:
+        raise ValueError(f"无效的 --group-list：{text!r}") from error
+def validate_shape(group_count: int, k: int, n: int, group_list: np.ndarray) -> None:
+    if not 1 <= group_count <= MAX_GROUP_COUNT:
+        raise ValueError(f"G 必须位于 [1,{MAX_GROUP_COUNT}]，实际为 {group_count}")
+    if k <= 0 or k % REDUCTION_TILE != 0:
+        raise ValueError(f"K 必须是 {REDUCTION_TILE} 的正整数倍，实际为 {k}")
+    if n <= 0 or n % OUTPUT_TILE != 0:
+        raise ValueError(f"N 必须是 {OUTPUT_TILE} 的正整数倍，实际为 {n}")
+    if group_list.shape != (group_count,):
+        raise ValueError(f"group_list 形状应为 ({group_count},)，实际为 {group_list.shape}")
+    if np.any(group_list < 0):
+        raise ValueError(f"group_list[i] 必须为非负整数，实际为 {group_list.tolist()}")
+    if int(group_list.sum()) == 0:
+        raise ValueError("group_list 至少需要包含一个 token 行")
+def quantize_mxfp8_e4m3(activation_f32: np.ndarray, fp8_dtype) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """沿K轴每32元素生成一个E8M0 scale，并将A量化为E4M3FN。"""
+    if activation_f32.ndim != 2 or activation_f32.shape[1] % MX_SCALE_GROUP != 0:
+        raise ValueError(f"A必须是二维矩阵且K可被{MX_SCALE_GROUP}整除，实际shape={activation_f32.shape}")
+    grouped = activation_f32.reshape(activation_f32.shape[0], -1, MX_SCALE_GROUP)
+    max_abs = np.max(np.abs(grouped), axis=-1)
+    # scale=2^e，选择最小的e使当前K32组归一化后落入E4M3FN有限范围。
+    safe_ratio = np.maximum(max_abs / E4M3FN_MAX, np.finfo(np.float32).tiny)
+    exponents = np.ceil(np.log2(safe_ratio)).astype(np.int32)
+    exponents = np.where(max_abs == 0.0, 0, exponents)
+    exponents = np.clip(exponents, E8M0_MIN_EXP, E8M0_MAX_EXP)
+    scale_values = np.exp2(exponents.astype(np.float32)).astype(np.float32)
+    normalized = grouped / scale_values[..., None]
+    normalized = np.clip(normalized, -E4M3FN_MAX, E4M3FN_MAX)
+    activation_fp8 = np.ascontiguousarray(normalized.reshape(activation_f32.shape).astype(fp8_dtype))
+    # E8M0只保存带bias的指数；0x7F表示2^0=1.0，0xFF保留不用。
+    scale_codes = np.ascontiguousarray((exponents + E8M0_EXP_BIAS).astype(np.uint8))
+    return activation_fp8, scale_codes, scale_values
+def generate(group_count: int, k: int, n: int, group_list: np.ndarray, seed: int, save_b: bool) -> None:
+    validate_shape(group_count, k, n, group_list)
+    total_m = int(group_list.sum())
+    input_dir, output_dir = Path("input"), Path("output")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rng = np.random.default_rng(seed)
+    fp8 = ml_dtypes.float8_e4m3fn
+    if np.dtype(fp8).itemsize != 1:
+        raise RuntimeError("float8_e4m3fn 必须占 1 Byte")
+    k_codebook_count, n_group_count = k // CODEBOOK_K, n // CODEBOOK_N
+    # A_i 按组在 M 轴连续拼接；每个K32组使用一个E8M0 scale。
+    activation_source = rng.standard_normal((total_m, k), dtype=np.float32)
+    activation, activation_scale, activation_scale_f32 = quantize_mxfp8_e4m3(activation_source, fp8)
+    # 每个 K256xN32 块共享 4 个 FP8 level。
+    scales = rng.uniform(0.25, 1.5, size=(group_count, k_codebook_count, n_group_count, 1)).astype(np.float32)
+    base_levels = np.array([-1.5, -0.5, 0.5, 1.5], dtype=np.float32)
+    levels = (scales * base_levels).astype(fp8)
+    scalar_codes = rng.integers(0, 4, size=(group_count, n, k), dtype=np.uint8)
+    packed_codes_zn = pack_zn_2bit_codes(scalar_codes)
+    # LUT 全局排布：[G,K/256,N/32,32 Byte]。
+    pair_lut = build_pair_lut(levels)
+    table = pair_lut.reshape(group_count, k_codebook_count, n_group_count, 32)
+    codes_grouped = reshape_codes_by_codebook(scalar_codes)
+    dequant_grouped = np.take_along_axis(levels[..., None, None, :], codes_grouped[..., None], axis=-1)[..., 0]
+    dequant_weight = np.ascontiguousarray(restore_codes_from_codebook_groups(dequant_grouped), dtype=fp8)
+    # 使用 FP32 显式计算 Golden。
+    activation_f32 = (
+        activation.astype(np.float32).reshape(total_m, k // MX_SCALE_GROUP, MX_SCALE_GROUP)
+        * activation_scale_f32[..., None]
+    ).reshape(total_m, k)
+    golden_c = np.empty((total_m, n), dtype=np.float32)
+    row_begin = 0
+    for group_id, group_m_value in enumerate(group_list):
+        group_m = int(group_m_value)
+        row_end = row_begin + group_m
+        if group_m:
+            golden_c[row_begin:row_end] = activation_f32[row_begin:row_end] @ dequant_weight[group_id].astype(np.float32).T
+        row_begin = row_end
+    activation.tofile(input_dir / "input_a.bin")
+    activation_scale.tofile(input_dir / "input_a_scale.bin")
+    packed_codes_zn.tofile(input_dir / "input_b.bin")
+    table.tofile(input_dir / "input_table.bin")
+    group_list.tofile(input_dir / "input_group_list.bin")
+    golden_c.tofile(output_dir / "golden_c.bin")
+    if save_b:
+        dequant_weight.tofile(output_dir / "golden_b_fp8.bin")
+    metadata = {
+        "groups": group_count,
+        "experts": group_count,
+        "group_list": group_list.tolist(),
+        "group_list_semantics": "non-cumulative M_i",
+        "total_m": total_m,
+        "k": k,
+        "n": n,
+        "fractal_k0": ZN_K0,
+        "fractal_n0": ZN_N0,
+        "fractal_contiguous_axis": "N0",
+        "decoded_fractal_order": ["N1", "K1", "K0", "N0"],
+        "packed_fractal_order": ["N1", "K1", "K0", "N0/4"],
+        "codebook_k": CODEBOOK_K,
+        "codebook_n": CODEBOOK_N,
+        "k0_fractals_per_codebook": CODEBOOK_K // ZN_K0,
+        "n0_fractals_per_codebook": CODEBOOK_N // ZN_N0,
+        "weights_per_codebook": CODEBOOK_K * CODEBOOK_N,
+        "activation_dtype": "mxfp8_e4m3fn",
+        "activation_scale_dtype": "float8_e8m0",
+        "activation_scale_group_size": MX_SCALE_GROUP,
+        "activation_scale_layout": "GM ND [M,K/64,2], two adjacent E8M0 reinterpreted as BF16 for DN2NZ",
+        "weight_code_bits": 2,
+        "weight_format": "zN K0=16 N0=32, N0-contiguous, packed W2",
+        "weight_lut_dtype": "float8_e4m3fn",
+        "output_dtype": "bfloat16",
+        "golden_output_dtype": "float32",
+        "input_group_list_shape": [group_count],
+        "input_group_list_dtype": "int64",
+        "input_a_shape": [total_m, k],
+        "input_a_scale_shape": [total_m, k // 64, 2],
+        "input_b_packed_zn_shape": [group_count, n // ZN_N0, k // ZN_K0, ZN_K0, ZN_N0 // 4],
+        "input_table_shape": [group_count, k // CODEBOOK_K, n // CODEBOOK_N, 32],
+        "output_shape": [total_m, n],
+        "seed": seed,
+    }
+    (input_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    print(f"Group list int64:   {group_list.tolist()}, {group_list.nbytes} bytes")
+    print(f"A MXFP8 E4M3:       {activation.shape}, {activation.nbytes} bytes")
+    print(f"A E8M0 scale:       {(total_m, k // 64, 2)}, {activation_scale.nbytes} bytes")
+    print(f"B W2 packed zN:     {packed_codes_zn.shape}, {packed_codes_zn.nbytes} bytes")
+    print("  B axes:            [G, N1, K1, K0=16, N0/4=8]")
+    print(f"Pair LUT K256xN32:  {table.shape}, {table.nbytes} bytes")
+    print(f"Golden C FP32:      {golden_c.shape}, {golden_c.nbytes} bytes")
+if **name** == "**main**":
+    args = parse_args()
+    generate(args.G, args.K, args.N, parse_group_list(args.group_list, args.G), args.seed, args.save_dequant_weight)
+########## [9/9] scripts\w2_layout.py ##########
+"""W2 packed zN 与 pair LUT 的公共布局函数。"""
+from **future** import annotations
+import numpy as np
+ZN_K0 = 16
+ZN_N0 = 32
+CODEBOOK_K = 256
+CODEBOOK_N = 32
+def validate_w2_shape(codes: np.ndarray) -> None:
+    if codes.dtype != np.uint8:
+        raise TypeError(f"codes 必须是 uint8，实际为 {codes.dtype}")
+    if codes.shape[-1] % 4 != 0:
+        raise ValueError("最后一维必须是 4 的倍数")
+    if codes.size and int(codes.max()) > 3:
+        raise ValueError("2-bit code 必须位于 [0,3]")
+def pack_2bit_codes(codes: np.ndarray) -> np.ndarray:
+    """将最后一维每 4 个 2-bit code 打包为 1 个 uint8。"""
+    codes = np.ascontiguousarray(codes, dtype=np.uint8)
+    validate_w2_shape(codes)
+    packed = codes[..., 0::4] | (codes[..., 1::4] << np.uint8(2))
+    packed |= (codes[..., 2::4] << np.uint8(4)) | (codes[..., 3::4] << np.uint8(6))
+    return np.ascontiguousarray(packed, dtype=np.uint8)
+def unpack_2bit_codes(packed: np.ndarray) -> np.ndarray:
+    """将 uint8 还原为最后一维连续的 2-bit code。"""
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    out = np.empty(packed.shape[:-1] + (packed.shape[-1] * 4,), dtype=np.uint8)
+    out[..., 0::4] = packed & np.uint8(0x03)
+    out[..., 1::4] = (packed >> np.uint8(2)) & np.uint8(0x03)
+    out[..., 2::4] = (packed >> np.uint8(4)) & np.uint8(0x03)
+    out[..., 3::4] = (packed >> np.uint8(6)) & np.uint8(0x03)
+    return out
+def pack_zn_2bit_codes(codes: np.ndarray) -> np.ndarray:
+    """将逻辑 `[...,N,K]` W2 code 转为 packed zN `[...,N/32,K/16,16,8]`。"""
+    codes = np.ascontiguousarray(codes, dtype=np.uint8)
+    validate_w2_shape(codes)
+    if codes.ndim < 2:
+        raise ValueError("codes 至少需要 N、K 两维")
+    n, k = codes.shape[-2:]
+    if n % ZN_N0 != 0:
+        raise ValueError(f"N 必须是 {ZN_N0} 的倍数")
+    if k % ZN_K0 != 0:
+        raise ValueError(f"K 必须是 {ZN_K0} 的倍数")
+    prefix = codes.shape[:-2]
+    dims = tuple(range(len(prefix)))
+    logical_kn = np.swapaxes(codes, -2, -1)
+    zn_codes = logical_kn.reshape(prefix + (k // ZN_K0, ZN_K0, n // ZN_N0, ZN_N0))
+    zn_codes = zn_codes.transpose(dims + (len(prefix) + 2, len(prefix), len(prefix) + 1, len(prefix) + 3))
+    return pack_2bit_codes(zn_codes)
+def unpack_zn_2bit_codes(packed: np.ndarray) -> np.ndarray:
+    """将 packed zN W2 code 还原为逻辑 `[...,N,K]`。"""
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    if packed.ndim < 4:
+        raise ValueError("packed zN 末四维必须是 [N/32,K/16,16,8]")
+    if packed.shape[-2] != ZN_K0 or packed.shape[-1] != ZN_N0 // 4:
+        raise ValueError(f"packed zN 最后两维必须是 [{ZN_K0},{ZN_N0 // 4}]")
+    prefix = packed.shape[:-4]
+    dims = tuple(range(len(prefix)))
+    n_blocks, k_blocks = packed.shape[-4:-2]
+    zn_codes = unpack_2bit_codes(packed)
+    logical_kn = zn_codes.transpose(dims + (len(prefix) + 1, len(prefix) + 2, len(prefix), len(prefix) + 3))
+    logical_kn = logical_kn.reshape(prefix + (k_blocks * ZN_K0, n_blocks * ZN_N0))
+    return np.ascontiguousarray(np.swapaxes(logical_kn, -2, -1))
+def reshape_codes_by_codebook(codes: np.ndarray) -> np.ndarray:
+    """将逻辑 code 转为 `[...,K/256,N/32,32,256]`。"""
+    codes = np.ascontiguousarray(codes, dtype=np.uint8)
+    validate_w2_shape(codes)
+    if codes.ndim < 2:
+        raise ValueError("codes 至少需要 N、K 两维")
+    n, k = codes.shape[-2:]
+    if n % CODEBOOK_N != 0:
+        raise ValueError(f"N 必须是 {CODEBOOK_N} 的倍数")
+    if k % CODEBOOK_K != 0:
+        raise ValueError(f"K 必须是 {CODEBOOK_K} 的倍数")
+    prefix = codes.shape[:-2]
+    dims = tuple(range(len(prefix)))
+    grouped = codes.reshape(prefix + (n // CODEBOOK_N, CODEBOOK_N, k // CODEBOOK_K, CODEBOOK_K))
+    return np.ascontiguousarray(grouped.transpose(dims + (len(prefix) + 2, len(prefix), len(prefix) + 1, len(prefix) + 3)))
+def restore_codes_from_codebook_groups(grouped: np.ndarray) -> np.ndarray:
+    """将 `[...,K/256,N/32,32,256]` 还原为逻辑 `[...,N,K]`。"""
+    grouped = np.ascontiguousarray(grouped)
+    if grouped.ndim < 4:
+        raise ValueError("grouped code 末四维必须是 [K/256,N/32,32,256]")
+    if grouped.shape[-2:] != (CODEBOOK_N, CODEBOOK_K):
+        raise ValueError(f"grouped code 最后两维必须是 [{CODEBOOK_N},{CODEBOOK_K}]")
+    prefix = grouped.shape[:-4]
+    dims = tuple(range(len(prefix)))
+    k_blocks, n_groups = grouped.shape[-4:-2]
+    logical = grouped.transpose(dims + (len(prefix) + 1, len(prefix) + 2, len(prefix), len(prefix) + 3))
+    return np.ascontiguousarray(logical.reshape(prefix + (n_groups * CODEBOOK_N, k_blocks * CODEBOOK_K)))
+def build_pair_lut(levels: np.ndarray) -> np.ndarray:
+    """将 4 个 level 展开为 16 项 pair LUT，输出形状为 `[...,16,2]`。"""
+    if levels.shape[-1] != 4:
+        raise ValueError("levels 最后一维必须包含 4 个值")
+    pair_index = np.arange(16, dtype=np.uint8)
+    first = np.take(levels, pair_index & np.uint8(0x03), axis=-1)
+    second = np.take(levels, pair_index >> np.uint8(2), axis=-1)
+    return np.ascontiguousarray(np.stack((first, second), axis=-1))

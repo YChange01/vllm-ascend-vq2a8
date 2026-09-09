@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import json
 import math
-import re
 from pathlib import Path
 
+import regex as re
 import torch
 from safetensors import safe_open
 
@@ -36,9 +36,15 @@ def offline_engine_options(
     root_linear_mode="bf16",
     ascendc_library=None,
     ascendc_sha256=None,
+    ascendc_v2_library=None,
+    ascendc_v2_sha256=None,
     verbose_experts=False,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
+    if execution_policy != "ascendc" and (ascendc_library is not None or ascendc_sha256 is not None):
+        raise ValueError("AscendC library options require execution_policy=ascendc.")
+    if execution_policy != "ascendc_v2" and (ascendc_v2_library is not None or ascendc_v2_sha256 is not None):
+        raise ValueError("V2 library options require execution_policy=ascendc_v2.")
     return {
         "model": str(model_root),
         "skip_tokenizer_init": True,
@@ -58,7 +64,7 @@ def offline_engine_options(
         "max_model_len": OFFLINE_CONTEXT_LIMIT,
         "max_num_batched_tokens": OFFLINE_CONTEXT_LIMIT,
         "block_size": 128,
-        "gpu_memory_utilization": 0.9 if execution_policy in ("cached", "ascendc") else 0.35,
+        "gpu_memory_utilization": 0.9 if execution_policy in ("cached", "ascendc", "ascendc_v2") else 0.35,
         "kv_cache_memory_bytes": 1024**3,
         "seed": 0,
         "disable_log_stats": True,
@@ -70,7 +76,7 @@ def offline_engine_options(
                 "enabled": True,
                 "artifact": str(artifact),
                 "execution_policy": execution_policy,
-                "cache_experts": 256 if execution_policy in ("cached", "ascendc") else 2,
+                "cache_experts": 256 if execution_policy in ("cached", "ascendc", "ascendc_v2") else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
@@ -79,6 +85,11 @@ def offline_engine_options(
                 **(
                     {"ascendc_library": str(ascendc_library), "ascendc_sha256": ascendc_sha256}
                     if execution_policy == "ascendc"
+                    else {}
+                ),
+                **(
+                    {"ascendc_v2_library": str(ascendc_v2_library), "ascendc_v2_sha256": ascendc_v2_sha256}
+                    if execution_policy == "ascendc_v2"
                     else {}
                 ),
             },
@@ -102,6 +113,8 @@ def validate_offline_config(config) -> dict:
         "root_linear_mode",
         "ascendc_library",
         "ascendc_sha256",
+        "ascendc_v2_library",
+        "ascendc_v2_sha256",
         "verbose_experts",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
@@ -148,8 +161,8 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Generic offload/sleep cannot manage standalone packed-cache ownership.")
     if config.load_config.load_format != "safetensors":
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
-    if options.get("execution_policy", "baseline") not in ("baseline", "cached", "ascendc"):
-        raise ValueError("execution_policy must be baseline, cached or ascendc.")
+    if options.get("execution_policy", "baseline") not in ("baseline", "cached", "ascendc", "ascendc_v2"):
+        raise ValueError("execution_policy must be baseline, cached, ascendc or ascendc_v2.")
     if options.get("execution_policy") == "ascendc":
         path, sha = options.get("ascendc_library"), options.get("ascendc_sha256")
         if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
@@ -158,6 +171,16 @@ def validate_offline_config(config) -> dict:
             raise ValueError("AscendC requires the regression-tested library SHA256.")
     elif "ascendc_library" in options or "ascendc_sha256" in options:
         raise ValueError("Native library options require explicit execution_policy=ascendc.")
+    if options.get("execution_policy") == "ascendc_v2":
+        path, sha = options.get("ascendc_v2_library"), options.get("ascendc_v2_sha256")
+        if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
+            raise ValueError("VQ2A8 v2 backend requires an absolute native .so library path.")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+            raise ValueError("VQ2A8 v2 backend requires the regression-tested library SHA256.")
+        if options.get("root_linear_mode", "bf16") != "bf16":
+            raise ValueError("VQ2A8 v2 candidate bring-up requires BF16 roots; root FP8 is outside its gate.")
+    elif "ascendc_v2_library" in options or "ascendc_v2_sha256" in options:
+        raise ValueError("VQ2A8 v2 library options require explicit execution_policy=ascendc_v2.")
     if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
         raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
     if type(options.get("verbose_experts", False)) is not bool:
@@ -219,6 +242,12 @@ class OfflineMoEOwner:
             if device.type != "npu":
                 raise ValueError("AscendC offline execution requires an NPU, without fallback.")
             self.native_library = load_pinned_library(options["ascendc_library"], options["ascendc_sha256"])
+        elif options.get("execution_policy") == "ascendc_v2":
+            from vllm_ascend.quantization.vq2a8_ascendc_v2 import load_pinned_library
+
+            if device.type != "npu":
+                raise ValueError("VQ2A8 v2 offline execution requires an NPU, without fallback.")
+            self.native_library = load_pinned_library(options["ascendc_v2_library"], options["ascendc_v2_sha256"])
         self.artifact = open_vq2a8_tp1_artifact(
             Path(options["artifact"]),
             model_root / "config.json",
@@ -239,11 +268,16 @@ class OfflineMoEOwner:
         # vLLM constructs under a default NPU device. Keep CPU validation
         # factories on CPU; the tested runtime moves its roots explicitly.
         with torch.device("cpu"):
-            runtime_class = {
+            runtime_classes = {
                 "baseline": VQ2TP1MoE,
                 "cached": CachedVQ2TP1MoE,
                 "ascendc": AscendCVQ2TP1MoE,
-            }[self.options.get("execution_policy", "baseline")]
+            }
+            if self.options.get("execution_policy") == "ascendc_v2":
+                from vllm_ascend.quantization.vq2a8_ascendc_v2 import AscendCV2VQ2TP1MoE
+
+                runtime_classes["ascendc_v2"] = AscendCV2VQ2TP1MoE
+            runtime_class = runtime_classes[self.options.get("execution_policy", "baseline")]
             layer = runtime_class(
                 self.artifact,
                 index,
@@ -263,7 +297,7 @@ class OfflineMoEOwner:
 
     def configure_cache(self, memory_fraction: float) -> None:
         """Call after strict root load, before profiling populates any cache."""
-        if self.options.get("execution_policy") not in ("cached", "ascendc"):
+        if self.options.get("execution_policy") not in ("cached", "ascendc", "ascendc_v2"):
             return
         if any(layer.cache_stats()["resident_experts"] for layer in self.layers.values()):
             raise ValueError("Configure the packed cache before the first expert call.")
@@ -273,7 +307,12 @@ class OfflineMoEOwner:
             budget_gib=self.options.get("cache_budget_gib", 0.0),
             memory_fraction=memory_fraction,
         )
-        plan = packed_cache_plan(
+        planner = packed_cache_plan
+        if self.options.get("execution_policy") == "ascendc_v2":
+            from vllm_ascend.quantization.vq2a8_ascendc_v2 import ascendc_v2_cache_plan
+
+            planner = ascendc_v2_cache_plan
+        plan = planner(
             [layer.layer for layer in self.layers.values()],
             budget["budget_bytes"],
             expert_limit=self.options.get("cache_experts", 256),
@@ -380,6 +419,7 @@ def validate_offline_evidence(
     *,
     execution_policy=None,
     ascendc_sha256=None,
+    ascendc_v2_sha256=None,
 ) -> dict:
     """Require real prefill followed by decode, all layers, and sampler/logit agreement."""
     if len(prompt) < 2 or len(generated) != OFFLINE_NEW_TOKENS:
@@ -393,12 +433,13 @@ def validate_offline_evidence(
     backend = evidence.get("expert_backend", {})
     if execution_policy is not None and backend.get("policy") != execution_policy:
         raise ValueError("Requested expert backend did not execute on the model.")
-    if execution_policy == "ascendc":
+    if execution_policy in ("ascendc", "ascendc_v2"):
+        expected_sha256 = ascendc_v2_sha256 if execution_policy == "ascendc_v2" else ascendc_sha256
         records = backend.get("layers", [])
         if (
-            not isinstance(ascendc_sha256, str)
-            or not re.fullmatch(r"[0-9a-f]{64}", ascendc_sha256)
-            or backend.get("library", {}).get("sha256") != ascendc_sha256
+            not isinstance(expected_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha256)
+            or backend.get("library", {}).get("sha256") != expected_sha256
             or backend.get("fallback_enabled") is not False
             or len(records) != layers
             or {r["layer"] for r in records} != set(range(layers))
@@ -469,6 +510,7 @@ def validate_offline_evidence(
             raise ValueError("Root FP8 projection coverage/calls incomplete; profile calls cannot count.")
     return {
         "prefill_tokens": len(prompt),
+        "steps": evidence["steps"],
         "decode_steps": len(generated) - 1,
         "generated_token_ids": generated,
         "layers_executed": layers,

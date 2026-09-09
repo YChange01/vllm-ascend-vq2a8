@@ -1,0 +1,10 @@
+# Local generated inputs/outputs and test/build files only. Source remains visible to git.
+input/
+output/
+build/
+__pycache__/
+*.pyc
+code_dump.txt
+*.o
+*.obj
+*.exe

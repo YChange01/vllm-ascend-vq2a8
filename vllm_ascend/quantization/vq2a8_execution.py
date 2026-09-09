@@ -34,7 +34,7 @@ def synchronize_execution(device: torch.device) -> None:
         getattr(torch, device.type).synchronize(device)
 
 
-def packed_cache_plan(layers, budget_bytes: int, *, expert_limit: int = 256) -> dict:
+def packed_cache_plan(layers, budget_bytes: int, *, expert_limit: int = 256, expert_size_bytes=None) -> dict:
     """Header-only plan, with a common per-layer cap and rounded tensor sizes.
 
     Budget excludes roots, KV, workspaces and allocator headroom. Allocation is
@@ -55,6 +55,12 @@ def packed_cache_plan(layers, budget_bytes: int, *, expert_limit: int = 256) -> 
                     raise ValueError("Invalid expert-axis shape in cache plan.")
                 width = torch.empty((), dtype=dtype, device="cpu").element_size()
                 size += math.ceil(math.prod(shape[1:]) * width / ALLOCATION_GRANULARITY) * ALLOCATION_GRANULARITY
+        if expert_size_bytes is not None:
+            # Explicit alternate layouts must account for their actual cached
+            # tensors, including device-side activation gather indices.
+            size = expert_size_bytes(layer)
+            if type(size) is not int or size <= 0:
+                raise ValueError("Alternate expert cache size must be a positive integer.")
         if layer.layer_index in inventory:
             raise ValueError("Duplicate layer in packed cache plan.")
         inventory[layer.layer_index] = (len(layer.expert_ids), size)
@@ -181,6 +187,7 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
                 kind: self.artifact.load_expert(self.layer_index, expert_id, kind, device="cpu", timings=host_timings)
                 for kind in ("gate_up", "down")
             }
+            host = self._prepare_host_expert(host)
         host_s = time.perf_counter() - start
         start = time.perf_counter()
         expert = {
@@ -212,6 +219,10 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
                 evictions=self.evictions,
             )
         return expert
+
+    def _prepare_host_expert(self, host):
+        """Identity for accepted backends; alternate layouts convert before H2D."""
+        return host
 
     def _projection(self, hidden, payload, spec):
         if self.device.type == "cpu":
@@ -284,7 +295,8 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             "resident_bytes": self._resident_bytes,
             "execution_policy": getattr(self, "execution_policy", "cached"),
             "native_fp8_dot": False
-            if self.device.type == "npu" and getattr(self, "execution_policy", "cached") != "ascendc"
+            if self.device.type == "npu"
+            and getattr(self, "execution_policy", "cached") not in ("ascendc", "ascendc_v2")
             else None,  # native policy call coverage is not an ISA-verification claim
         }
         if self.progress:

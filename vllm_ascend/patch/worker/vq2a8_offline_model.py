@@ -359,6 +359,13 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
     def offline_evidence(self):
         if not self._offline_logits:
             raise ValueError("No real generation logits captured.")
+        # Optimized row preparation records deferred device validity flags.
+        # Consume them outside inference timing, including the v2 bring-up:
+        # finite final logits alone cannot certify valid intermediate inputs.
+        for index, layer in self.model.offline_owner.layers.items():
+            state = getattr(layer, "_optimization", None)
+            if state is not None and (state.valid is None or not bool(state.valid)):
+                raise ValueError(f"Offline optimized layer {index} has missing/failed intermediate validity.")
         return {
             "load": self._offline_load_report,
             "steps": self._offline_steps,
