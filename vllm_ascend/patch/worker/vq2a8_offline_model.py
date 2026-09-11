@@ -187,8 +187,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         """Explicit, bounded offline benchmark control; not a serving switch.
 
         Only the supervisor's single in-process worker calls this between
-        requests. Same-stream native handlers own their tensors; cache eviction
-        retains its completion fence. No async H2D or workspace reuse is added.
+        requests. Same-stream native handlers own their tensors; legacy cache
+        eviction retains its completion fence. V3 has its own immutable-bank
+        and single-stream workspace contract, never a legacy cache fallback.
         """
         from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
         from vllm_ascend.quantization.vq2a8_execution import AscendCVQ2TP1MoE
@@ -205,7 +206,12 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("Performance probe switches must be booleans.")
         if type(profile) is not bool:
             raise ValueError("Profile switch must be boolean.")
-        if optimization is not None:
+        v3 = bool(owner.layers) and all(
+            getattr(layer, "execution_policy", None) == "ascendc_v3" for layer in owner.layers.values()
+        )
+        if v3 and optimization not in (None, "batched", "v3"):
+            raise ValueError("V3 preserves the fixed resident arithmetic path; other presets require separate gates.")
+        if optimization is not None and not v3:
             OptimizationOptions.preset(optimization)
         if not owner.layers or not all(isinstance(layer, AscendCVQ2TP1MoE) for layer in owner.layers.values()):
             raise ValueError("Performance probe requires the explicit AscendC backend on every layer.")
@@ -222,6 +228,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             layer.measurement_mode = measurement
             layer.trace_native = False
             layer.native_steps = []
+            if getattr(layer, "execution_policy", None) == "ascendc_v3":
+                layer.configure_v3_probe(
+                    measurement=measurement, compact=compact, optimization=optimization, profile=profile
+                )
+                continue
             if optimization is not None or hasattr(layer, "_optimization"):
                 configure_runtime(layer, optimization, profile=profile)
             preparation = getattr(layer, "_row_preparation", None)
@@ -240,9 +251,15 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         """Called outside timed intervals; synchronize and check finite flags."""
         torch.npu.synchronize()
         owner = self.model.offline_owner
+        v3 = any(getattr(layer, "execution_policy", None) == "ascendc_v3" for layer in owner.layers.values())
         valid = self._measurement_valid
         optimization = {}
         for index, layer in owner.layers.items():
+            if getattr(layer, "execution_policy", None) == "ascendc_v3":
+                layer.check_resident_integrity()
+                v3_valid = layer.v3_validity()
+                if v3_valid is not None:
+                    valid = v3_valid if valid is None else valid & v3_valid
             state = getattr(layer, "_optimization", None)
             if state is not None:
                 if state.valid is not None:
@@ -254,12 +271,19 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         return {
             "finite": bool(valid) if valid is not None else None,
             "optimization": optimization,
+            "v3": {
+                str(index): layer.v3_report()
+                for index, layer in owner.layers.items()
+                if getattr(layer, "execution_policy", None) == "ascendc_v3"
+            },
             "forwards": getattr(self, "_measurement_forwards", 0),
             "cache": owner.cache_report(),
             "native_calls": sum(layer.native_calls for layer in owner.layers.values()),
             "native_launches": sum(layer.native_launches for layer in owner.layers.values()),
             "h2d_bytes": sum(layer.h2d_bytes for layer in owner.layers.values()),
-            "host_observed_timing": {
+            "host_observed_timing": None
+            if v3
+            else {
                 key: sum(layer.timing[key] for layer in owner.layers.values())
                 for key in (
                     "host_load_validate_s",
@@ -270,7 +294,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                     "packed_projection_s",
                 )
             },
-            "timing_scope": "host submission/validation waits included; prepare/projection are not kernel-only",
+            "timing_scope": "v3 host phase timers not collected; null is not zero elapsed time"
+            if v3
+            else "host submission/validation waits included; prepare/projection are not kernel-only",
             "allocated_bytes": torch.npu.memory_allocated(),
             "reserved_bytes": torch.npu.memory_reserved(),
             "peak_allocated_bytes": torch.npu.max_memory_allocated(),
@@ -363,6 +389,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         # Consume them outside inference timing, including the v2 bring-up:
         # finite final logits alone cannot certify valid intermediate inputs.
         for index, layer in self.model.offline_owner.layers.items():
+            if getattr(layer, "execution_policy", None) == "ascendc_v3":
+                layer.check_resident_integrity()
+                valid = layer.v3_validity()
+                if valid is None or not bool(valid):
+                    raise ValueError(f"Offline v3 layer {index} has missing/failed intermediate validity.")
             state = getattr(layer, "_optimization", None)
             if state is not None and (state.valid is None or not bool(state.valid)):
                 raise ValueError(f"Offline optimized layer {index} has missing/failed intermediate validity.")
@@ -375,6 +406,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "peak_reserved_bytes": torch.npu.max_memory_reserved(),
             "root_fp8": self.root_fp8_evidence(),
             "expert_backend": self.model.offline_owner.backend_report(),
+            "v3": {
+                str(index): layer.v3_report()
+                for index, layer in self.model.offline_owner.layers.items()
+                if getattr(layer, "execution_policy", None) == "ascendc_v3"
+            },
         }
 
     def root_fp8_evidence(self):

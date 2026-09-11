@@ -296,7 +296,7 @@ class CachedVQ2TP1MoE(VQ2TP1MoE):
             "execution_policy": getattr(self, "execution_policy", "cached"),
             "native_fp8_dot": False
             if self.device.type == "npu"
-            and getattr(self, "execution_policy", "cached") not in ("ascendc", "ascendc_v2")
+            and getattr(self, "execution_policy", "cached") not in ("ascendc", "ascendc_v2", "ascendc_v3")
             else None,  # native policy call coverage is not an ISA-verification claim
         }
         if self.progress:
