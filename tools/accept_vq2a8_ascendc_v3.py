@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in v3: build -> short operator gate -> isolated v1 -> exact v3 -> timing.
+"""Opt-in v3: operator gate -> optional isolated v1 reference -> v3 timing.
 
 Default 10:4 is a quick case, not a long-output performance claim. Full v3
 residency may exceed the default budget/reserve; never reduce safety margins
@@ -128,9 +128,10 @@ def commands(args, output):
         str(args.cache_reserve_gib),
         "--memory-fraction",
         str(args.memory_fraction),
+        "--progress-interval",
+        str(args.progress_interval),
     ]
-    reference = args.reference_report.resolve() if args.reference_report else output / "v1-reference/summary.json"
-    if args.reference_report is None:
+    if not args.v3_only and args.reference_report is None:
         steps.append(
             (
                 "v1-reference",
@@ -150,9 +151,12 @@ def commands(args, output):
         str(library),
         "--preflight",
         str(output / "preflight.json"),
-        "--reference-report",
-        str(reference),
     ]
+    if args.v3_only:
+        candidate += ["--v3-only"]
+    else:
+        reference = args.reference_report.resolve() if args.reference_report else output / "v1-reference/summary.json"
+        candidate += ["--reference-report", str(reference)]
     if args.benchmark:
         performance = [*candidate, "--output-dir", str(output / "performance")]
         if args.target_tpot_ms is not None:
@@ -186,6 +190,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--memory-fraction", type=float, default=0.9)
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument(
+        "--v3-only", action="store_true", help="Measure v3 without loading/comparing v1; requires --benchmark"
+    )
+    parser.add_argument(
+        "--progress-interval", type=float, default=5.0, help="Seconds between host progress snapshots; 0 disables"
+    )
     parser.add_argument("--profile", action="store_true", help="Extra untimed CPU/NPU trace after benchmark cases")
     parser.add_argument(
         "--target-tpot-ms", type=float, help="Optional measured observation target; not a correctness threshold"
@@ -207,6 +217,10 @@ def parse_args(argv=None):
             raise ValueError("Benchmark cannot skip full-model exact gate")
         if args.profile and not args.benchmark:
             raise ValueError("--profile requires --benchmark")
+        if args.v3_only and (not args.benchmark or args.reference_report is not None):
+            raise ValueError("--v3-only requires --benchmark and cannot use --reference-report")
+        if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
+            raise ValueError("--progress-interval must be finite and non-negative")
         if (
             not math.isfinite(args.cache_budget_gib)
             or args.cache_budget_gib < 0
@@ -243,6 +257,8 @@ def main():
                     default_backend="unchanged",
                     full_model_graph_verified=False,
                     performance_target_met=None,
+                    baseline_comparison="not_requested" if args.v3_only else "required",
+                    progress_interval_s=args.progress_interval,
                 ),
                 indent=2,
             )
@@ -259,9 +275,14 @@ def main():
         full_model_graph_verified=False,
         device_execution_verified=False,
         model_integration_verified=False,
-        baseline_exact=False,
+        v3_only=args.v3_only,
+        baseline_exact=None if args.v3_only else False,
+        baseline_comparison="not_requested" if args.v3_only else "required",
+        progress_interval_s=args.progress_interval,
         performance_measurement_verified=False,
         performance_target_met=None,
+        quality_verified=False,
+        serving_verified=False,
     )
 
     def save():
@@ -269,14 +290,23 @@ def main():
 
     save()
     try:
-        for name, command in steps:
-            print(f"VQ2A8_V3_STAGE={name} TIMEOUT_S={args.timeout} LOG={output / (name + '.log')}", flush=True)
+        for step_index, (name, command) in enumerate(steps, 1):
+            print(
+                f"VQ2A8_V3_STAGE={name} STEP={step_index}/{len(steps)} "
+                f"TIMEOUT_S={args.timeout} LOG={output / (name + '.log')}",
+                flush=True,
+            )
             stage_env = environment.copy()
             if name == "performance":
                 stage_env["ASCEND_LAUNCH_BLOCKING"] = "0"
             result = supervise(command, output / f"{name}.log", stage_env, args.timeout)
             report["stages"].append(dict(name=name, **result))
             save()
+            print(
+                f"VQ2A8_V3_STAGE_DONE={name} STEP={step_index}/{len(steps)} "
+                f"EXIT={result['exit']} TIMEOUT={result['timeout']} ELAPSED_S={result['elapsed_s']:.1f}",
+                flush=True,
+            )
             if result["exit"] != 0 or result["timeout"]:
                 raise RuntimeError(f"{name} failed; inspect {result['log']}")
             if name == "preflight":
@@ -301,11 +331,12 @@ def main():
                     else:
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = previous
                 if name == "model-exact":
-                    report.update(model_integration_verified=True, baseline_exact=True)
+                    report.update(model_integration_verified=True, baseline_exact=True, baseline_comparison="verified")
                 elif name == "performance":
                     report.update(
                         model_integration_verified=True,
-                        baseline_exact=True,
+                        baseline_exact=child_report["baseline_exact"],
+                        baseline_comparison=child_report["baseline_comparison"],
                         performance_measurement_verified=True,
                         performance_target_met=child_report["performance_target_met"],
                         summaries=child_report["summaries"],
@@ -320,7 +351,8 @@ def main():
         save()
         print(
             f"VQ2A8_V3_ACCEPTANCE={report['status']} REPORT={output / 'summary.json'} "
-            f"BASELINE_EXACT={report['baseline_exact']} PERFORMANCE_TARGET_MET={report['performance_target_met']} "
+            f"BASELINE_EXACT={'NOT_REQUESTED' if args.v3_only else report['baseline_exact']} "
+            f"PERFORMANCE_TARGET_MET={report['performance_target_met']} "
             "FULL_MODEL_GRAPH_VERIFIED=False",
             flush=True,
         )

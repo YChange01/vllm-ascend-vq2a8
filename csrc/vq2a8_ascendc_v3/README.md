@@ -54,6 +54,39 @@ v3 从 `../vq2a8_ascendc`（v1）派生，不替换 v1/v2，不改默认后端�
 
 ## 服务器操作
 
+### 只测当前 v3 的 TTFT/TPOT
+
+已有 v3 库且只关心当前速度时，使用 `--v3-only --benchmark`。该模式不读取、
+不重编、不运行 v1 对照库，也不要求 v1 reference report；默认严格对照模式仍保留。
+算子 preflight、v3 自身两次逐 step 重复性/有限值/执行覆盖检查仍然执行。
+报告标记 `baseline_comparison=not_requested`、`baseline_exact=null`，
+终端显示 `BASELINE_EXACT=NOT_REQUESTED`，不能据此宣称与旧版一致或质量已验证。
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+python -u tools/accept_vq2a8_ascendc_v3.py \
+  --model /home/g00872988/vq2a8 \
+  --library build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so \
+  --physical-npu 0 \
+  --memory-fraction 1.0 --cache-reserve-gib 3 \
+  --v3-only --benchmark --cases 10:32 \
+  --warmups 2 --repeats 5 \
+  --progress-interval 5 --target-tpot-ms 20 --timeout 3600
+```
+
+这使用已编译的 v3 库，仅重跑算子检查；首次编译则去掉 `--library`，改传
+`--soc Ascend950DT_9574 --jobs 4`。`10:32` 每次提供 31 个 decode 间隔，
+比 `10:4` 的 3 个间隔更适合观察 TPOT。不传 `--profile` 可省去额外的性能跟踪请求。
+上述显式紧内存预算仍有前文所述 OOM 风险，不会自动减少预留空间。
+
+进度包括：阶段编号/耗时、每层常驻权重加载量、当前用例/轮次、
+限频的 token 完成数和距最近 token 的等待时间，以及请求结束后的 TTFT/TPOT/E2E。
+`--progress-interval 5` 控制后台 token 进度间隔；设为 `0` 关闭该进度线程，
+但保留阶段/用例结果。计时循环只更新 CPU 标量快照，不为日志逐 token 同步 NPU
+或写终端；后台日志仍可能影响主机调度，报告保留该配置用于复测。
+
+### 与 v1 严格对照
+
 先只编译并做短算子检查，不加载全模型：
 
 ```bash
@@ -109,9 +142,10 @@ CPU/NPU trace，不把该次请求计入性能样本。跟踪包含 `v3_device_r
   event 跨度含 host 提交间隙，不是纯 Cube 内核耗时。
 - 顶层 `summary.json`：各阶段结果及最终验收状态。
 
-`BASELINE_EXACT` 必须由 v1/v3 的逐 step FP32 logits 字节及输出 token 比较产生。
+严格对照模式中的 `BASELINE_EXACT=True` 必须由 v1/v3 的逐 step FP32 logits 字节及输出 token 比较产生。
 重复一致不代替 baseline 一致。热态样本要求全层执行、零专家换入/换出，
 并保留 v3 设备路由计数。未获得性能数据时目标结果为 `null`。
+`--v3-only` 中性能测量可以通过，但 `BASELINE_EXACT` 始终为 `NOT_REQUESTED`。
 `--target-tpot-ms 20` 根据实测请求平均 TPOT 的中位数报告目标是否满足；
 目标未满足不伪造功能失败，也不把 P50 达标冒充每个 token 均达标。
 

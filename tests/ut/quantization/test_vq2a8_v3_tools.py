@@ -100,6 +100,86 @@ def test_v3_tools_profile_requires_benchmark(tmp_path):
         bench.parse_args(cli(tmp_path) + ["--correctness-only", "--profile"])
 
 
+def test_v3_only_plan_never_resolves_old_library_or_reference(tmp_path):
+    class UnavailableBaseline:
+        def resolve(self):
+            raise AssertionError("v3-only must never access the old library")
+
+    args = accept.parse_args(
+        ["--model", str(tmp_path), "--library", str(tmp_path / "v3.so"), "--v3-only", "--benchmark"]
+    )
+    args.baseline_library = UnavailableBaseline()
+    steps = accept.commands(args, tmp_path / "out")
+    assert [name for name, _ in steps] == ["environment", "preflight", "performance"]
+    candidate = steps[-1][1]
+    assert "--v3-only" in candidate
+    assert "--reference-report" not in candidate and "--reference-only" not in candidate
+    assert candidate[candidate.index("--progress-interval") + 1] == "5.0"
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--v3-only"],
+        ["--v3-only", "--benchmark", "--reference-report", "unused.json"],
+        ["--progress-interval", "nan"],
+        ["--progress-interval", "-1"],
+    ],
+)
+def test_v3_only_accept_rejects_conflicting_options(tmp_path, flags):
+    with pytest.raises(SystemExit):
+        accept.parse_args(["--model", str(tmp_path), "--library", str(tmp_path / "v3.so"), *flags])
+
+
+def test_v3_only_accept_does_not_promote_unrequested_baseline(tmp_path, monkeypatch, capsys):
+    args = accept.parse_args(
+        [
+            "--model",
+            str(tmp_path),
+            "--library",
+            str(tmp_path / "v3.so"),
+            "--v3-only",
+            "--benchmark",
+            "--output-dir",
+            str(tmp_path / "run"),
+        ]
+    )
+    monkeypatch.setattr(accept, "parse_args", lambda: args)
+    monkeypatch.setattr(accept.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(accept, "acceptance_environment", lambda *_: {})
+    monkeypatch.setattr(accept, "library_identity", lambda *_: {})
+    monkeypatch.setattr(accept, "validate_receipt", lambda *_: None)
+    monkeypatch.setattr(bench, "verify_report", lambda *_: None)
+
+    def supervise(command, log, environment, timeout):
+        if log.stem == "preflight":
+            (args.output_dir / "preflight.json").write_text("{}", encoding="utf-8")
+        if log.stem == "performance":
+            child = args.output_dir / "performance"
+            child.mkdir()
+            (child / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "baseline_exact": None,
+                        "baseline_comparison": "not_requested",
+                        "performance_target_met": False,
+                        "summaries": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+        return dict(exit=0, timeout=False, elapsed_s=0.01, log=str(log), command=command)
+
+    monkeypatch.setattr(accept, "supervise", supervise)
+    assert accept.main() == 0
+    report = json.loads((args.output_dir / "summary.json").read_text(encoding="utf-8"))
+    assert report["baseline_exact"] is None
+    assert report["baseline_comparison"] == "not_requested"
+    assert report["performance_measurement_verified"] is True
+    assert report["performance_target_met"] is False
+    assert "BASELINE_EXACT=NOT_REQUESTED" in capsys.readouterr().out
+
+
 @pytest.mark.parametrize(
     "flags",
     [

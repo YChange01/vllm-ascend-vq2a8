@@ -9,6 +9,8 @@ immutability checks and validity reporting belong outside measured decode.
 """
 
 import math
+import time
+from contextlib import suppress
 from types import MappingProxyType
 
 import torch
@@ -22,7 +24,12 @@ from vllm_ascend.quantization.vq2a8_ascendc_v3 import (
     grouped_projection_v3,
     make_constants,
 )
-from vllm_ascend.quantization.vq2a8_execution import ALLOCATION_GRANULARITY, AscendCVQ2TP1MoE, synchronize_execution
+from vllm_ascend.quantization.vq2a8_execution import (
+    ALLOCATION_GRANULARITY,
+    GIB,
+    AscendCVQ2TP1MoE,
+    synchronize_execution,
+)
 from vllm_ascend.quantization.vq2a8_moe import route_vq2a8
 from vllm_ascend.quantization.vq2a8_optimization import FastMoEState, OptimizationOptions
 from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE, deepseek_v4_swiglu_reference
@@ -32,6 +39,8 @@ KINDS = ("gate_up", "down")
 POINTER_FIELDS = ("packed_indices", "codebooks", "codebook_tile_ids")
 TRANSFORM_FIELDS = ("weight_scale", "weight_bias", "rht_sign")
 ELEMENT_BYTES = dict(packed_indices=4, codebooks=1, codebook_tile_ids=1, weight_scale=4, weight_bias=4, rht_sign=1)
+RESIDENT_PROGRESS_EXPERT_INTERVAL = 32
+RESIDENT_PROGRESS_INTERVAL_S = 5.0
 
 
 def _rounded(size):
@@ -277,6 +286,13 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             if not set(table.cpu().unique().tolist()).issubset(expert_ids):
                 raise ValueError("Hash table selects an unavailable resident expert.")
         self._resident_failed = True
+        progress_started = last_progress = time.monotonic()
+        loaded_payload_bytes = 0
+        payload_bytes_per_expert = sum(
+            math.prod(self.layer.tensor_shapes[f"{kind}_{field}"][1:]) * size
+            for kind in KINDS
+            for field, size in ELEMENT_BYTES.items()
+        )
         try:
             # Even when the caller is in inference_mode, these immutable banks
             # retain version counters for trial-boundary mutation detection.
@@ -305,12 +321,18 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                     resident[expert][kind] = (MappingProxyType(payload), spec)
                     del host
                 resident[expert] = MappingProxyType(resident[expert])
-                if self.progress and ((row + 1) % 32 == 0 or row + 1 == len(expert_ids)):
-                    print(
-                        f"MODEL layer={self.layer_index} stage=v3_resident_payload "
-                        f"loaded={row + 1} total={len(expert_ids)}",
-                        flush=True,
-                    )
+                loaded_payload_bytes += payload_bytes_per_expert
+                if self.progress:
+                    now = time.monotonic()
+                    if self._resident_load_progress_due(row + 1, len(expert_ids), now, last_progress):
+                        self._resident_load_progress(
+                            row + 1,
+                            len(expert_ids),
+                            now - progress_started,
+                            loaded_payload_bytes,
+                            plan["planned_bytes"],
+                        )
+                        last_progress = now
             with torch.inference_mode(False):
                 preparation = RowwiseVQ2A8Preparation(compact=True, validity=self._retain_valid)
                 preparation._ensure_hadamard(self.device, 128)
@@ -349,6 +371,26 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             self._resident_ready = False
             raise
         return self.resident_report()
+
+    def _resident_load_progress(self, loaded, total, elapsed_s, loaded_payload_bytes, planned_bytes):
+        # Startup-only host report: loaded is populated payload, not allocator
+        # residency (banks are preallocated). Planned also includes workspaces.
+        with suppress(Exception):
+            print(
+                f"MODEL layer={self.layer_index} stage=v3_resident_payload "
+                f"loaded={loaded} total={total} elapsed_s={elapsed_s:.3f} "
+                f"loaded_gib={loaded_payload_bytes / GIB:.6f} planned_gib={planned_bytes / GIB:.6f} "
+                "bytes_scope=loaded_payload_vs_planned_resident",
+                flush=True,
+            )
+
+    @staticmethod
+    def _resident_load_progress_due(loaded, total, now, last_progress):
+        return (
+            loaded % RESIDENT_PROGRESS_EXPERT_INTERVAL == 0
+            or loaded == total
+            or now - last_progress >= RESIDENT_PROGRESS_INTERVAL_S
+        )
 
     @staticmethod
     def _seal(value):

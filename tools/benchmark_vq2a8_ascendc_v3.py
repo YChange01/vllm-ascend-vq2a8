@@ -5,6 +5,7 @@
 
 No full-model graph or 20 ms result is implied. Residency is mandatory for v3;
 policy-budget failure is not proof that the physical device cannot fit the model.
+Explicit --v3-only skips baseline comparison, never the v3 self-checks.
 """
 
 from __future__ import annotations
@@ -38,11 +39,13 @@ def validate_options(args):
     parse_cases(args.cases)
     if args.reference_only and args.correctness_only:
         raise ValueError("Choose reference-only or correctness-only, not both")
+    if args.v3_only and (args.reference_only or args.correctness_only or args.reference_report is not None):
+        raise ValueError("--v3-only is performance-only and rejects reference-only/correctness-only/reference-report")
     if args.profile and (args.reference_only or args.correctness_only):
         raise ValueError("--profile requires the performance mode")
     if not args.reference_only and not args.preflight:
         raise ValueError("V3 model allocation requires --preflight")
-    if not args.reference_only and not args.reference_report:
+    if not args.reference_only and not args.v3_only and not args.reference_report:
         raise ValueError("V3 model gates require a hash-bound v1 --reference-report")
     if args.warmups < 2 or args.repeats < 5:
         raise ValueError("Require >=2 warmups and >=5 measured requests")
@@ -57,6 +60,8 @@ def validate_options(args):
         raise ValueError("Budget >=0, reserve >=1 GiB, memory fraction in (0,1] must be finite")
     if args.target_tpot_ms is not None and (not math.isfinite(args.target_tpot_ms) or args.target_tpot_ms <= 0):
         raise ValueError("Target TPOT must be finite and positive")
+    if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
+        raise ValueError("Progress interval must be finite and nonnegative; 0 disables it")
 
 
 def configuration(args):
@@ -76,7 +81,8 @@ def write_report(output, report):
     (output / "summary.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     lines = [
         f"VQ2A8_V3={report['status']} MODE={report['mode']}",
-        f"BASELINE_EXACT={report.get('baseline_exact', False)} REPEAT_EXACT={report.get('repeat_exact', False)}",
+        f"BASELINE_EXACT={'NOT_REQUESTED' if report.get('v3_only') else report.get('baseline_exact', False)} "
+        f"REPEAT_EXACT={report.get('repeat_exact', False)}",
         f"PERFORMANCE_MEASUREMENT_VERIFIED={report.get('performance_measurement_verified', False)}",
         f"PERFORMANCE_TARGET_MET={report.get('performance_target_met')}",
         "FULL_MODEL_GRAPH_VERIFIED=False DEFAULT_BACKEND=UNCHANGED",
@@ -214,7 +220,7 @@ def validate_reference(report, args, cases):
     return report
 
 
-def timed_request(llm, prompt, count, request_id):
+def timed_request(llm, prompt, count, request_id, *, progress=None):
     """Record one real NPU event per delivered token; never divide a bulk timer."""
     import torch
     from vllm import SamplingParams
@@ -249,6 +255,8 @@ def timed_request(llm, prompt, count, request_id):
                 event.record()
                 events.append(event)
                 ready.append(time.perf_counter() - started)
+                if progress is not None:
+                    progress.update(len(ready), ready[-1])
             tokens, finished = current, result.finished
         if finished:
             break
@@ -402,6 +410,7 @@ def verify_report(report, args):
     """Recompute retained logits and timing evidence; exit=0 alone never passes."""
     import torch
 
+    validate_options(args)
     cases = parse_cases(args.cases)
     expected_mode = "reference" if args.reference_only else "correctness" if args.correctness_only else "performance"
     if (
@@ -416,6 +425,8 @@ def verify_report(report, args):
         or report.get("cases") != [list(c) for c in cases]
         or report.get("repeat_exact") is not True
         or report.get("full_model_graph_verified") is not False
+        or report.get("v3_only", False) is not args.v3_only
+        or report.get("quality_verified") is not False
         or report.get("physical_npu") != os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
     ):
         raise ValueError("Invalid model report status/configuration/identity")
@@ -427,12 +438,22 @@ def verify_report(report, args):
         identity = checked_model_preflight(args.library, args.preflight, args.model)
         if identity != library:
             raise ValueError("Preflight library identity mismatch")
-        if (
-            report.get("reference_report_sha256") != sha256(args.reference_report)
-            or report.get("baseline_exact") is not True
-        ):
-            raise ValueError("Missing exact hash-bound baseline comparison")
-        reference = validate_reference(json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases)
+        if args.v3_only:
+            if (
+                report.get("baseline_exact") is not None
+                or report.get("baseline_comparison") != "not_requested"
+                or "reference_report_sha256" in report
+                or "baseline_operator_preflight" in report
+            ):
+                raise ValueError("V3-only report must not claim or contain a baseline comparison")
+        else:
+            if (
+                report.get("reference_report_sha256") != sha256(args.reference_report)
+                or report.get("baseline_exact") is not True
+                or report.get("baseline_comparison", "verified") != "verified"
+            ):
+                raise ValueError("Missing exact hash-bound baseline comparison")
+            reference = validate_reference(json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases)
     vocab = json.loads((args.model / "config.json").read_text(encoding="utf-8"))["vocab_size"]
     if set(report.get("diagnostics", {})) != {f"p{p}-o{o}" for p, o in cases}:
         raise ValueError("Incomplete diagnostic cases")
@@ -449,6 +470,7 @@ def verify_report(report, args):
         if not args.reference_only:
             for record in pair:
                 validate_residency(record.get("v3_before", {}), record.get("v3", {}), len(record["tokens"]) - 1)
+        if not args.reference_only and not args.v3_only:
             refpair = reference.get("diagnostics", {}).get(case, [])
             if len(refpair) != 2:
                 raise ValueError("Missing baseline case")
@@ -462,6 +484,7 @@ def verify_report(report, args):
             report.get("warmups") != args.warmups
             or report.get("repeats") != args.repeats
             or report.get("target_tpot_ms") != args.target_tpot_ms
+            or report.get("progress_interval_s") != args.progress_interval
         ):
             raise ValueError("Timing configuration differs from requested matrix/target")
         if report.get("measurement_launch_blocking") not in (None, "0"):
@@ -499,7 +522,11 @@ def run(args):
         cases=[list(c) for c in cases],
         diagnostics={},
         samples=[],
-        baseline_exact=False,
+        v3_only=args.v3_only,
+        baseline_exact=None if args.v3_only else False,
+        baseline_comparison=(
+            "not_requested" if args.v3_only else "reference_generation" if args.reference_only else "required"
+        ),
         repeat_exact=False,
         performance_measurement_verified=False,
         performance_target_met=None,
@@ -509,8 +536,10 @@ def run(args):
         target_tpot_ms=args.target_tpot_ms,
         warmups=args.warmups,
         repeats=args.repeats,
+        progress_interval_s=args.progress_interval,
     )
     write_report(output, report)
+    progress_reporter = None
     try:
         visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
         if not visible.isdecimal():
@@ -535,8 +564,11 @@ def run(args):
             library = {"path": evidence["path"], "sha256": evidence["sha256"]}
         else:
             library = checked_model_preflight(args.library, args.preflight, args.model)
-            reference = validate_reference(json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases)
-            report["reference_report_sha256"] = sha256(args.reference_report)
+            if not args.v3_only:
+                reference = validate_reference(
+                    json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases
+                )
+                report["reference_report_sha256"] = sha256(args.reference_report)
         report["library"] = library
         os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         import torch
@@ -548,13 +580,15 @@ def run(args):
         from tools.validate_vq2a8_qli_metadata import run_preflight
         from tools.validate_vq2a8_sas_attention import run_sas_preflight
         from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device, environment_report
+        from tools.vq2a8_v3_progress import ProgressReporter, RequestProgress
         from vllm_ascend.quantization.vq2a8_offline import offline_engine_options
 
+        progress_reporter = ProgressReporter()
         report["device"] = _initialize_device(torch.device("npu:0"))
         report["soc"] = torch.npu.get_device_name(0)
         report["environment"] = environment_report()
         require_hardware_runtime()
-        if not args.reference_only and reference["soc"] != report["soc"]:
+        if not args.reference_only and not args.v3_only and reference["soc"] != report["soc"]:
             raise ValueError("Baseline/v3 exact SoC mismatch")
         config = json.loads((args.model / "config.json").read_text(encoding="utf-8"))
         if config.get("num_hidden_layers") != LAYERS:
@@ -641,6 +675,9 @@ def run(args):
             ):
                 raise ValueError("V3/reference self-repeat is not exact")
             if not args.reference_only:
+                for record in records:
+                    validate_residency(record.get("v3_before", {}), record.get("v3", {}), o - 1)
+            if not args.reference_only and not args.v3_only:
                 for reference_record in reference["diagnostics"][case]:
                     golden = load_diagnostic(reference_record, reference["library"], "ascendc", config["vocab_size"])
                     if (
@@ -649,21 +686,35 @@ def run(args):
                         or not torch.equal(golden.view(torch.uint8), values[0].view(torch.uint8))
                     ):
                         raise ValueError(f"v1/v3 exact logits or token comparison failed: {case}")
-            print(f"PERF_V3_CASE_EXACT={case} REPEAT_EXACT=True BASELINE_EXACT={not args.reference_only}", flush=True)
+            baseline_status = "NOT_REQUESTED" if args.v3_only else str(not args.reference_only)
+            print(f"PERF_V3_CASE_EXACT={case} REPEAT_EXACT=True BASELINE_EXACT={baseline_status}", flush=True)
             if report["mode"] == "performance":
                 for kind, count in (("warmup", args.warmups), ("measured", args.repeats)):
                     for index in range(count):
                         print(f"PERF_V3_CASE_START={case} KIND={kind} REPEAT={index + 1}/{count}", flush=True)
                         configure(llm, measurement=True, compact=False, optimization="batched")
-                        sample = timed_request(llm, prompt, o, f"v3-{case}-{kind}-{index}")
+                        request_id = f"v3-{case}-{kind}-{index}"
+                        with RequestProgress(
+                            request_id, o, interval_s=args.progress_interval, reporter=progress_reporter
+                        ) as progress:
+                            sample = timed_request(llm, prompt, o, request_id, progress=progress)
                         sample.update(
                             case=case, kind=kind, repeat=index, tokens_exact=sample["tokens"] == records[0]["tokens"]
                         )
                         validate_sample(sample, o, records[0]["tokens"])
                         report["samples"].append(sample)
                         write_report(output, report)
-                        print(f"PERF_V3_SAMPLE={case} KIND={kind} TPOT_MS={sample['tpot_s'] * 1000:.4f}", flush=True)
-        report.update(repeat_exact=True, baseline_exact=not args.reference_only)
+                        interval_example = [v * 1000 for v in sample["decode_intervals_s"][:8]]
+                        print(
+                            f"PERF_V3_SAMPLE={case} KIND={kind} TOKENS={len(sample['tokens'])} "
+                            f"TTFT_MS={sample['ttft_s'] * 1000:.4f} TPOT_MS={sample['tpot_s'] * 1000:.4f} "
+                            f"E2E_S={sample['e2e_s']:.4f} "
+                            f"DECODE_INTERVAL_MS_FIRST8={json.dumps(interval_example)}",
+                            flush=True,
+                        )
+        report.update(repeat_exact=True, baseline_exact=None if args.v3_only else not args.reference_only)
+        if not args.v3_only and not args.reference_only:
+            report["baseline_comparison"] = "verified"
         if report["mode"] == "performance":
             report["summaries"] = summarize_samples(
                 report["samples"], cases, args.warmups, args.repeats, report["diagnostics"]
@@ -686,6 +737,8 @@ def run(args):
         )
         raise
     finally:
+        if progress_reporter is not None:
+            progress_reporter.close()
         write_report(output, report)
         print((output / "summary.txt").read_text(encoding="utf-8"), flush=True)
 
@@ -698,11 +751,15 @@ def parse_args(argv=None):
     parser.add_argument("--reference-report", type=Path)
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--correctness-only", action="store_true")
+    parser.add_argument(
+        "--v3-only", action="store_true", help="Measure v3 with self-checks; do not access v1 library/reference"
+    )
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--profile", action="store_true", help="One extra untimed CPU/NPU trace after measurements")
     parser.add_argument("--cases", default="10:4", help="Also supports 10:64,32:64; total context <=128")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--progress-interval", type=float, default=5.0, help="Background progress seconds; 0 disables")
     parser.add_argument("--cache-budget-gib", type=float, default=0.0)
     parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
     parser.add_argument("--memory-fraction", type=float, default=0.9)
@@ -726,6 +783,8 @@ def main():
                     scope="plan_only_no_device_execution",
                     cases=parse_cases(args.cases),
                     configuration=configuration(args),
+                    v3_only=args.v3_only,
+                    baseline_comparison="not_requested" if args.v3_only else "required",
                     full_model_graph_verified=False,
                 ),
                 indent=2,

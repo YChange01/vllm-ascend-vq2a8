@@ -57,6 +57,7 @@ def python_source_hashes():
         "tools/validate_vq2a8_ascendc.py",
         "tools/vq2a8_baseline.py",
         "tools/vq2a8_perf_report.py",
+        "tools/vq2a8_v3_progress.py",
         "vllm_ascend/quantization/vq2a8_ascendc_v3.py",
         "vllm_ascend/quantization/vq2a8_ascendc.py",
         "vllm_ascend/quantization/vq2a8_activation.py",
