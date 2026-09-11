@@ -129,9 +129,11 @@ class AscendCV2Projection {
         MaskReg all32 = CreateMask<uint32_t, MaskPattern::ALL>();
         MaskReg all8 = CreateMask<uint8_t, MaskPattern::ALL>();
         RegTensor<uint16_t> lut, value;
-        RegTensor<uint32_t> word, highNibble, highIndex, index, mask, shiftRight, shiftLeft;
-        Duplicate(shiftRight, uint32_t(4), all32);
-        Duplicate(shiftLeft, uint32_t(16), all32);
+        RegTensor<uint32_t> word, highNibble, highIndex, index, mask;
+        // CANN 9.1 vshr/vshl use signed per-lane counts even for uint32 data.
+        RegTensor<int32_t> shiftRight, shiftLeft;
+        Duplicate(shiftRight, int32_t(4), all32);
+        Duplicate(shiftLeft, int32_t(16), all32);
         Duplicate(mask, uint32_t(0x000F000F), all32);
         for (uint16_t n1 = 0; n1 < kN / kN0; ++n1) {
           for (uint16_t lutK = 0; lutK < kAivK / kCodebookK; ++lutK) {

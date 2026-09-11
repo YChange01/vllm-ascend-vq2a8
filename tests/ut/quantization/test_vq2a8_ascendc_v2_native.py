@@ -202,6 +202,22 @@ def test_v2_cross_core_protocol_drains_between_pointer_jobs(k_tiles, seed):
     assert not tokens and not buffers
 
 
+@pytest.mark.parametrize(("count_register", "count"), [("shiftRight", 4), ("shiftLeft", 16)])
+def test_v2_shift_counts_are_signed(count_register, count):
+    """Guard the CANN 9.1 u32-data/s32-count contract; not a device compile test."""
+    kernel = (SOURCE / "kernel.cpp").read_text(encoding="utf-8")
+    register_types = {
+        name.strip(): dtype
+        for dtype, names in re.findall(r"RegTensor<(\w+)>\s+([\w,\s]+);", kernel)
+        for name in names.split(",")
+    }
+    assert register_types[count_register] == "int32_t", "vshr/vshl require signed per-lane shift counts"
+    assert re.search(rf"Duplicate\(\s*{count_register},\s*int32_t\({count}\),\s*all32\s*\)", kernel)
+    # Only the counts change type: preserve logical shifts and packed LUT bits.
+    for data_register in ("word", "highNibble", "highIndex", "index", "mask"):
+        assert register_types[data_register] == "uint32_t"
+
+
 def test_v2_native_source_contract_and_distinct_backend():
     kernel = (SOURCE / "kernel.cpp").read_text(encoding="utf-8")
     binding = (SOURCE / "torch_binding.cpp").read_text(encoding="utf-8")
