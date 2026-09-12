@@ -13,6 +13,7 @@ import torch
 from safetensors import safe_open
 
 from vllm_ascend.quantization.vq2a8_execution import (
+    GIB,
     AscendCVQ2TP1MoE,
     CachedVQ2TP1MoE,
     device_cache_budget,
@@ -24,6 +25,14 @@ from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
 OFFLINE_CONTEXT_LIMIT = 32
 OFFLINE_NEW_TOKENS = 4
 OFFLINE_RUNS = 2
+CACHE_EXECUTION_POLICIES = ("cached", "ascendc", "ascendc_v2", "ascendc_v3")
+
+
+def _validate_cache_memory_fraction(value, policy):
+    if policy not in CACHE_EXECUTION_POLICIES:
+        raise ValueError("cache_memory_fraction requires a cached or native AscendC execution policy.")
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 1:
+        raise ValueError("cache_memory_fraction must be a finite number in (0,1], not a boolean.")
 
 
 def offline_engine_options(
@@ -33,6 +42,7 @@ def offline_engine_options(
     execution_policy="cached",
     cache_budget_gib=0.0,
     cache_reserve_gib=16.0,
+    cache_memory_fraction=None,
     root_linear_mode="bf16",
     ascendc_library=None,
     ascendc_sha256=None,
@@ -49,6 +59,8 @@ def offline_engine_options(
         raise ValueError("V2 library options require execution_policy=ascendc_v2.")
     if execution_policy != "ascendc_v3" and (ascendc_v3_library is not None or ascendc_v3_sha256 is not None):
         raise ValueError("V3 library options require execution_policy=ascendc_v3.")
+    if cache_memory_fraction is not None:
+        _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     return {
         "model": str(model_root),
         "skip_tokenizer_init": True,
@@ -86,6 +98,7 @@ def offline_engine_options(
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
+                **({"cache_memory_fraction": cache_memory_fraction} if cache_memory_fraction is not None else {}),
                 "root_linear_mode": root_linear_mode,
                 "verbose_experts": verbose_experts,
                 **(
@@ -121,6 +134,7 @@ def validate_offline_config(config) -> dict:
         "execution_policy",
         "cache_budget_gib",
         "cache_reserve_gib",
+        "cache_memory_fraction",
         "root_linear_mode",
         "ascendc_library",
         "ascendc_sha256",
@@ -176,6 +190,11 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
     if options.get("execution_policy", "baseline") not in ("baseline", "cached", "ascendc", "ascendc_v2", "ascendc_v3"):
         raise ValueError("execution_policy must be baseline, cached, ascendc, ascendc_v2 or ascendc_v3.")
+    if "cache_memory_fraction" in options:
+        _validate_cache_memory_fraction(options["cache_memory_fraction"], options.get("execution_policy", "baseline"))
+        kv_bytes = getattr(config.cache_config, "kv_cache_memory_bytes", None)
+        if type(kv_bytes) is not int or kv_bytes <= 0:
+            raise ValueError("cache_memory_fraction requires explicit positive integer kv_cache_memory_bytes.")
     if options.get("execution_policy") == "ascendc":
         path, sha = options.get("ascendc_library"), options.get("ascendc_sha256")
         if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
@@ -218,6 +237,10 @@ def validate_offline_config(config) -> dict:
         value = options.get(key, default)
         if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
             raise ValueError(f"{key} must be finite and >= {minimum}.")
+    if "cache_memory_fraction" in options and kv_bytes > options.get("cache_reserve_gib", 16.0) * GIB:
+        raise ValueError(
+            "Explicit kv_cache_memory_bytes must fit inside cache_reserve_gib when cache fraction is independent."
+        )
     return options
 
 
@@ -332,16 +355,70 @@ class OfflineMoEOwner:
 
     def configure_cache(self, memory_fraction: float) -> None:
         """Call after strict root load, before profiling populates any cache."""
-        if self.options.get("execution_policy") not in ("cached", "ascendc", "ascendc_v2", "ascendc_v3"):
+        policy = self.options.get("execution_policy")
+        override = self.options.get("cache_memory_fraction")
+        if override is not None:
+            _validate_cache_memory_fraction(override, policy)
+        if policy not in CACHE_EXECUTION_POLICIES:
             return
         if any(layer.cache_stats()["resident_experts"] for layer in self.layers.values()):
             raise ValueError("Configure the packed cache before the first expert call.")
+        cache_memory_fraction = memory_fraction if override is None else override
+        requested_gib = self.options.get("cache_budget_gib", 0.0)
+        if type(requested_gib) not in (int, float) or not math.isfinite(requested_gib) or requested_gib < 0:
+            raise ValueError("cache_budget_gib must be finite and non-negative.")
+        # Sample the original safe-budget function once, before applying an
+        # explicit byte cap, so even a rejected cap has useful memory evidence.
         budget = device_cache_budget(
             self.device,
             reserve_gib=self.options.get("cache_reserve_gib", 16.0),
-            budget_gib=self.options.get("cache_budget_gib", 0.0),
-            memory_fraction=memory_fraction,
+            budget_gib=0.0,
+            memory_fraction=cache_memory_fraction,
         )
+        available = budget["budget_bytes"]
+        requested = int(requested_gib * GIB)
+        free, allocated, reserved = (
+            budget.get("free_bytes"),
+            budget.get("allocated_bytes_at_plan"),
+            budget.get("reserved_bytes_at_plan"),
+        )
+        reusable = (
+            free + max(0, reserved - allocated)
+            if all(value is not None for value in (free, allocated, reserved))
+            else None
+        )
+        evidence = {
+            "scope": "requested_cap_within_safe_budget_not_model_residency",
+            "execution_policy": policy,
+            "engine_memory_fraction": memory_fraction,
+            "cache_memory_fraction": cache_memory_fraction,
+            "independent_cache_fraction": override is not None,
+            "free_bytes": free,
+            "reusable_bytes": reusable,
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "reserve_bytes": budget.get("reserve_bytes"),
+            "available_bytes": available,
+            "requested_bytes": requested,
+            "budget_bytes": requested or available,
+            "fits": requested <= available,
+        }
+        evidence.update(
+            {
+                key.replace("_bytes", "_gib"): value / GIB if value is not None else None
+                for key, value in list(evidence.items())
+                if key.endswith("_bytes")
+            }
+        )
+        print("MODEL_CACHE_BUDGET " + json.dumps(evidence), flush=True)
+        if requested > available:
+            raise ValueError(f"Requested packed cache {requested} exceeds safe current budget {available} bytes.")
+        budget = {
+            **budget,
+            "budget_bytes": requested or available,
+            "engine_memory_fraction": memory_fraction,
+            "cache_memory_fraction": cache_memory_fraction,
+        }
         if self.options.get("execution_policy") == "ascendc_v3":
             self._configure_v3_residency(budget)
             return
@@ -370,7 +447,9 @@ class OfflineMoEOwner:
         """
         from vllm_ascend.quantization.vq2a8_execution_v3 import resident_plan
 
-        plan = resident_plan([layer.layer for layer in self.layers.values()], budget["budget_bytes"])
+        plan = resident_plan(
+            [layer.layer for layer in self.layers.values()], budget["budget_bytes"], report_budget=True
+        )
         self.cache_plan = {**budget, **plan}
         print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
         for index, layer in self.layers.items():

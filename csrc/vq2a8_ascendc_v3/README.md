@@ -37,10 +37,22 @@ v3 从 `../vq2a8_ascendc`（v1）派生，不替换 v1/v2，不改默认后端�
 
 ## 内存预算
 
+启动检查与权重常驻预算使用两个独立参数：
+
+- `--engine-memory-fraction`（默认 `0.98`）传给 vLLM 的 `gpu_memory_utilization`，
+  引擎启动时检查空闲显存是否达到 `total × engine_fraction`，不绕过 worker 检查。
+- `--memory-fraction` / `--cache-memory-fraction`（同一参数，默认 `0.9`）
+  单独限制 packed 权重和固定工作区预算，不再传给引擎启动检查。
+- `--cache-reserve-gib` 保留给后续 KV、临时张量和分配器余量，不自动降低。
+
 预算在 BF16 根权重加载完成后计算。`--cache-budget-gib 0` 表示按可用内存计算，
-不是无限预算。`--memory-fraction` 同时限制允许使用的物理显存比例；
-`--cache-reserve-gib` 保留给后续 KV、临时张量和分配器余量，不自动降低。
-固定 v3 decode 工作区另外计入常驻预算。
+不是无限预算。可用预算为
+`max(0, min(free + max(0, reserved - allocated), total × cache_fraction - allocated) - reserve)`。
+固定 v3 decode 工作区计入常驻需求；显式 cache budget 也不得超过此可用预算。
+独立 cache 比例仅在显式指定 KV 字节数且其不超过 reserve 时启用，本工具固定为 1 GiB，
+避免同时使用自动 KV 比例预算；reserve 中 KV 以外的空间还要容纳临时张量和运行峰值。
+因此 engine 比例在此手动 KV 配置下不充当整个进程的显存硬上限；物理安全检查由独立预算及预留承担。
+其他旧入口未指定独立 cache 比例时，仍沿用原来的引擎比例，不改变旧版默认行为。
 
 此前服务器日志中的物理容量约 80.16 GiB、根权重已分配约 14.82 GiB、
 完整 packed cache 约 61.54 GiB。再扣除 1 GiB KV 后算术余量仅约 2.80 GiB，
@@ -48,9 +60,17 @@ v3 从 `../vq2a8_ascendc`（v1）派生，不替换 v1/v2，不改默认后端�
 默认 0.9 使用比例和 16 GiB reserve 很可能主动拒绝该配置。
 这代表策略预算不足，不等于证明物理内存绝对装不下。
 
-以下完整实测示例显式选择 `--memory-fraction 1.0 --cache-reserve-gib 3`，
+旧命令把 `1.0` 同时用作引擎启动比例，会要求整卡 80.16 GiB 全部空闲，
+即使日志显示空闲 79.41 GiB，也会在模型加载前退出。这不是模型 OOM。
+按此前精确根权重分配数及模型几何计算，v3 常驻需求约 61.566 GiB；
+只改为 `0.99` 并保留 3 GiB reserve，比例预算仍少约 29.43 MiB，不能作为可靠修复。
+
+以下完整实测示例显式选择 `--engine-memory-fraction 0.98 --memory-fraction 1.0 --cache-reserve-gib 3`，
 是一个需要核查运行峰值的紧预算候选，**不是自动默认值或装得下的承诺**。
 请在空闲卡上执行；若预算/OOM 失败，保留日志，不要无条件继续减小 reserve。
+启动前显示 `PERF_V3_MEMORY_CONFIG`；根权重加载后显示 `MODEL_CACHE_BUDGET`，
+全驻留分配前显示 `V3_RESIDENCY_BUDGET` 的需求、可用预算、余量/缺口和 `fits`。
+如果 `fits=false`，不会开始部分权重加载；如果 `fits=true`，也不代表运行峰值已验证。
 
 ## 服务器操作
 
@@ -68,6 +88,7 @@ python -u tools/accept_vq2a8_ascendc_v3.py \
   --model /home/g00872988/vq2a8 \
   --library build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so \
   --physical-npu 0 \
+  --engine-memory-fraction 0.98 \
   --memory-fraction 1.0 --cache-reserve-gib 3 \
   --v3-only --benchmark --cases 10:32 \
   --warmups 2 --repeats 5 \
@@ -107,6 +128,7 @@ python -u tools/accept_vq2a8_ascendc_v3.py \
   --library build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so \
   --baseline-library build/vq2a8-ascendc-v026/libvq2a8_ascendc.so \
   --physical-npu 0 \
+  --engine-memory-fraction 0.98 \
   --memory-fraction 1.0 --cache-reserve-gib 3 \
   --benchmark --cases 10:4 --warmups 2 --repeats 5 \
   --target-tpot-ms 20 --timeout 3600

@@ -83,9 +83,9 @@ def test_v3_integration_plans_all_layers_before_initializing(monkeypatch):
         for index in (0, 1)
     }
 
-    def plan(layers, budget):
+    def plan(layers, budget, *, report_budget=False):
         assert layers == [0, 1] and not calls
-        assert budget == 30
+        assert budget == 30 and report_budget is True
         return {"planned_bytes": 30, "layer_plans": {0: {"planned_bytes": 10}, 1: {"planned_bytes": 20}}}
 
     monkeypatch.setattr(v3, "resident_plan", plan)
@@ -100,7 +100,8 @@ def test_v3_integration_budget_failure_never_begins_partial_loading(monkeypatch)
     owner = offline.OfflineMoEOwner.__new__(offline.OfflineMoEOwner)
     owner.layers = {0: NS(layer=0, initialize_resident=lambda **kwargs: pytest.fail("must plan first"))}
 
-    def insufficient(*args):
+    def insufficient(*args, **kwargs):
+        assert kwargs == {"report_budget": True}
         raise ValueError("full residency exceeds budget")
 
     monkeypatch.setattr(v3, "resident_plan", insufficient)

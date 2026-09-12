@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from tools.benchmark_vq2a8_ascendc_v3 import parse_cases
+from tools.benchmark_vq2a8_ascendc_v3 import configuration, parse_cases
 from tools.build_vq2a8_ascendc_v3 import LIBRARY_NAME, REPO
 from tools.validate_vq2a8_ascendc_v3 import library_identity, validate_receipt
 from tools.validate_vq2a8_tp1_acceptance import acceptance_environment
@@ -128,6 +128,8 @@ def commands(args, output):
         str(args.cache_reserve_gib),
         "--memory-fraction",
         str(args.memory_fraction),
+        "--engine-memory-fraction",
+        str(args.engine_memory_fraction),
         "--progress-interval",
         str(args.progress_interval),
     ]
@@ -188,7 +190,19 @@ def parse_args(argv=None):
         default=16.0,
         help="Explicit headroom for KV/allocator; never automatically reduced",
     )
-    parser.add_argument("--memory-fraction", type=float, default=0.9)
+    parser.add_argument(
+        "--memory-fraction",
+        "--cache-memory-fraction",
+        type=float,
+        default=0.9,
+        help="Expert-cache budget fraction in (0,1]; independent of engine startup reservation (default: 0.9)",
+    )
+    parser.add_argument(
+        "--engine-memory-fraction",
+        type=float,
+        default=0.98,
+        help="vLLM startup memory fraction in (0,1]; worker free-memory check stays enabled (default: 0.98)",
+    )
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument(
         "--v3-only", action="store_true", help="Measure v3 without loading/comparing v1; requires --benchmark"
@@ -228,8 +242,10 @@ def parse_args(argv=None):
             or args.cache_reserve_gib < 1
             or not math.isfinite(args.memory_fraction)
             or not 0 < args.memory_fraction <= 1
+            or not math.isfinite(args.engine_memory_fraction)
+            or not 0 < args.engine_memory_fraction <= 1
         ):
-            raise ValueError("Invalid budget/reserve/memory fraction")
+            raise ValueError("Invalid budget/reserve/cache memory fraction/engine memory fraction")
         if args.target_tpot_ms is not None and (
             not args.benchmark or not math.isfinite(args.target_tpot_ms) or args.target_tpot_ms <= 0
         ):
@@ -254,6 +270,7 @@ def main():
                 dict(
                     scope="plan_only_no_device_execution",
                     steps=steps,
+                    configuration=configuration(args),
                     default_backend="unchanged",
                     full_model_graph_verified=False,
                     performance_target_met=None,
@@ -271,6 +288,7 @@ def main():
     report = dict(
         status="RUNNING",
         stages=[],
+        configuration=configuration(args),
         default_backend="unchanged",
         full_model_graph_verified=False,
         device_execution_verified=False,
@@ -290,6 +308,7 @@ def main():
 
     save()
     try:
+        print(f"VQ2A8_V3_MEMORY_CONFIG={json.dumps(configuration(args))}", flush=True)
         for step_index, (name, command) in enumerate(steps, 1):
             print(
                 f"VQ2A8_V3_STAGE={name} STEP={step_index}/{len(steps)} "

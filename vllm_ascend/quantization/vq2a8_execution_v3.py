@@ -8,6 +8,7 @@ uses the legacy eager grouped ABI in the separate V3 library. Initialization,
 immutability checks and validity reporting belong outside measured decode.
 """
 
+import json
 import math
 import time
 from contextlib import suppress
@@ -47,7 +48,7 @@ def _rounded(size):
     return math.ceil(size / ALLOCATION_GRANULARITY) * ALLOCATION_GRANULARITY
 
 
-def resident_plan(layers, budget_bytes, *, top_k=6):
+def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
     """Header-only device-storage plan; budget excludes roots, KV and scratch.
 
     Transform metadata is loaded directly into its final bank, never stacked
@@ -55,8 +56,8 @@ def resident_plan(layers, budget_bytes, *, top_k=6):
     eager preparation/operator scratch, fragmentation and graph pools still
     require the caller's separate reserve. The plan never reduces expert count.
     """
-    if type(budget_bytes) is not int or budget_bytes <= 0 or type(top_k) is not int or not 1 <= top_k <= 6:
-        raise ValueError("V3 requires an explicit positive byte budget and top_k in [1,6].")
+    if type(budget_bytes) is not int or budget_bytes < 0 or type(top_k) is not int or not 1 <= top_k <= 6:
+        raise ValueError("V3 requires an explicit non-negative byte budget and top_k in [1,6].")
     plans = {}
     for layer in layers:
         if layer.layer_index in plans or not layer.expert_ids or len(set(layer.expert_ids)) != len(layer.expert_ids):
@@ -113,10 +114,12 @@ def resident_plan(layers, budget_bytes, *, top_k=6):
     totals = {
         key: sum(plan[key] for plan in plans.values()) for key in ("payload_bytes", "workspace_bytes", "planned_bytes")
     }
+    if report_budget:
+        _report_resident_budget(totals, budget_bytes)
     if totals["planned_bytes"] > budget_bytes:
         raise ValueError(
             f"V3 full residency requires {totals['planned_bytes']} bytes, "
-            f"exceeds budget {budget_bytes}; no cache fallback."
+            f"exceeds budget {budget_bytes} by {totals['planned_bytes'] - budget_bytes} bytes; no cache fallback."
         )
     return dict(
         **totals,
@@ -127,6 +130,26 @@ def resident_plan(layers, budget_bytes, *, top_k=6):
         per_layer_cache_limit=max(plan["experts"] for plan in plans.values()),
         layer_limits={index: plan["experts"] for index, plan in plans.items()},
         scope="packed_payload_and_persistent_workspace_only_separate_scratch_reserve_required",
+    )
+
+
+def _report_resident_budget(totals, budget_bytes):
+    """Header-only report, including shortages before the first resident bank."""
+    required = totals["planned_bytes"]
+    headroom = budget_bytes - required
+    values = dict(
+        required_bytes=required,
+        payload_bytes=totals["payload_bytes"],
+        workspace_bytes=totals["workspace_bytes"],
+        budget_bytes=budget_bytes,
+        headroom_bytes=headroom,
+        shortfall_bytes=max(0, -headroom),
+    )
+    gib_values = {key.replace("_bytes", "_gib"): value / GIB for key, value in values.items()}
+    print(
+        "V3_RESIDENCY_BUDGET "
+        + json.dumps(dict(**values, **gib_values, fits=headroom >= 0, scope="packed_payload_and_persistent_workspace")),
+        flush=True,
     )
 
 

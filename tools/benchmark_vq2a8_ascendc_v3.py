@@ -56,8 +56,10 @@ def validate_options(args):
         or args.cache_reserve_gib < 1
         or not math.isfinite(args.memory_fraction)
         or not 0 < args.memory_fraction <= 1
+        or not math.isfinite(args.engine_memory_fraction)
+        or not 0 < args.engine_memory_fraction <= 1
     ):
-        raise ValueError("Budget >=0, reserve >=1 GiB, memory fraction in (0,1] must be finite")
+        raise ValueError("Budget >=0, reserve >=1 GiB, cache and engine memory fractions in (0,1] must be finite")
     if args.target_tpot_ms is not None and (not math.isfinite(args.target_tpot_ms) or args.target_tpot_ms <= 0):
         raise ValueError("Target TPOT must be finite and positive")
     if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
@@ -69,11 +71,54 @@ def configuration(args):
         cache_budget_gib=args.cache_budget_gib,
         cache_reserve_gib=args.cache_reserve_gib,
         memory_fraction=args.memory_fraction,
+        engine_memory_fraction=args.engine_memory_fraction,
         preset="batched",
         root_linear_mode="bf16",
         max_context=MAX_CONTEXT,
         tensor_parallel_size=1,
         max_num_seqs=1,
+    )
+
+
+def build_engine_options(args, library, options_factory):
+    """Keep worker startup reservation independent of the expert-cache budget."""
+    library_options = (
+        {"ascendc_library": library["path"], "ascendc_sha256": library["sha256"]}
+        if args.reference_only
+        else {"ascendc_v3_library": library["path"], "ascendc_v3_sha256": library["sha256"]}
+    )
+    options = options_factory(
+        args.model,
+        args.model / "experts_vq_ascend_v2",
+        execution_policy="ascendc" if args.reference_only else "ascendc_v3",
+        cache_budget_gib=args.cache_budget_gib,
+        cache_reserve_gib=args.cache_reserve_gib,
+        cache_memory_fraction=args.memory_fraction,
+        root_linear_mode="bf16",
+        **library_options,
+    )
+    options.update(
+        max_model_len=MAX_CONTEXT,
+        max_num_batched_tokens=MAX_CONTEXT,
+        gpu_memory_utilization=args.engine_memory_fraction,
+    )
+    return options
+
+
+def engine_memory_diagnostic(free_total_bytes, options):
+    """Informational pre-LLM snapshot; worker rechecks memory after device setup."""
+    free, total = free_total_bytes
+    engine_memory_fraction = options["gpu_memory_utilization"]
+    requested = int(total * engine_memory_fraction)
+    return dict(
+        engine_memory_fraction=engine_memory_fraction,
+        cache_memory_fraction=options["additional_config"]["vq2a8_offline"]["cache_memory_fraction"],
+        kv_cache_memory_bytes=options["kv_cache_memory_bytes"],
+        requested_bytes=requested,
+        observed_free_bytes=free,
+        observed_total_bytes=total,
+        observed_requested_fits_free=requested <= free,
+        worker_check_authoritative=True,
     )
 
 
@@ -541,6 +586,7 @@ def run(args):
     write_report(output, report)
     progress_reporter = None
     try:
+        print(f"PERF_V3_MEMORY_CONFIG={json.dumps(configuration(args))}", flush=True)
         visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")
         if not visible.isdecimal():
             raise ValueError("Select exactly one physical NPU")
@@ -611,28 +657,20 @@ def run(args):
                 same_fp8_oracle(values[:3], synthetic_dense_oracle(*values[3:])),
                 vq2a8_ascendc(*(v.to("npu:0") for v in values)),
             )
-        kwargs = (
-            {"ascendc_library": library["path"], "ascendc_sha256": library["sha256"]}
-            if args.reference_only
-            else {"ascendc_v3_library": library["path"], "ascendc_v3_sha256": library["sha256"]}
-        )
-        options = offline_engine_options(
-            args.model,
-            args.model / "experts_vq_ascend_v2",
-            execution_policy=policy,
-            cache_budget_gib=args.cache_budget_gib,
-            cache_reserve_gib=args.cache_reserve_gib,
-            root_linear_mode="bf16",
-            **kwargs,
-        )
-        options.update(
-            max_model_len=MAX_CONTEXT, max_num_batched_tokens=MAX_CONTEXT, gpu_memory_utilization=args.memory_fraction
-        )
+        options = build_engine_options(args, library, offline_engine_options)
         report["engine_options"] = options
         report["before_model_memory"] = dict(
             free_total_bytes=list(torch.npu.mem_get_info()),
             allocated_bytes=torch.npu.memory_allocated(),
             reserved_bytes=torch.npu.memory_reserved(),
+        )
+        report["engine_memory_diagnostic"] = engine_memory_diagnostic(
+            report["before_model_memory"]["free_total_bytes"], options
+        )
+        memory_check = report["engine_memory_diagnostic"]
+        print(
+            f"PERF_V3_MEMORY_CONFIG={json.dumps({**configuration(args), **memory_check})}",
+            flush=True,
         )
         torch.npu.reset_peak_memory_stats()
         print(
@@ -762,7 +800,19 @@ def parse_args(argv=None):
     parser.add_argument("--progress-interval", type=float, default=5.0, help="Background progress seconds; 0 disables")
     parser.add_argument("--cache-budget-gib", type=float, default=0.0)
     parser.add_argument("--cache-reserve-gib", type=float, default=16.0)
-    parser.add_argument("--memory-fraction", type=float, default=0.9)
+    parser.add_argument(
+        "--memory-fraction",
+        "--cache-memory-fraction",
+        type=float,
+        default=0.9,
+        help="Expert-cache budget fraction in (0,1]; independent of engine startup reservation (default: 0.9)",
+    )
+    parser.add_argument(
+        "--engine-memory-fraction",
+        type=float,
+        default=0.98,
+        help="vLLM startup memory fraction in (0,1]; worker free-memory check stays enabled (default: 0.98)",
+    )
     parser.add_argument(
         "--target-tpot-ms", type=float, help="Optional observation target; missing it never fails correctness"
     )
