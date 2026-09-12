@@ -74,6 +74,42 @@ v3 从 `../vq2a8_ascendc`（v1）派生，不替换 v1/v2，不改默认后端�
 
 ## 服务器操作
 
+### 快速迭代：只用 vLLM 引擎粗测 TPOT
+
+已有编译好的 v3 库时，运行独立快测入口，**不需要先跑完整验收**：
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+python -u tools/quick_benchmark_vq2a8_v3.py \
+  --model /home/g00872988/vq2a8 --physical-npu 0
+```
+
+默认使用 `build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so`，只创建一次 `vllm.LLM`，
+预热 1 次、测量 3 次，每次输入 10、输出 32 个 token。直接通过 `llm.llm_engine.step()`
+运行完整模型和调度器，不是单算子微基准，也不启动 HTTP 服务。
+每轮在终端打印 TTFT/TPOT/E2E；最后看 `QUICK_V3_DONE` 的 `TPOT_MEDIAN_MS`、最小值和最大值。
+预热不计入统计；若只想尽快看一次结果，可加 `--repeats 1`，但单样本波动较大。
+输入、输出和预热分别通过 `--prompt-tokens`、`--output-tokens`、`--warmups` 调整；总长度不超过 128。
+
+TPOT 为 `(末 token 返回时间 - 首 token 返回时间) / (输出数 - 1)`，
+用主机时钟记录引擎返回 token 的时间，包含调度/提交开销，不是纯 NPU 内核时间。
+计时循环没有逐 token 日志、额外同步或 NPU event；请求边界同步。
+启动、预热和最终检查不计入 TPOT，`E2E_S` 包含该请求的首 token 等待及末尾同步。
+
+快测跳过自动构建、算子/QLI/SAS preflight、旧库对照、重复 logits 比较、profiler 和报告目录生成。
+仍保留库/源码身份、硬件与 SoC 匹配、显存预算和原有完整权重加载检查，结束时检查有限值和 43 层
+resident decode 执行。它只输出速度估计，始终标记 `ACCEPTANCE=NOT_RUN`，不证明数值正确或质量合格。
+如果修改了原生源码，需要先重新编译 v3；快测不会悄悄测旧 `.so`。
+
+为减少启动预跑，两项上下文/批 token 上限均设置为本次输入加输出长度，默认 42，而非完整测速的 128。
+因此不同长度间、与完整验收间比较时需要注意配置差异；同配置连续测量更适合判断优化趋势。
+模型全量加载和引擎自身的启动预跑仍保留，不能承诺整个命令几秒完成。
+
+**仅这个快测入口**采用当前 80 GiB 服务器使用的紧预算默认值：
+`--engine-memory-fraction 0.98 --cache-memory-fraction 1.0 --cache-reserve-gib 3`，
+固定 KV 为 1 GiB，包含在 reserve 中；仍按实际空闲显存检查，不保证装得下，不自动降低 reserve。
+原有完整验收脚本及其默认配置不变。
+
 ### 只测当前 v3 的 TTFT/TPOT
 
 已有 v3 库且只关心当前速度时，使用 `--v3-only --benchmark`。该模式不读取、
