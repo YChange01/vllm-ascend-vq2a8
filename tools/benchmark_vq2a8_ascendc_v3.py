@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Isolated v1 references / exact v3 model gates / per-token event+wall timing.
+"""Isolated v1 comparison / resident v3 model gates / per-token event+wall timing.
 
 No full-model graph or 20 ms result is implied. Residency is mandatory for v3;
 policy-budget failure is not proof that the physical device cannot fit the model.
@@ -28,11 +28,17 @@ from tools.validate_vq2a8_ascendc_v3 import checked_model_preflight, model_ident
 from tools.vq2a8_perf_report import MAX_CONTEXT, distribution, token_metrics, validate_cases
 
 LAYERS = 43
+SCHEMA_VERSION = 2
 SCOPE = "TP1_B1_OFFLINE_CONTEXT_LE_128_EAGER"
 
 
 def parse_cases(value):
     return validate_cases([tuple(map(int, case.split(":"))) for case in value.split(",")])
+
+
+def candidate_preflight(args):
+    options = {"preparation": "fused"} if args.preparation == "fused" else {}
+    return checked_model_preflight(args.library, args.preflight, args.model, **options)
 
 
 def validate_options(args):
@@ -41,6 +47,8 @@ def validate_options(args):
         raise ValueError("Choose reference-only or correctness-only, not both")
     if args.v3_only and (args.reference_only or args.correctness_only or args.reference_report is not None):
         raise ValueError("--v3-only is performance-only and rejects reference-only/correctness-only/reference-report")
+    if args.v3_only and args.baseline_mode != "observe":
+        raise ValueError("--v3-only cannot request a strict baseline comparison")
     if args.profile and (args.reference_only or args.correctness_only):
         raise ValueError("--profile requires the performance mode")
     if not args.reference_only and not args.preflight:
@@ -77,6 +85,9 @@ def configuration(args):
         max_context=MAX_CONTEXT,
         tensor_parallel_size=1,
         max_num_seqs=1,
+        baseline_mode=args.baseline_mode,
+        decode_graph=args.decode_graph,
+        preparation=args.preparation,
     )
 
 
@@ -87,6 +98,8 @@ def build_engine_options(args, library, options_factory):
         if args.reference_only
         else {"ascendc_v3_library": library["path"], "ascendc_v3_sha256": library["sha256"]}
     )
+    if not args.reference_only:
+        library_options.update(v3_decode_graph=args.decode_graph, v3_preparation=args.preparation)
     options = options_factory(
         args.model,
         args.model / "experts_vq_ascend_v2",
@@ -128,6 +141,7 @@ def write_report(output, report):
         f"VQ2A8_V3={report['status']} MODE={report['mode']}",
         f"BASELINE_EXACT={'NOT_REQUESTED' if report.get('v3_only') else report.get('baseline_exact', False)} "
         f"REPEAT_EXACT={report.get('repeat_exact', False)}",
+        f"BASELINE_COMPARISON={report.get('baseline_comparison')} QUALITY_VERIFIED=False",
         f"PERFORMANCE_MEASUREMENT_VERIFIED={report.get('performance_measurement_verified', False)}",
         f"PERFORMANCE_TARGET_MET={report.get('performance_target_met')}",
         "FULL_MODEL_GRAPH_VERIFIED=False DEFAULT_BACKEND=UNCHANGED",
@@ -138,6 +152,15 @@ def write_report(output, report):
             f"CASE={row['case']} TTFT_MS={row['ttft_ms']:.4f} TPOT_MS={row['tpot_ms']:.4f} "
             f"DECODE_TOKEN_P95_MS={row['decode_token_ms']['p95_nearest_rank']:.4f} "
             f"DEVICE_TOKEN_P95_MS={row['device_decode_token_ms']['p95_nearest_rank']:.4f}"
+        )
+    for case, comparisons in report.get("baseline_observations", {}).items():
+        steps = [step for comparison in comparisons for step in comparison["steps"]]
+        matching_prefix = [step for step in steps if step["input_prefix_equal"]]
+        lines.append(
+            f"BASELINE_CASE={case} TOKENS_EXACT={all(v['tokens_exact'] for v in comparisons)} "
+            f"MATCHING_PREFIX_STEPS={len(matching_prefix)}/{len(steps)} "
+            f"MAX_ABS_ERROR={max((s['max_abs_error'] for s in matching_prefix), default=0):.8g} "
+            "ERROR_SCOPE=MATCHING_PREFIX_ONLY QUALITY_VERIFIED=False"
         )
     if report.get("error"):
         lines.append("ERROR=" + report["error"])
@@ -244,9 +267,89 @@ def load_diagnostic(record, library, policy, vocab):
     return payload["logits"]
 
 
+def compare_model_logits(reference_record, reference_logits, record, logits):
+    """Observe full-vocabulary errors without inventing a model tolerance.
+
+    Autoregressive comparisons after a token divergence have different inputs;
+    retain those observations, but label their prefixes explicitly.
+    """
+    import torch
+
+    if (
+        reference_record["prompt"] != record["prompt"]
+        or reference_logits.shape != logits.shape
+        or logits.ndim != 2
+        or min(logits.shape) < 1
+    ):
+        raise ValueError("Model comparison requires identical prompts and logits geometry")
+    if reference_logits.dtype != torch.float32 or logits.dtype != torch.float32:
+        raise ValueError("Model comparison requires retained FP32 logits")
+    if not bool(torch.isfinite(reference_logits).all() & torch.isfinite(logits).all()):
+        raise ValueError("Non-finite model logits cannot be observed as a successful execution")
+    left_tokens, right_tokens = reference_record["tokens"], record["tokens"]
+    if len(left_tokens) != len(right_tokens) or len(left_tokens) != logits.shape[0]:
+        raise ValueError("Token counts disagree with retained logits rows")
+    steps = []
+    for index, (expected, actual) in enumerate(zip(reference_logits, logits)):
+        difference = actual.double() - expected.double()
+        norm = float(torch.linalg.vector_norm(expected.double()))
+        error_norm = float(torch.linalg.vector_norm(difference))
+        steps.append(
+            dict(
+                step=index,
+                input_prefix_equal=left_tokens[:index] == right_tokens[:index],
+                token_equal=left_tokens[index] == right_tokens[index],
+                reference_token=left_tokens[index],
+                candidate_token=right_tokens[index],
+                max_abs_error=float(difference.abs().max()),
+                relative_l2_error=error_norm / norm if norm else 0.0 if error_norm == 0 else None,
+                reference_l2_zero=norm == 0,
+                byte_mismatch_count=int(
+                    (expected.contiguous().view(torch.uint8) != actual.contiguous().view(torch.uint8)).sum()
+                ),
+            )
+        )
+    exact = left_tokens == right_tokens and all(step["byte_mismatch_count"] == 0 for step in steps)
+    return dict(
+        baseline_exact=exact,
+        tokens_exact=left_tokens == right_tokens,
+        steps=steps,
+        comparison_scope="autoregressive_generation_observation",
+        model_tolerance=None,
+        quality_verified=False,
+        generation_warning=(
+            "Token sequences diverged; later logits may have different input prefixes."
+            if left_tokens != right_tokens
+            else None
+        ),
+    )
+
+
+def compare_case(reference, case, records, values, vocab, *, baseline_mode):
+    """Require a repeatable reference, then compare each independent candidate run."""
+    import torch
+
+    if baseline_mode not in ("observe", "exact") or len(records) != 2 or len(values) != 2:
+        raise ValueError(f"Two candidate diagnostics and an explicit comparison mode are required: {case}")
+    refpair = reference.get("diagnostics", {}).get(case, [])
+    if len(refpair) != 2:
+        raise ValueError(f"Missing baseline pair: {case}")
+    refs = [load_diagnostic(r, reference["library"], "ascendc", vocab) for r in refpair]
+    if (
+        refpair[0]["prompt"] != refpair[1]["prompt"]
+        or refpair[0]["tokens"] != refpair[1]["tokens"]
+        or not torch.equal(refs[0].view(torch.uint8), refs[1].view(torch.uint8))
+    ):
+        raise ValueError(f"Reference repeat is not exact: {case}")
+    comparison = [compare_model_logits(refpair[0], refs[0], record, value) for record, value in zip(records, values)]
+    if baseline_mode == "exact" and not all(value["baseline_exact"] for value in comparison):
+        raise ValueError(f"V3 differs from v1 strict per-step logits/tokens: {case}")
+    return comparison
+
+
 def validate_reference(report, args, cases):
     if (
-        report.get("schema_version") != 1
+        report.get("schema_version") != SCHEMA_VERSION
         or report.get("status") != "PASS"
         or report.get("mode") != "reference"
         or report.get("implementation") != "ascendc"
@@ -331,7 +434,7 @@ def timed_request(llm, prompt, count, request_id, *, progress=None):
     }
 
 
-def validate_residency(before, after, decode_count):
+def validate_residency(before, after, decode_count, *, measured=False, decode_graph=None, preparation=None):
     expected_layers = {str(i) for i in range(LAYERS)}
     if set(after) != expected_layers or (before is not None and set(before) != expected_layers):
         raise ValueError("Missing full 43-layer resident device-route evidence")
@@ -339,20 +442,66 @@ def validate_residency(before, after, decode_count):
         current = after[layer]
         if (
             current.get("ready") is not True
+            or current.get("layout") != "zn_pair_lut_k256"
+            or current.get("resident_abi_version") != 1
             or current.get("full_model_graph_verified") is not False
             or current.get("route_host_reads") != 0
             or current.get("descriptor_h2d_bytes") != 0
             or type(current.get("decode_calls")) is not int
         ):
             raise ValueError("Resident layer not ready or decode used host routing/descriptor H2D")
+        if current.get("preparation_mode") not in ("eager", "fused") or (
+            preparation is not None and current["preparation_mode"] != preparation
+        ):
+            raise ValueError("Resident preparation mode differs from the requested execution")
+        graph = current.get("decode_graph", {})
+        old_graph = {} if before is None else before[layer].get("decode_graph", {})
+        expected_scope = None if decode_graph is None else "moe_decode" if decode_graph == "moe" else "none"
+        if (
+            graph.get("scope") not in ("none", "moe_decode")
+            or (expected_scope is not None and graph["scope"] != expected_scope)
+            or graph.get("failed") is not False
+            or graph.get("full_model_graph_verified") is not False
+            or any(type(graph.get(k)) is not int or graph[k] < 0 for k in ("captures", "replays", "entries"))
+        ):
+            raise ValueError("Missing bounded MoE decode graph evidence")
+        if before is not None and (
+            old_graph.get("scope") != graph["scope"]
+            or old_graph.get("failed") is not False
+            or old_graph.get("full_model_graph_verified") is not False
+            or any(type(old_graph.get(k)) is not int or old_graph[k] < 0 for k in ("captures", "replays", "entries"))
+        ):
+            raise ValueError("Missing prior MoE decode graph evidence")
+        if graph["scope"] == "none":
+            if any(graph[k] != 0 or old_graph.get(k, 0) != 0 for k in ("captures", "replays", "entries")):
+                raise ValueError("Disabled graph cannot report capture or replay work")
+        else:
+            if graph["captures"] != 1 or graph["entries"] != 1:
+                raise ValueError("MoE decode must have one completed graph capture")
+            previous_replays = old_graph.get("replays", 0)
+            replay_delta = graph["replays"] - previous_replays
+            if replay_delta < decode_count or (before is not None and replay_delta != decode_count):
+                raise ValueError("MoE graph must replay each decode request")
+        if measured and graph["scope"] == "moe_decode":
+            if graph["captures"] != old_graph.get("captures") or graph["entries"] != old_graph.get("entries"):
+                raise ValueError("Measured MoE graph must replay each decode without capture")
         previous = 0 if before is None else before[layer].get("decode_calls")
         if type(previous) is not int or current["decode_calls"] - previous < decode_count:
             raise ValueError("Resident device path did not cover each real decode token")
         if before is not None and current["decode_calls"] - previous != decode_count:
             raise ValueError("Unexpected dummy or extra resident decode calls during timing")
+        for counter in ("resident_projection_launches", "resident_prefill_launches"):
+            previous = 0 if before is None else before[layer].get(counter)
+            if type(current.get(counter)) is not int or type(previous) is not int:
+                raise ValueError("Missing new resident native launch counters")
+            delta = current[counter] - previous
+            if (counter == "resident_projection_launches" and delta != 2 * decode_count) or (
+                counter == "resident_prefill_launches" and delta <= 0
+            ):
+                raise ValueError("New resident decode/prefill native path did not cover the request")
 
 
-def validate_sample(sample, count, expected_tokens):
+def validate_sample(sample, count, expected_tokens, *, decode_graph=None, preparation=None):
     if (
         sample.get("tokens") != expected_tokens
         or sample.get("tokens_exact") is not True
@@ -363,7 +512,14 @@ def validate_sample(sample, count, expected_tokens):
         or sample.get("cache_delta", {}).get("evictions") != 0
     ):
         raise ValueError("Measured v3 request must be exact, finite, fully resident with zero loads/evictions/H2D")
-    validate_residency(sample.get("v3_before", {}), sample.get("v3_after", {}), count - 1)
+    validate_residency(
+        sample.get("v3_before", {}),
+        sample.get("v3_after", {}),
+        count - 1,
+        measured=sample.get("kind") == "measured",
+        decode_graph=decode_graph,
+        preparation=preparation,
+    )
     for key in ("native_calls", "native_launches"):
         if type(sample.get(key)) is not int or sample[key] < 2 * LAYERS * count:
             raise ValueError("Missing native work coverage")
@@ -386,6 +542,9 @@ def validate_sample(sample, count, expected_tokens):
 
 
 def summarize_samples(samples, cases, warmups, repeats, diagnostics):
+    validate_cases(cases)
+    if warmups < 2 or repeats < 5:
+        raise ValueError("Require >=2 warmups and >=5 measured requests")
     if len(samples) != len(cases) * (warmups + repeats):
         raise ValueError("Incomplete/extra timing sample matrix")
     rows = []
@@ -459,7 +618,7 @@ def verify_report(report, args):
     cases = parse_cases(args.cases)
     expected_mode = "reference" if args.reference_only else "correctness" if args.correctness_only else "performance"
     if (
-        report.get("schema_version") != 1
+        report.get("schema_version") != SCHEMA_VERSION
         or report.get("status") != "PASS"
         or report.get("mode") != expected_mode
         or report.get("implementation") != ("ascendc" if args.reference_only else "ascendc_v3")
@@ -480,7 +639,7 @@ def verify_report(report, args):
     if library["path"] != str(args.library.resolve()) or sha256(args.library) != library["sha256"]:
         raise ValueError("Library changed after execution")
     if not args.reference_only:
-        identity = checked_model_preflight(args.library, args.preflight, args.model)
+        identity = candidate_preflight(args)
         if identity != library:
             raise ValueError("Preflight library identity mismatch")
         if args.v3_only:
@@ -489,19 +648,21 @@ def verify_report(report, args):
                 or report.get("baseline_comparison") != "not_requested"
                 or "reference_report_sha256" in report
                 or "baseline_operator_preflight" in report
+                or report.get("baseline_observations", {})
             ):
                 raise ValueError("V3-only report must not claim or contain a baseline comparison")
         else:
             if (
                 report.get("reference_report_sha256") != sha256(args.reference_report)
-                or report.get("baseline_exact") is not True
-                or report.get("baseline_comparison", "verified") != "verified"
+                or type(report.get("baseline_exact")) is not bool
+                or report.get("baseline_comparison") != ("verified" if args.baseline_mode == "exact" else "observed")
             ):
-                raise ValueError("Missing exact hash-bound baseline comparison")
+                raise ValueError("Missing hash-bound baseline comparison")
             reference = validate_reference(json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases)
     vocab = json.loads((args.model / "config.json").read_text(encoding="utf-8"))["vocab_size"]
     if set(report.get("diagnostics", {})) != {f"p{p}-o{o}" for p, o in cases}:
         raise ValueError("Incomplete diagnostic cases")
+    comparisons = {}
     for case, pair in report["diagnostics"].items():
         if len(pair) != 2 or pair[0]["logits_file"] == pair[1]["logits_file"]:
             raise ValueError("Two independent retained diagnostics required")
@@ -514,16 +675,21 @@ def verify_report(report, args):
             raise ValueError("Model repeat is not bit-exact")
         if not args.reference_only:
             for record in pair:
-                validate_residency(record.get("v3_before", {}), record.get("v3", {}), len(record["tokens"]) - 1)
+                validate_residency(
+                    record.get("v3_before", {}),
+                    record.get("v3", {}),
+                    len(record["tokens"]) - 1,
+                    decode_graph=args.decode_graph,
+                    preparation=args.preparation,
+                )
         if not args.reference_only and not args.v3_only:
-            refpair = reference.get("diagnostics", {}).get(case, [])
-            if len(refpair) != 2:
-                raise ValueError("Missing baseline case")
-            refs = [load_diagnostic(r, reference["library"], "ascendc", vocab) for r in refpair]
-            if any(r["prompt"] != pair[0]["prompt"] or r["tokens"] != pair[0]["tokens"] for r in refpair) or any(
-                not torch.equal(left.view(torch.uint8), v.view(torch.uint8)) for v in refs
-            ):
-                raise ValueError(f"V3 differs from v1 strict per-step logits/tokens: {case}")
+            comparisons[case] = compare_case(
+                reference, case, pair, (left, right), vocab, baseline_mode=args.baseline_mode
+            )
+    if not args.reference_only and not args.v3_only:
+        exact = all(value["baseline_exact"] for pair in comparisons.values() for value in pair)
+        if report.get("baseline_observations") != comparisons or report.get("baseline_exact") is not exact:
+            raise ValueError("Baseline observations disagree with retained per-step logits/tokens")
     if expected_mode == "performance":
         if (
             report.get("warmups") != args.warmups
@@ -535,6 +701,14 @@ def verify_report(report, args):
         if report.get("measurement_launch_blocking") not in (None, "0"):
             raise ValueError("Timing ran with launch blocking")
         summaries = summarize_samples(report["samples"], cases, args.warmups, args.repeats, report["diagnostics"])
+        for sample in report["samples"]:
+            validate_sample(
+                sample,
+                len(sample["tokens"]),
+                report["diagnostics"][sample["case"]][0]["tokens"],
+                decode_graph=args.decode_graph,
+                preparation=args.preparation,
+            )
         target = (
             all(r["tpot_ms"] <= args.target_tpot_ms for r in summaries) if args.target_tpot_ms is not None else None
         )
@@ -558,7 +732,7 @@ def run(args):
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
     report = dict(
-        schema_version=1,
+        schema_version=SCHEMA_VERSION,
         status="RUNNING",
         mode="reference" if args.reference_only else "correctness" if args.correctness_only else "performance",
         implementation=policy,
@@ -567,6 +741,7 @@ def run(args):
         cases=[list(c) for c in cases],
         diagnostics={},
         samples=[],
+        baseline_observations={},
         v3_only=args.v3_only,
         baseline_exact=None if args.v3_only else False,
         baseline_comparison=(
@@ -609,7 +784,7 @@ def run(args):
             evidence = library_evidence(args.library.resolve())
             library = {"path": evidence["path"], "sha256": evidence["sha256"]}
         else:
-            library = checked_model_preflight(args.library, args.preflight, args.model)
+            library = candidate_preflight(args)
             if not args.v3_only:
                 reference = validate_reference(
                     json.loads(args.reference_report.read_text(encoding="utf-8")), args, cases
@@ -714,17 +889,25 @@ def run(args):
                 raise ValueError("V3/reference self-repeat is not exact")
             if not args.reference_only:
                 for record in records:
-                    validate_residency(record.get("v3_before", {}), record.get("v3", {}), o - 1)
+                    validate_residency(
+                        record.get("v3_before", {}),
+                        record.get("v3", {}),
+                        o - 1,
+                        decode_graph=args.decode_graph,
+                        preparation=args.preparation,
+                    )
             if not args.reference_only and not args.v3_only:
-                for reference_record in reference["diagnostics"][case]:
-                    golden = load_diagnostic(reference_record, reference["library"], "ascendc", config["vocab_size"])
-                    if (
-                        reference_record["prompt"] != prompt
-                        or reference_record["tokens"] != records[0]["tokens"]
-                        or not torch.equal(golden.view(torch.uint8), values[0].view(torch.uint8))
-                    ):
-                        raise ValueError(f"v1/v3 exact logits or token comparison failed: {case}")
-            baseline_status = "NOT_REQUESTED" if args.v3_only else str(not args.reference_only)
+                report["baseline_observations"][case] = compare_case(
+                    reference, case, records, values, config["vocab_size"], baseline_mode=args.baseline_mode
+                )
+                write_report(output, report)
+            baseline_status = (
+                "NOT_REQUESTED"
+                if args.v3_only
+                else str(all(v["baseline_exact"] for v in report["baseline_observations"].get(case, [])))
+                if not args.reference_only
+                else "REFERENCE"
+            )
             print(f"PERF_V3_CASE_EXACT={case} REPEAT_EXACT=True BASELINE_EXACT={baseline_status}", flush=True)
             if report["mode"] == "performance":
                 for kind, count in (("warmup", args.warmups), ("measured", args.repeats)):
@@ -739,7 +922,13 @@ def run(args):
                         sample.update(
                             case=case, kind=kind, repeat=index, tokens_exact=sample["tokens"] == records[0]["tokens"]
                         )
-                        validate_sample(sample, o, records[0]["tokens"])
+                        validate_sample(
+                            sample,
+                            o,
+                            records[0]["tokens"],
+                            decode_graph=args.decode_graph,
+                            preparation=args.preparation,
+                        )
                         report["samples"].append(sample)
                         write_report(output, report)
                         interval_example = [v * 1000 for v in sample["decode_intervals_s"][:8]]
@@ -750,9 +939,12 @@ def run(args):
                             f"DECODE_INTERVAL_MS_FIRST8={json.dumps(interval_example)}",
                             flush=True,
                         )
-        report.update(repeat_exact=True, baseline_exact=None if args.v3_only else not args.reference_only)
+        report.update(repeat_exact=True)
         if not args.v3_only and not args.reference_only:
-            report["baseline_comparison"] = "verified"
+            report["baseline_exact"] = all(
+                value["baseline_exact"] for pair in report["baseline_observations"].values() for value in pair
+            )
+            report["baseline_comparison"] = "verified" if args.baseline_mode == "exact" else "observed"
         if report["mode"] == "performance":
             report["summaries"] = summarize_samples(
                 report["samples"], cases, args.warmups, args.repeats, report["diagnostics"]
@@ -787,6 +979,19 @@ def parse_args(argv=None):
         parser.add_argument(f"--{name}", required=True, type=Path)
     parser.add_argument("--preflight", type=Path)
     parser.add_argument("--reference-report", type=Path)
+    parser.add_argument(
+        "--baseline-mode",
+        choices=("observe", "exact"),
+        default="observe",
+        help="Observe per-step errors without a quality claim, or require the old bit-exact gate",
+    )
+    parser.add_argument(
+        "--decode-graph",
+        choices=("none", "moe"),
+        default="none",
+        help="Capture complete MoE decode only; never a full-model graph claim",
+    )
+    parser.add_argument("--preparation", choices=("eager", "fused"), default="eager")
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--correctness-only", action="store_true")
     parser.add_argument(

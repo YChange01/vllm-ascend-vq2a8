@@ -78,6 +78,11 @@ def runtime(monkeypatch, *, singleton=False, hash_routes=False):
     layer = inventory(experts)
     value = v3.AscendCV3VQ2TP1MoE.__new__(v3.AscendCV3VQ2TP1MoE)
     value.layer, value.layer_index, value.device = layer, layer.layer_index, torch.device("cpu")
+    # Retain coverage for the original diagnostic runtime. The default V3
+    # converted-layout workspace is exercised in the resident runtime tests.
+    value.projection_kernel = "legacy"
+    value.v3_preparation, value.v3_decode_graph = "eager", "none"
+    value._decode_graph = None
     value.config = NS(hidden_size=512, top_k=6, renormalize=True, num_shared=0, swiglu_limit=7.0, routed_scale=1.5)
     value.root = {"gate.weight": torch.arange(6 * 512).reshape(6, 512).float() / (6 * 512 * 512)}
     if hash_routes or singleton:
@@ -108,20 +113,20 @@ def runtime(monkeypatch, *, singleton=False, hash_routes=False):
 
 def test_v3_full_resident_plan_never_shrinks_expert_inventory():
     layers = [inventory((0,), 0), inventory(tuple(range(6)), 3)]
-    plan = v3.resident_plan(layers, 1 << 30)
+    plan = v3.resident_plan(layers, 1 << 30, kernel="legacy")
     assert plan["layer_limits"] == {0: 1, 3: 6}
     assert plan["layer_plans"][0]["jobs"] == 1
     assert plan["layer_plans"][3]["jobs"] == 6
     assert plan["payload_bytes"] + plan["workspace_bytes"] == plan["planned_bytes"]
-    assert v3.resident_plan(layers, plan["planned_bytes"])["all_experts_fit"]
+    assert v3.resident_plan(layers, plan["planned_bytes"], kernel="legacy")["all_experts_fit"]
     with pytest.raises(ValueError, match="no cache fallback"):
-        v3.resident_plan(layers, plan["planned_bytes"] - 1)
+        v3.resident_plan(layers, plan["planned_bytes"] - 1, kernel="legacy")
 
 
 @pytest.mark.parametrize("budget", [0, -1, True, 1.2])
 def test_v3_resident_plan_requires_explicit_byte_budget(budget):
     with pytest.raises(ValueError):
-        v3.resident_plan([inventory()], budget)
+        v3.resident_plan([inventory()], budget, kernel="legacy")
 
 
 @pytest.mark.parametrize("slots", [[0, 1, 2, 3, 4, 5], [5, 3, 1, 5, 3, 1]])

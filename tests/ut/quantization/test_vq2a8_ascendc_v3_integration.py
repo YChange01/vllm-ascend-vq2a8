@@ -45,6 +45,40 @@ def test_v3_integration_is_explicit_and_old_defaults_are_unchanged(tmp_path):
     assert value["cache_experts"] == 256 and value["root_linear_mode"] == "bf16"
     assert value["cache_reserve_gib"] == 16.0, "Do not silently consume the user's reserve"
     assert options["enforce_eager"] and options["compilation_config"]["cudagraph_mode"] == "NONE"
+    assert value["v3_preparation"] == "eager" and value["v3_decode_graph"] == "none"
+
+
+@pytest.mark.parametrize("preparation", ["eager", "fused"])
+@pytest.mark.parametrize("decode_graph", ["none", "moe"])
+def test_v3_preparation_and_graph_options_are_explicit(tmp_path, preparation, decode_graph):
+    options = offline.offline_engine_options(
+        tmp_path / "model",
+        tmp_path / "artifact",
+        execution_policy="ascendc_v3",
+        ascendc_v3_library=tmp_path / "lib.so",
+        ascendc_v3_sha256="b" * 64,
+        v3_preparation=preparation,
+        v3_decode_graph=decode_graph,
+    )
+    value = offline.validate_offline_config(config(options))
+    assert value["v3_preparation"] == preparation
+    assert value["v3_decode_graph"] == decode_graph
+    assert options["enforce_eager"] and options["compilation_config"]["cudagraph_mode"] == "NONE"
+
+
+@pytest.mark.parametrize("key,value", [("v3_preparation", "fwht"), ("v3_decode_graph", "full")])
+def test_v3_unsupported_preparation_or_graph_is_rejected(tmp_path, key, value):
+    cfg = config(v3_options(tmp_path))
+    cfg.additional_config["vq2a8_offline"][key] = value
+    with pytest.raises(ValueError):
+        offline.validate_offline_config(cfg)
+
+
+@pytest.mark.parametrize("policy", ["cached", "ascendc", "ascendc_v2"])
+@pytest.mark.parametrize("option", [{"v3_preparation": "fused"}, {"v3_decode_graph": "moe"}])
+def test_v3_preparation_and_graph_do_not_leak_to_other_policies(tmp_path, policy, option):
+    with pytest.raises(ValueError, match="ascendc_v3"):
+        offline.offline_engine_options(tmp_path, tmp_path, execution_policy=policy, **option)
 
 
 @pytest.mark.parametrize(
@@ -111,9 +145,9 @@ def test_v3_integration_budget_failure_never_begins_partial_loading(monkeypatch)
 
 def test_v3_integration_resident_out_op_has_no_host_upload_or_output_allocation():
     source = (Path(__file__).resolve().parents[3] / "csrc/vq2a8_ascendc_v3/torch_binding.cpp").read_text("utf-8")
-    body = source.split("void GroupedProjectionOut(", 1)[1].split("}  // namespace", 1)[0]
+    body = source.split("void GroupedProjectionResidentOut(", 1)[1].split("\n}\n", 1)[0]
     assert "at::empty" not in body and "at::zeros" not in body and ".to(" not in body
-    assert "LaunchGroupedV3(" in body and "[stream, blocks, descriptors, constants, owners" in body
+    assert "vq2a8_v3_resident::LaunchGrouped(" in body and "[stream, blocks, descriptors, owners" in body
     assert "Tensor(a!)[] owners" in source
 
 

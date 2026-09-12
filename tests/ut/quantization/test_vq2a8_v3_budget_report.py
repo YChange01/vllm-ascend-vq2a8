@@ -72,9 +72,10 @@ def test_v3_real_geometry_budget_explains_why_point99_is_not_a_fix(capsys):
     # Previously observed total and roots allocation; not a new hardware run.
     total, allocated, reserve = 86_067_118_080, 15_909_779_456, 3 * v3.GIB
     plan = v3.resident_plan(layers, total)
-    assert plan["payload_bytes"] == 66_079_641_600
-    assert plan["workspace_bytes"] == 26_659_840
-    assert plan["planned_bytes"] == 66_106_301_440
+    # Converted banks replace uint8 tile IDs with int64 activation order.
+    assert plan["payload_bytes"] == 66_079_641_600 + 10_243 * (4096 + 2048) * (8 - 1)
+    assert plan["workspace_bytes"] == 61_252_096
+    assert plan["planned_bytes"] == 66_581_424_640
     with pytest.raises(ValueError, match="no cache fallback"):
         v3.resident_plan(layers, int(total * 0.99) - allocated - reserve, report_budget=True)
-    assert read_budget(capsys)["shortfall_bytes"] == 30_859_469
+    assert read_budget(capsys)["shortfall_bytes"] == 505_982_669

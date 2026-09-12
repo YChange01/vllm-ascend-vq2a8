@@ -21,7 +21,19 @@ def cli(tmp_path, *, preflight=True):
 def resident(calls):
     return {
         str(i): dict(
-            ready=True, full_model_graph_verified=False, route_host_reads=0, descriptor_h2d_bytes=0, decode_calls=calls
+            ready=True,
+            full_model_graph_verified=False,
+            route_host_reads=0,
+            descriptor_h2d_bytes=0,
+            decode_calls=calls,
+            layout="zn_pair_lut_k256",
+            resident_abi_version=1,
+            resident_projection_launches=calls * 2,
+            resident_prefill_launches=calls,
+            preparation_mode="eager",
+            decode_graph=dict(
+                scope="none", captures=0, replays=0, entries=0, failed=False, full_model_graph_verified=False
+            ),
         )
         for i in range(43)
     }
@@ -109,7 +121,7 @@ def evidence(tmp_path, monkeypatch):
     diagnostics = {"p10-o4": [diagnostic(tmp_path, i, library) for i in range(2)]}
     samples = [sample("warmup", i) for i in range(2)] + [sample("measured", i) for i in range(5)]
     report = dict(
-        schema_version=1,
+        schema_version=bench.SCHEMA_VERSION,
         status="PASS",
         mode="performance",
         implementation="ascendc_v3",
@@ -175,6 +187,42 @@ def test_v3_only_verifies_real_retained_logits_without_reference(evidence):
     assert bench.verify_report(report, args) is report
     assert checks == ["v3_preflight"]
     assert report["baseline_exact"] is None
+
+
+def test_observed_model_report_recomputes_errors_from_retained_logits(evidence, tmp_path, monkeypatch):
+    args, report, _ = evidence
+    args.v3_only = False
+    args.reference_report = tmp_path / "reference.json"
+    args.reference_report.write_text("{}", encoding="utf-8")
+    library = report["library"]
+    reference_records = []
+    reference_values = torch.zeros(4, 16, dtype=torch.float32)
+    reference_values[torch.arange(4), torch.tensor([1, 2, 3, 4])] = 1
+    reference_values += 0.125
+    for index, candidate in enumerate(report["diagnostics"]["p10-o4"]):
+        reference_record = copy.deepcopy(candidate)
+        path = tmp_path / f"reference-{index}.safetensors"
+        save_file({"logits": reference_values}, str(path))
+        reference_record.update(logits_file=str(path), logits_sha256=bench.sha256(path))
+        reference_record["evidence"]["expert_backend"]["policy"] = "ascendc"
+        reference_records.append(reference_record)
+    reference = dict(library=library, diagnostics={"p10-o4": reference_records})
+    monkeypatch.setattr(bench, "validate_reference", lambda *_: reference)
+    pair = report["diagnostics"]["p10-o4"]
+    values = [bench.load_diagnostic(r, library, "ascendc_v3", 16) for r in pair]
+    report.update(
+        v3_only=False,
+        baseline_exact=False,
+        baseline_comparison="observed",
+        baseline_observations={
+            "p10-o4": bench.compare_case(reference, "p10-o4", pair, values, 16, baseline_mode="observe")
+        },
+        reference_report_sha256=bench.sha256(args.reference_report),
+    )
+    assert bench.verify_report(report, args) is report
+    report["baseline_observations"]["p10-o4"][0]["steps"][0]["max_abs_error"] = 0.0
+    with pytest.raises(ValueError, match="observations disagree"):
+        bench.verify_report(report, args)
 
 
 @pytest.mark.parametrize(

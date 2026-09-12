@@ -33,12 +33,23 @@ from tools.vq2a8_live_log import LiveChildLog
 REPO = Path(__file__).resolve().parents[1]
 SOURCE = REPO / "csrc/vq2a8_ascendc_v3"
 ABI_VERSION = 1
+RESIDENT_ABI_VERSION = 1
+RESIDENT_CAPABILITIES_REQUIRED = 1
+RESIDENT_LAYOUT = "zn_pair_lut_k256"
+RESIDENT_KERNEL = "v2_pipeline_resident"
 LIBRARY_NAME = "libvq2a8_ascendc_v3.so"
 
 
 def source_hashes():
-    """Bind native definitions and the reused SDK build helper, not v2 repacking."""
-    for name in ("CMakeLists.txt", "kernel.cpp", "torch_binding.cpp"):
+    """Bind native definitions, including the separate resident implementation."""
+    for name in (
+        "CMakeLists.txt",
+        "kernel.cpp",
+        "torch_binding.cpp",
+        "resident_kernel.cpp",
+        "resident_layout.h",
+        "resident_launch.h",
+    ):
         if not (SOURCE / name).is_file():
             raise ValueError(f"V3 source missing: {SOURCE / name}")
     helper = "tools/build_vq2a8_ascendc_v2.py"
@@ -68,6 +79,10 @@ def build(args):
         "status": "planned" if args.plan_only else "building",
         "implementation": "ascendc_v3",
         "abi_version": ABI_VERSION,
+        "resident_abi_version": RESIDENT_ABI_VERSION,
+        "resident_capabilities_required": RESIDENT_CAPABILITIES_REQUIRED,
+        "layout": RESIDENT_LAYOUT,
+        "resident_kernel": RESIDENT_KERNEL,
         "soc": args.soc,
         "python": sys.executable,
         "source_sha256": source_hashes(),

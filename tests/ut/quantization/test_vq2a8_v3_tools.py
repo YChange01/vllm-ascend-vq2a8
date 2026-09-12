@@ -27,7 +27,19 @@ def cli(tmp_path):
 def resident(calls):
     return {
         str(i): dict(
-            ready=True, full_model_graph_verified=False, route_host_reads=0, descriptor_h2d_bytes=0, decode_calls=calls
+            ready=True,
+            full_model_graph_verified=False,
+            route_host_reads=0,
+            descriptor_h2d_bytes=0,
+            decode_calls=calls,
+            layout="zn_pair_lut_k256",
+            resident_abi_version=1,
+            resident_projection_launches=calls * 2,
+            resident_prefill_launches=calls,
+            preparation_mode="eager",
+            decode_graph=dict(
+                scope="none", captures=0, replays=0, entries=0, failed=False, full_model_graph_verified=False
+            ),
         )
         for i in range(43)
     }
@@ -62,7 +74,7 @@ def test_v3_tools_default_quick_plan_and_independent_paths(tmp_path):
     args = accept.parse_args(["--model", str(tmp_path), "--soc", "Ascend950PR_9599", "--plan-only"])
     assert args.cases == "10:4" and args.cache_reserve_gib == 16 and args.memory_fraction == 0.9
     steps = accept.commands(args, tmp_path / "output")
-    assert [s[0] for s in steps] == ["environment", "build", "preflight", "v1-reference", "model-exact"]
+    assert [s[0] for s in steps] == ["environment", "build", "preflight", "v1-reference", "model-observe"]
     assert "ascendc-v3" in " ".join(steps[2][1])
     assert "--reference-only" in steps[3][1] and "--correctness-only" in steps[4][1]
     assert args.baseline_library.as_posix().endswith("vq2a8-ascendc-v026/libvq2a8_ascendc.so")
@@ -187,8 +199,10 @@ def test_v3_only_accept_does_not_promote_unrequested_baseline(tmp_path, monkeypa
         ["--cache-budget-gib", "-1"],
         ["--memory-fraction", "1.01"],
         ["--cases", "96:64"],
+        ["--cases", "1:4"],
         ["--cases", "10:4,10:4"],
         ["--warmups", "1"],
+        ["--warmups", "0"],
         ["--repeats", "4"],
         ["--target-tpot-ms", "nan"],
     ],
@@ -211,8 +225,8 @@ def test_v3_tools_does_not_reuse_v2_cmake_target(tmp_path):
 
 def test_v3_tools_preflight_requires_prepared_abi_matrix():
     cases = validate.expected_cases()
-    assert {f"prepared:k{k}:g{g}" for k in (512, 2048, 4096) for g in (1, 6)} <= cases
-    assert len(cases) == 22
+    assert {f"resident:k{k}:g{g}" for k in (2048, 4096) for g in (1, 6)} <= cases
+    assert len(cases) == 28
     assert "vllm_ascend/quantization/vq2a8_execution_v3.py" in validate.python_source_hashes()
     assert {
         "tools/build_vq2a8_ascendc_v2.py",

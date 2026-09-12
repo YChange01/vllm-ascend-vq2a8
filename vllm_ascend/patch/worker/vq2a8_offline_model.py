@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in inheritance adapter. Importing this module does not monkey-patch vLLM.
 
-Only the offline gate selects this architecture. Attention/HC/cache execution
+The offline tools and explicit V3 server select this architecture. Attention/HC/cache execution
 is inherited; MoE allocation, token routing and root loading are explicit.
 """
 
@@ -127,7 +127,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
     model_cls = OfflineDecoderModel
 
     def __init__(self, *, vllm_config, prefix=""):
-        validate_offline_config(vllm_config)
+        options = validate_offline_config(vllm_config)
         ascend = get_ascend_config()
         for name in ("enable_flashcomm1", "mix_placement", "multistream_dsv4_dsa_overlap"):
             if getattr(ascend, name, False):
@@ -141,6 +141,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_memory_fraction = vllm_config.cache_config.gpu_memory_utilization
         self._offline_root_mode = validate_offline_config(vllm_config).get("root_linear_mode", "bf16")
         self._offline_root_verified = False
+        self._v3_serving = options.get("v3_serving", False)
 
     def set_moe_parameters(self):
         # No FusedMoE allocation, expert extraction, EPLB or TP reduction.
@@ -164,8 +165,24 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._offline_root_mode == "bf16":
             self.model.offline_owner.configure_cache(self._offline_memory_fraction)
         self._offline_loaded = True
+        if self._v3_serving:
+            self._configure_v3_serving()
         print("MODEL_LOAD_RESULT " + json.dumps(report), flush=True)
         return loaded
+
+    def _configure_v3_serving(self):
+        """Enable quiet resident execution before the worker's startup profile.
+
+        Serving owns a persistent engine. It does not collect offline evidence,
+        reset counters per request or add per-layer timing synchronization.
+        """
+        owner = self.model.offline_owner
+        owner.measurement_mode = True
+        self._measurement_valid = None
+        self._measurement_forwards = 0
+        for layer in owner.layers.values():
+            layer.measurement_mode = True
+            layer.trace_native = False
 
     def reset_offline_trace(self):
         if getattr(self.model.offline_owner, "measurement_mode", False):
@@ -325,11 +342,13 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._offline_trace and not get_forward_context().attn_metadata:
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
         if getattr(self.model.offline_owner, "measurement_mode", False):
-            if not get_forward_context().attn_metadata:
+            real_attention = bool(get_forward_context().attn_metadata)
+            if not real_attention and not getattr(self, "_v3_serving", False):
                 raise ValueError("Performance probes require real attention metadata.")
             result = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
-            self._retain_finite_flag(result)
-            self._measurement_forwards += 1
+            if real_attention:
+                self._retain_finite_flag(result)
+                self._measurement_forwards += 1
             return result
         phase = ("prefill" if not self._offline_steps else "decode") if self._offline_trace else "profile"
         print(

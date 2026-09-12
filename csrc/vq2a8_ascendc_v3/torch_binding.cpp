@@ -13,6 +13,9 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "launch.h"
 #include "layout.h"
+#include "prepare_launch.h"
+#include "resident_launch.h"
+#include "resident_layout.h"
 
 namespace vq2a8_v3 {
 namespace {
@@ -236,9 +239,200 @@ void GroupedProjectionOut(const at::Tensor& descriptors, const at::Tensor& const
   });
   command.Run();
 }
+
+void CheckResidentProjection(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                             const at::Tensor& packed, const at::Tensor& table) {
+  TORCH_CHECK(x.device().type() == c10::DeviceType::PrivateUse1, "V3 resident projection requires an NPU");
+  Check(x, x, at::kFloat8_e4m3fn, 2, "activation");
+  Check(scale, x, at::kFloat, 1, "row_scale", 4);
+  Check(bias, x, at::kFloat, 1, "row_bias", 4);
+  Check(packed, x, at::kByte, 4, "packed_zn");
+  Check(table, x, at::kByte, 3, "pair_lut");
+  const int64_t m = x.size(0), k = x.size(1), n = packed.size(0) * vq2a8_v3_resident::kN0;
+  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k),
+              "V3 resident projection supports M1..32, N4096, K2048/4096 only");
+  TORCH_CHECK(scale.numel() == m && bias.numel() == m, "row_scale/row_bias must contain M FP32 values");
+  TORCH_CHECK(packed.size(1) == k / vq2a8_v3_resident::kK0 && packed.size(2) == vq2a8_v3_resident::kK0 &&
+                  packed.size(3) == vq2a8_v3_resident::kN0 / 4,
+              "packed_zn must have shape [N/32,K/16,16,8]");
+  TORCH_CHECK(table.size(0) == k / vq2a8_v3_resident::kCodebookK && table.size(1) == n / vq2a8_v3_resident::kN0 &&
+                  table.size(2) == 32,
+              "pair_lut must have shape [K/256,N/32,32]");
+}
+
+uint32_t ResidentCoreCount() {
+  const char* soc = aclrtGetSocName();
+  TORCH_CHECK(soc && std::strncmp(soc, "Ascend950", 9) == 0, "V3 resident projection is Ascend950-only");
+  auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+  TORCH_CHECK(platform != nullptr, "CANN platform query failed");
+  const uint32_t cores = platform->GetCoreNumAic();
+  TORCH_CHECK(cores > 0 && platform->GetCoreNumAiv() >= 2 * cores, "V3 resident projection requires 1C:2V topology");
+  return cores;
+}
+
+std::vector<at::Tensor> GroupedProjectionResident(const std::vector<at::Tensor>& x,
+                                                  const std::vector<at::Tensor>& scale,
+                                                  const std::vector<at::Tensor>& bias,
+                                                  const std::vector<at::Tensor>& packed,
+                                                  const std::vector<at::Tensor>& table) {
+  const auto jobs = x.size();
+  TORCH_CHECK(jobs > 0 && jobs <= vq2a8_v3_resident::kMaxJobs, "V3 resident projection requires 1..6 jobs");
+  TORCH_CHECK(scale.size() == jobs && bias.size() == jobs && packed.size() == jobs && table.size() == jobs,
+              "V3 resident tensor lists must have identical lengths");
+  // Eager prefill/preflight entry. Validate every pointer before allocating or
+  // submitting device work; decode uses the prepared out entry below instead.
+  for (size_t i = 0; i < jobs; ++i) {
+    CheckResidentProjection(x[i], scale[i], bias[i], packed[i], table[i]);
+    TORCH_CHECK(
+        x[i].device() == x[0].device() && x[i].size(1) == x[0].size(1) && packed[i].size(0) == packed[0].size(0),
+        "V3 resident grouped jobs must share device, N and K");
+  }
+  const c10_npu::OptionalNPUGuard guard(x[0].device());
+  const uint32_t cores = ResidentCoreCount();
+  const uint32_t n = packed[0].size(0) * vq2a8_v3_resident::kN0;
+  const uint32_t groups = n / vq2a8_v3_resident::kN;
+  const uint32_t blocks = std::min(cores, static_cast<uint32_t>(jobs) * groups);
+  auto host = at::empty({static_cast<int64_t>(jobs), vq2a8_v3_resident::kJobWords},
+                        at::TensorOptions().device(at::kCPU).dtype(at::kLong));
+  auto* records = host.data_ptr<int64_t>();
+  std::vector<at::Tensor> output;
+  output.reserve(jobs);
+  for (size_t i = 0; i < jobs; ++i) {
+    output.push_back(at::empty({x[i].size(0), n}, x[i].options().dtype(at::kBFloat16)));
+    auto* entry = records + i * vq2a8_v3_resident::kJobWords;
+    entry[vq2a8_v3_resident::kX] = reinterpret_cast<int64_t>(x[i].data_ptr());
+    entry[vq2a8_v3_resident::kScale] = reinterpret_cast<int64_t>(scale[i].data_ptr());
+    entry[vq2a8_v3_resident::kBias] = reinterpret_cast<int64_t>(bias[i].data_ptr());
+    entry[vq2a8_v3_resident::kPacked] = reinterpret_cast<int64_t>(packed[i].data_ptr());
+    entry[vq2a8_v3_resident::kTable] = reinterpret_cast<int64_t>(table[i].data_ptr());
+    entry[vq2a8_v3_resident::kOutput] = reinterpret_cast<int64_t>(output[i].data_ptr());
+    entry[vq2a8_v3_resident::kRows] = x[i].size(0);
+    entry[vq2a8_v3_resident::kColumns] = n;
+    entry[vq2a8_v3_resident::kReduction] = x[i].size(1);
+  }
+  // This eager-only blocking metadata copy must be included in its timings.
+  auto descriptors = host.to(x[0].device(), at::kLong, false, true);
+  const auto npuStream = c10_npu::getCurrentNPUStream();
+  RecordInputStream(x, npuStream);
+  RecordInputStream(scale, npuStream);
+  RecordInputStream(bias, npuStream);
+  RecordInputStream(packed, npuStream);
+  RecordInputStream(table, npuStream);
+  const auto stream = npuStream.stream();
+  at_npu::native::OpCommand command;
+  command.Name("Vq2a8AscendCV3ResidentGroupedProjection");
+  command.SetCustomHandler([stream, blocks, descriptors, jobs, groups, x, scale, bias, packed, table, output]() -> int {
+    (void)x;
+    (void)scale;
+    (void)bias;
+    (void)packed;
+    (void)table;
+    (void)output;
+    vq2a8_v3_resident::LaunchGrouped(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
+    return 0;
+  });
+  command.Run();
+  return output;
+}
+
+void GroupedProjectionResidentOut(const at::Tensor& descriptors, const std::vector<at::Tensor>& owners, int64_t jobs,
+                                  int64_t m, int64_t n, int64_t k) {
+  // Trusted workspace ABI 1: int64[jobs,9] contains x, scale, bias, packed_zn,
+  // pair_lut, output, M, N, K. Every pointed allocation belongs to owners.
+  // Python constructs validated immutable banks and updates selected pointers
+  // on the same stream. Never inspect descriptor values through a host copy.
+  TORCH_CHECK(descriptors.device().type() == c10::DeviceType::PrivateUse1, "V3 resident projection requires an NPU");
+  TORCH_CHECK(jobs > 0 && jobs <= vq2a8_v3_resident::kMaxJobs && m == 1, "V3 resident decode requires 1..6 M1 jobs");
+  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k), "Unsupported V3 resident projection dimensions");
+  Check(descriptors, descriptors, at::kLong, 2, "resident_descriptors");
+  TORCH_CHECK(descriptors.size(0) == jobs && descriptors.size(1) == vq2a8_v3_resident::kJobWords,
+              "V3 resident descriptors must have shape [jobs,9]");
+  TORCH_CHECK(!owners.empty(), "V3 resident workspace must retain every pointer owner");
+  for (const auto& owner : owners) {
+    TORCH_CHECK(owner.defined() && owner.device() == descriptors.device(), "V3 resident owners must share the NPU");
+  }
+  const c10_npu::OptionalNPUGuard guard(descriptors.device());
+  const uint32_t cores = ResidentCoreCount();
+  const uint32_t groups = static_cast<uint32_t>(n) / vq2a8_v3_resident::kN;
+  const uint32_t blocks = std::min(cores, static_cast<uint32_t>(jobs) * groups);
+  const auto npuStream = c10_npu::getCurrentNPUStream();
+  RecordInputStream(owners, npuStream);
+  RecordInputStream({descriptors}, npuStream);
+  const auto stream = npuStream.stream();
+  at_npu::native::OpCommand command;
+  command.Name("Vq2a8AscendCV3ResidentProjectionOut");
+  command.SetCustomHandler([stream, blocks, descriptors, owners, jobs, groups]() -> int {
+    // Retain owners through deferred host dispatch and record their stream use
+    // above so early host release cannot recycle live device allocations.
+    (void)owners;
+    vq2a8_v3_resident::LaunchGrouped(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
+    return 0;
+  });
+  command.Run();
+}
+
+void PrepareOut(const at::Tensor& rotated, const at::Tensor& weightScale, const at::Tensor& order,
+                const at::Tensor& inputBias, const at::Tensor& quantized, const at::Tensor& scale,
+                const at::Tensor& bias, const at::Tensor& valid) {
+  TORCH_CHECK(rotated.device().type() == c10::DeviceType::PrivateUse1, "V3 preparation requires an NPU");
+  Check(rotated, rotated, at::kFloat, 2, "rotated");
+  Check(weightScale, rotated, at::kFloat, 2, "weight_scale");
+  Check(order, rotated, at::kLong, 2, "activation_order");
+  Check(inputBias, rotated, at::kFloat, 1, "input_bias", 4);
+  Check(quantized, rotated, at::kFloat8_e4m3fn, 2, "quantized");
+  Check(scale, rotated, at::kFloat, 1, "row_scale", 4);
+  Check(bias, rotated, at::kFloat, 1, "output_bias", 4);
+  Check(valid, rotated, at::kInt, 1, "valid", 4);
+  const int64_t jobs = rotated.size(0), k = rotated.size(1);
+  TORCH_CHECK(ValidPrepareDimensions(jobs, k), "V3 preparation requires 1..6 rows and K%512=0, K<=65536");
+  TORCH_CHECK(weightScale.sizes() == rotated.sizes() && order.sizes() == rotated.sizes() &&
+                  quantized.sizes() == rotated.sizes(),
+              "V3 preparation inputs and quantized output must have the same [jobs,K] shape");
+  TORCH_CHECK(inputBias.numel() == jobs && scale.numel() == jobs && bias.numel() == jobs && valid.numel() == jobs,
+              "V3 preparation bias/scale/valid tensors must contain one value per row");
+  const std::vector<at::Tensor> owners{rotated, weightScale, order, inputBias, quantized, scale, bias, valid};
+  constexpr size_t kFirstOutput = 4;
+  for (size_t output = kFirstOutput; output < owners.size(); ++output) {
+    for (size_t other = 0; other < output; ++other) {
+      // Reject even disjoint views of the same storage: asynchronous row
+      // processing must never overwrite another row's input or output.
+      TORCH_CHECK(!owners[output].is_alias_of(owners[other]), "V3 preparation outputs require distinct storage");
+    }
+  }
+  const c10_npu::OptionalNPUGuard guard(rotated.device());
+  const char* soc = aclrtGetSocName();
+  TORCH_CHECK(soc && std::strncmp(soc, "Ascend950", 9) == 0, "V3 preparation is Ascend950-only");
+  auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+  TORCH_CHECK(platform != nullptr, "CANN platform query failed");
+  const uint32_t cores = platform->GetCoreNumAiv();
+  TORCH_CHECK(cores > 0, "V3 preparation requires vector cores");
+  const uint32_t blocks = std::min(cores, static_cast<uint32_t>(jobs));
+  const auto npuStream = c10_npu::getCurrentNPUStream();
+  RecordInputStream(owners, npuStream);
+  const auto stream = npuStream.stream();
+  at_npu::native::OpCommand command;
+  command.Name("Vq2a8AscendCV3PrepareOut");
+  command.SetCustomHandler([stream, blocks, owners, jobs, k]() -> int {
+    LaunchPrepareV3(stream, blocks, owners[0].data_ptr(), owners[1].data_ptr(), owners[2].data_ptr(),
+                    owners[3].data_ptr(), owners[4].data_ptr(), owners[5].data_ptr(), owners[6].data_ptr(),
+                    owners[7].data_ptr(), static_cast<uint32_t>(jobs), static_cast<uint32_t>(k));
+    return 0;
+  });
+  command.Run();
+}
 }  // namespace vq2a8_v3
 
 TORCH_LIBRARY(vq2a8_ascendc_v3, m) {
+  m.def("resident_abi_version() -> int", []() -> int64_t { return vq2a8_v3_resident::kAbiVersion; });
+  m.def("resident_capabilities() -> int", []() -> int64_t { return vq2a8_v3_resident::kCapabilities; });
+  m.def(
+      "prepare_out(Tensor rotated, Tensor weight_scale, Tensor order, Tensor input_bias, Tensor(a!) quantized, "
+      "Tensor(b!) scale, Tensor(c!) bias, Tensor(d!) valid) -> ()");
+  m.def(
+      "grouped_projection_resident_out(Tensor descriptors, Tensor(a!)[] owners, int jobs, int m, int n, int k) -> ()");
+  m.def(
+      "grouped_projection_resident(Tensor[] x, Tensor[] scale, Tensor[] bias, Tensor[] packed_zn, Tensor[] pair_lut) "
+      "-> Tensor[]");
   m.def("make_constants(Tensor anchor) -> Tensor");
   // Every writable descriptor target is an owner. Conservatively mark the
   // complete list mutable; this internal out op is not a functional graph op.
@@ -255,6 +449,9 @@ TORCH_LIBRARY(vq2a8_ascendc_v3, m) {
       "Tensor[] ids) -> Tensor[]");
 }
 TORCH_LIBRARY_IMPL(vq2a8_ascendc_v3, PrivateUse1, m) {
+  m.impl("prepare_out", &vq2a8_v3::PrepareOut);
+  m.impl("grouped_projection_resident_out", &vq2a8_v3::GroupedProjectionResidentOut);
+  m.impl("grouped_projection_resident", &vq2a8_v3::GroupedProjectionResident);
   m.impl("make_constants", &vq2a8_v3::MakeConstants);
   m.impl("grouped_projection_out", &vq2a8_v3::GroupedProjectionOut);
   m.impl("projection", &vq2a8_v3::Projection);

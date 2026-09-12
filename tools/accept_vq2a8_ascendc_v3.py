@@ -106,6 +106,8 @@ def commands(args, output):
                 str(library),
                 "--output",
                 str(output / "preflight.json"),
+                "--preparation",
+                args.preparation,
             ],
         )
     )
@@ -132,6 +134,12 @@ def commands(args, output):
         str(args.engine_memory_fraction),
         "--progress-interval",
         str(args.progress_interval),
+        "--baseline-mode",
+        args.baseline_mode,
+        "--decode-graph",
+        args.decode_graph,
+        "--preparation",
+        args.preparation,
     ]
     if not args.v3_only and args.reference_report is None:
         steps.append(
@@ -167,7 +175,8 @@ def commands(args, output):
             performance += ["--profile"]
         steps.append(("performance", performance))
     else:
-        steps.append(("model-exact", [*candidate, "--correctness-only", "--output-dir", str(output / "model-exact")]))
+        stage = "model-exact" if args.baseline_mode == "exact" else "model-observe"
+        steps.append((stage, [*candidate, "--correctness-only", "--output-dir", str(output / stage)]))
     return steps
 
 
@@ -180,6 +189,19 @@ def parse_args(argv=None):
     parser.add_argument("--build-dir", type=Path, default=REPO / "build/vq2a8-ascendc-v3")
     parser.add_argument("--baseline-library", type=Path, default=REPO / "build/vq2a8-ascendc-v026/libvq2a8_ascendc.so")
     parser.add_argument("--reference-report", type=Path, help="Reuse hash-bound v1 reference produced by this workflow")
+    parser.add_argument(
+        "--baseline-mode",
+        choices=("observe", "exact"),
+        default="observe",
+        help="Observe v1/v3 per-step error, or explicitly require bit-exact equality",
+    )
+    parser.add_argument(
+        "--decode-graph",
+        choices=("none", "moe"),
+        default="none",
+        help="Optional complete MoE decode graph; not full-model graph capture",
+    )
+    parser.add_argument("--preparation", choices=("eager", "fused"), default="eager")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--physical-npu", type=int, default=0)
     parser.add_argument("--timeout", type=int, default=3600, help="Maximum seconds for EACH child stage")
@@ -233,6 +255,8 @@ def parse_args(argv=None):
             raise ValueError("--profile requires --benchmark")
         if args.v3_only and (not args.benchmark or args.reference_report is not None):
             raise ValueError("--v3-only requires --benchmark and cannot use --reference-report")
+        if args.v3_only and args.baseline_mode != "observe":
+            raise ValueError("--v3-only cannot request strict baseline comparison")
         if not math.isfinite(args.progress_interval) or args.progress_interval < 0:
             raise ValueError("--progress-interval must be finite and non-negative")
         if (
@@ -331,9 +355,11 @@ def main():
             if name == "preflight":
                 library = (args.library or args.build_dir / LIBRARY_NAME).resolve()
                 receipt = json.loads((output / "preflight.json").read_text(encoding="utf-8"))
-                validate_receipt(receipt, library_identity(library), args.model, str(args.physical_npu))
+                validate_receipt(
+                    receipt, library_identity(library), args.model, str(args.physical_npu), args.preparation
+                )
                 report["device_execution_verified"] = True
-            elif name in ("v1-reference", "model-exact", "performance"):
+            elif name in ("v1-reference", "model-exact", "model-observe", "performance"):
                 from tools.benchmark_vq2a8_ascendc_v3 import parse_args as child_args
                 from tools.benchmark_vq2a8_ascendc_v3 import verify_report
 
@@ -349,13 +375,19 @@ def main():
                         os.environ.pop("ASCEND_RT_VISIBLE_DEVICES", None)
                     else:
                         os.environ["ASCEND_RT_VISIBLE_DEVICES"] = previous
-                if name == "model-exact":
-                    report.update(model_integration_verified=True, baseline_exact=True, baseline_comparison="verified")
+                if name in ("model-exact", "model-observe"):
+                    report.update(
+                        model_integration_verified=True,
+                        baseline_exact=child_report["baseline_exact"],
+                        baseline_comparison=child_report["baseline_comparison"],
+                        baseline_observations=child_report.get("baseline_observations", {}),
+                    )
                 elif name == "performance":
                     report.update(
                         model_integration_verified=True,
                         baseline_exact=child_report["baseline_exact"],
                         baseline_comparison=child_report["baseline_comparison"],
+                        baseline_observations=child_report.get("baseline_observations", {}),
                         performance_measurement_verified=True,
                         performance_target_met=child_report["performance_target_met"],
                         summaries=child_report["summaries"],

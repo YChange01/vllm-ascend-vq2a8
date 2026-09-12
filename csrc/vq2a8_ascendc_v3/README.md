@@ -1,80 +1,130 @@
-# VQ2A8 AscendC v3：设备常驻 decode 候选
+# VQ2A8 AscendC v3：常驻调度、v2 计算内核与 MoE decode 图
 
-v3 从 `../vq2a8_ascendc`（v1）派生，不替换 v1/v2，不改默认后端。
-独立执行策略为 `ascendc_v3`，独立库为 `libvq2a8_ascendc_v3.so`。
-继续读取原 `experts_vq_ascend_v2` **权重制品格式**；该目录名不是算子 v2，
-不需要重新量化、K 排序或重新打包权重。
+执行策略仍为 `ascendc_v3`，使用独立的 `libvq2a8_ascendc_v3.so`；不改 v1/v2 或其他后端默认值。
+本轮把 v2 的 register pair-LUT 计算接入 v3 的设备常驻运行时，并增加融合准备和 MoE 图执行选项。
+**20 ms TPOT 是待测目标；本地 CPU 验证不能证明 NPU 正确性或性能达标。**
 
-## 本轮实现与边界
+## 快速服务测速
 
-已实现：
+日常迭代使用这两个轻量入口。启动器直接执行标准 `vllm serve`，模型保持加载；
+无需 acceptance report、build manifest 或 preflight 回执，也不会自动运行验收。
+使用当前仓库代码和已编译的 v3 库，在服务器运行：
 
-- 加载全部不可驱逐的 packed 专家权重池，直接写入最终存储，无长期双份权重。
-  加载前按所有层计算权重、元数据、固定工作区预算，空间不足直接拒绝，不回退 LRU。
-- B1 decode 在设备上选择专家指针及 sign/scale/bias，不把路由 ID 搬回 CPU；
-  复用设备描述符和投影输入/输出工作区，取消逐层索引与描述符 H2D。
-- 准备阶段点算子按批执行；仍逐行执行原 dense RHT 和 bias GEMV，保持旧数值顺序。
-  保留任意 `16×2` FP8 向量码本，不将 VQ 编码误当成整数 INT4 或标量 FP4。
-- prepared 原生入口从常驻 GM 表 DMA 加载 6,656 个常量字，
-  取代每个 AIV、每次 launch 的逐项 scalar 初始化。
-- M1 激活直接按 NZ 行搬运；每个输出块只清零一次，第二个 AIV 不再搬入空激活或 Gather。
-- 保留原 K128 归约、FP32 scale→bias→BF16、SwiGLU 舍入边界和确定性路由归约。
-  初始化验证权重；执行时保留设备有效性标志，验收边界检查，不能只凭有限 logits 通过。
-- 当前 stream 的原生输入/工作区有 allocator 生命周期记录，运行时拒绝跨 stream
-  及递归复用。MoE 返回值有独立存储，不与下一个 token 的工作区别名。
+```bash
+python -u tools/serve_vq2a8_v3.py --model /path/to/vq2a8
+```
 
-**没有完成/没有验证的部分：**
+默认库为 `build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so`，卡 0、端口 8000、
+`preparation=eager`、`decode_graph=none`；可用 `--library`、`--physical-npu`、`--port` 修改。
+可加 `--preparation fused --decode-graph moe` 测融合和 MoE 图。
+服务模式关闭逐层同步计时与诊断日志，并允许 vLLM 启动时的 dummy profiling。
+默认 engine/cache 比例为 0.98/1.0、reserve 为 3 GiB，是下文说明的紧预算候选；
+可用 `--engine-memory-fraction`、`--memory-fraction`、`--reserve-gib` 调整。
 
-- Cube 仍用 M32；M1 优化的是激活搬运，不是已经消除了 32 行填充计算。
-- RHT/bias GEMV 尚未融合成新的原生准备算子；不默认启用改变归约顺序的 FWHT。
-- 准备阶段仍有 PyTorch 中间分配；prefill 仍是 batched、host-routed eager 路径。
-- 没有全模型 DecodeGraph，也没有将局部准备图标成全模型图。
-- 本机只能做 CPU 契约/数学/脚本检查；CANN 编译、NPU 数值和性能由服务器实测。
-  **20 ms 是观察目标，不是已实现的性能，也不是本轮可保证的结果。**
+服务就绪后，在服务器的另一个终端执行：
 
-后续是否缩小 Cube M、融合准备/SwiGLU/归约、接入全模型图，需先根据本轮
-严格对照及设备实测决定；不通过放宽数值验收来换取成功标签。
+```bash
+python tools/benchmark_vq2a8_serving.py
+# 需要多测几次时：
+python tools/benchmark_vq2a8_serving.py --max-tokens 64 --repeats 3
+```
+
+客户端默认发一个预热请求，再测一个请求；通过 `/v1/completions` 流式生成 32 tokens，
+输出 `TTFT_MS`、`TPOT_MS`、`TOKENS`。`--warmups 0` 可查看首次请求延迟。
+TTFT 从发送请求计至首个非空生成内容；TPOT 为首末内容间隔除以 `usage.completion_tokens - 1`，
+不把 SSE chunk 数当作 token 数。这是客户端 HTTP 时间，包含传输和输出缓冲影响。
+`--prompt` 可替换短提示词；当前模型仍限定 prompt 加 output 不超过 128 tokens。
+服务可保持运行并反复测速；改内核需增量编译并重启服务，改 Python 只需重启服务。
+已有构建目录时，内核迭代只需：
+
+```bash
+cmake --build build/vq2a8-ascendc-v3 --target vq2a8_ascendc_v3 -j4
+```
+
+首次构建可用 `python tools/build_vq2a8_ascendc_v3.py --soc Ascend950DT_9574`，按实际芯片和 CANN 路径调整。
+本地服务相关 CPU 配置、隔离模型方法、流解析及旧路径回归共 284 passed；
+测试未加载真实 vLLM/NPU 引擎，服务启动仍待内网验证。
+
+## 实现与开关
+
+| 部分 | 当前实现 |
+| --- | --- |
+| 权重 | 启动时将原制品转成 v2 的 K 排序、packed zN 与 pair-LUT，直接写最终常驻 bank |
+| 投影 | N128/K1024 分块、每个 AIV K512、Mmad K256、M 按 16 对齐、多级流水 |
+| decode 调度 | 设备选择专家指针及元数据；固定 9-word 描述符和输入/输出工作区；无路由 ID 回传或描述符 H2D |
+| `--preparation eager`（默认） | 原逐行 dense RHT、bias GEMV，然后量化和字节 permutation |
+| `--preparation fused` | 保留上述 RHT/GEMV；原生融合 weight scale 乘法、amax、行 scale、归一化/clamp、FP8 cast 和 permutation |
+| `--decode-graph none`（默认） | eager 提交 |
+| `--decode-graph moe` | 每层捕获完整 B1 MoE：路由、准备、两次投影、SwiGLU、加权归约和共享专家 |
+| prefill | B>1 保持 host-routed eager，投影使用同一套已转换的常驻权重和 v2 计算内核 |
+
+读取的仍是 `experts_vq_ascend_v2` 制品，无需重新量化或改磁盘文件。
+运行时通过已有 `convert_expert_payload` 做一次 CPU 转换，不保留另一份长期设备权重。
+任意合法 `16×2` FP8 向量码本仍按 VQ 解释，不当成整数 INT4 或标量 FP4。
+新的 resident 投影范围是 N4096、K2048/4096、M1..32、1..6 jobs，硬件目标为 Ascend950。
+旧 v3 内核和入口留作诊断，正式 `ascendc_v3` 配置默认走新 resident ABI 1。
+
+图捕获前在拥有工作区的同一 stream 上 warmup 两次。回放更新 hidden 和 token ID，
+路由及指针选择在图内执行；输出复制到独立存储，避免下一 token 覆盖已返回结果。
+图只接受一个 B1 输入签名和一个 stream；捕获/回放失败直接报错，不静默回退。
+累计设备有效性标志保持原地址，图回放继续累积无效输入/输出状态，在验收边界检查。
+
+**图范围是完整 MoE 层，不是完整模型。** Attention、KV 更新、MoE 外的根线性层及采样仍 eager，
+报告始终为 `full_model_graph_verified=false`。RHT/GEMV 未融合，准备和路由仍有 PyTorch 中间张量；
+图内临时张量、算子 scratch、graph pool 和内存碎片也需要预算预留。
+
+## 数值与验收
+
+K 排序和 v2 的 K256 累加会改变投影归约顺序，不能预设与 v1 逐 bit 相同。
+默认 `--baseline-mode observe` 运行独立 v1 对照，记录逐 step logits 误差、token 差异及前缀是否相同，
+不把观测报告当成模型质量通过。前缀分歧后的 logits 不能作为相同输入的数值对照。
+需要原来的严格门禁时显式使用 `--baseline-mode exact`。
+`--v3-only` 跳过 v1，报告 `baseline_comparison=not_requested`、`baseline_exact=null`。
+三种模式都不会把 v3 自身重复一致冒充 v1 一致。
+
+算子 preflight 包括 28 个投影案例，覆盖新 eager/out 入口、M 边界、1/6 jobs、两种 K、
+真实转换权重、重复运行、非默认 stream 和原址更新 descriptor 指向的专家。
+`--preparation fused` 还强制执行三类准备测试：复用与分块边界、FP8 midpoint/负零、非有限值与非法 int64 order。
+融合准备必须与 eager 的 FP8 字节、FP32 行 scale 和 bias 位级一致，不能复用 eager 模式的预检回执。
+投影沿用 v2 的独立数学 oracle 与数值门限；这不等同于全模型质量验收。
+
+新构建 manifest/回执使用 schema 2，并校验源码、库 SHA256、resident ABI 与 capability。
+旧 v3 `.so` 必须重编，不能只替换 Python 文件后复用旧回执。
+原生 `grouped_projection_resident_out` 是可信内部 ABI：`int64[jobs,9]` 存放
+`x, scale, bias, packed_zn, pair_lut, output, M, N, K`。
+它依赖运行时持有的不可变权重 bank 和有界选择，不接受外部文件/RPC 的任意设备指针。
 
 ## 内存预算
 
-启动检查与权重常驻预算使用两个独立参数：
+全层预算在加载根权重后、分配专家 bank 前检查；不足时拒绝，不减少专家数或回退 LRU。
+计划按每个独立分配取整，包括转换权重、int64 activation order、固定准备/投影工作区、H128 和有效性标志。
 
-- `--engine-memory-fraction`（默认 `0.98`）传给 vLLM 的 `gpu_memory_utilization`，
-  引擎启动时检查空闲显存是否达到 `total × engine_fraction`，不绕过 worker 检查。
-- `--memory-fraction` / `--cache-memory-fraction`（同一参数，默认 `0.9`）
-  单独限制 packed 权重和固定工作区预算，不再传给引擎启动检查。
-- `--cache-reserve-gib` 保留给后续 KV、临时张量和分配器余量，不自动降低。
+| 参数 | 用途 |
+| --- | --- |
+| `--engine-memory-fraction`，默认 0.98 | vLLM 启动空闲内存检查 |
+| `--memory-fraction` / `--cache-memory-fraction`，默认 0.9 | 常驻权重和工作区可用比例 |
+| `--cache-reserve-gib`，默认 16 | 为 KV、临时张量、graph pool 和运行峰值预留 |
+| `--cache-budget-gib 0` | 根据当前可用内存计算预算，非无限预算 |
 
-预算在 BF16 根权重加载完成后计算。`--cache-budget-gib 0` 表示按可用内存计算，
-不是无限预算。可用预算为
+可用预算为
 `max(0, min(free + max(0, reserved - allocated), total × cache_fraction - allocated) - reserve)`。
-固定 v3 decode 工作区计入常驻需求；显式 cache budget 也不得超过此可用预算。
-独立 cache 比例仅在显式指定 KV 字节数且其不超过 reserve 时启用，本工具固定为 1 GiB，
-避免同时使用自动 KV 比例预算；reserve 中 KV 以外的空间还要容纳临时张量和运行峰值。
-因此 engine 比例在此手动 KV 配置下不充当整个进程的显存硬上限；物理安全检查由独立预算及预留承担。
-其他旧入口未指定独立 cache 比例时，仍沿用原来的引擎比例，不改变旧版默认行为。
+工具显式分配 1 GiB KV，必须包含在 reserve 内；reserve 不会被自动缩小。
+手动 KV 配置下，engine 比例不是整个进程的显存硬上限。
 
-此前服务器日志中的物理容量约 80.16 GiB、根权重已分配约 14.82 GiB、
-完整 packed cache 约 61.54 GiB。再扣除 1 GiB KV 后算术余量仅约 2.80 GiB，
-**不能据此保证完整常驻可成功**，还要计算工作区及运行峰值。
-默认 0.9 使用比例和 16 GiB reserve 很可能主动拒绝该配置。
-这代表策略预算不足，不等于证明物理内存绝对装不下。
+以仓库中的 43 层几何（前 3 层各 1 expert，其余每层 256 experts）静态计算：
 
-旧命令把 `1.0` 同时用作引擎启动比例，会要求整卡 80.16 GiB 全部空闲，
-即使日志显示空闲 79.41 GiB，也会在模型加载前退出。这不是模型 OOM。
-按此前精确根权重分配数及模型几何计算，v3 常驻需求约 61.566 GiB；
-只改为 `0.99` 并保留 3 GiB reserve，比例预算仍少约 29.43 MiB，不能作为可靠修复。
+- 转换后权重和元数据：66,520,172,544 bytes。
+- 固定工作区：61,252,096 bytes。
+- 总常驻计划：66,581,424,640 bytes，约 **62.009 GiB**，不含根权重、KV、临时张量或 graph pool。
 
-以下完整实测示例显式选择 `--engine-memory-fraction 0.98 --memory-fraction 1.0 --cache-reserve-gib 3`，
-是一个需要核查运行峰值的紧预算候选，**不是自动默认值或装得下的承诺**。
-请在空闲卡上执行；若预算/OOM 失败，保留日志，不要无条件继续减小 reserve。
-启动前显示 `PERF_V3_MEMORY_CONFIG`；根权重加载后显示 `MODEL_CACHE_BUDGET`，
-全驻留分配前显示 `V3_RESIDENCY_BUDGET` 的需求、可用预算、余量/缺口和 `fits`。
-如果 `fits=false`，不会开始部分权重加载；如果 `fits=true`，也不代表运行峰值已验证。
+相较原 v3，activation order 由 uint8 tile ID 换为 int64，工作区也增加。
+套用此前服务器记录的总容量 86,067,118,080 bytes、根权重分配 15,909,779,456 bytes，
+即使 cache 比例为 0.99、reserve 为 3 GiB，仍短缺 505,982,669 bytes（约 482.54 MiB）。
+这些是静态预算回归数据，不是本轮 NPU 测量。
+下方 `1.0 / 3 GiB` 是显式紧预算候选；需检查实际峰值，尤其启用 graph 时。
+`V3_RESIDENCY_BUDGET fits=true` 只表示计划通过，不能证明运行峰值装得下。
 
-## 服务器操作
-
-### 快速迭代：只用 vLLM 引擎粗测 TPOT
+## 独立引擎快测
 
 已有编译好的 v3 库时，运行独立快测入口，**不需要先跑完整验收**：
 
@@ -87,6 +137,7 @@ python -u tools/quick_benchmark_vq2a8_v3.py \
 默认使用 `build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so`，只创建一次 `vllm.LLM`，
 预热 1 次、测量 3 次，每次输入 10、输出 32 个 token。直接通过 `llm.llm_engine.step()`
 运行完整模型和调度器，不是单算子微基准，也不启动 HTTP 服务。
+当前这个入口固定使用 `preparation=eager`、`decode_graph=none`，不提供融合/图模式开关。
 每轮在终端打印 TTFT/TPOT/E2E；最后看 `QUICK_V3_DONE` 的 `TPOT_MEDIAN_MS`、最小值和最大值。
 预热不计入统计；若只想尽快看一次结果，可加 `--repeats 1`，但单样本波动较大。
 输入、输出和预热分别通过 `--prompt-tokens`、`--output-tokens`、`--warmups` 调整；总长度不超过 128。
@@ -105,116 +156,66 @@ resident decode 执行。它只输出速度估计，始终标记 `ACCEPTANCE=NOT
 因此不同长度间、与完整验收间比较时需要注意配置差异；同配置连续测量更适合判断优化趋势。
 模型全量加载和引擎自身的启动预跑仍保留，不能承诺整个命令几秒完成。
 
-**仅这个快测入口**采用当前 80 GiB 服务器使用的紧预算默认值：
+该快测入口采用当前 80 GiB 服务器使用的紧预算默认值：
 `--engine-memory-fraction 0.98 --cache-memory-fraction 1.0 --cache-reserve-gib 3`，
 固定 KV 为 1 GiB，包含在 reserve 中；仍按实际空闲显存检查，不保证装得下，不自动降低 reserve。
 原有完整验收脚本及其默认配置不变。
 
-### 只测当前 v3 的 TTFT/TPOT
+## 内网验证步骤
 
-已有 v3 库且只关心当前速度时，使用 `--v3-only --benchmark`。该模式不读取、
-不重编、不运行 v1 对照库，也不要求 v1 reference report；默认严格对照模式仍保留。
-算子 preflight、v3 自身两次逐 step 重复性/有限值/执行覆盖检查仍然执行。
-报告标记 `baseline_comparison=not_requested`、`baseline_exact=null`，
-终端显示 `BASELINE_EXACT=NOT_REQUESTED`，不能据此宣称与旧版一致或质量已验证。
+先构建并只做算子预检，不加载全模型。路径替换为内网实际位置：
 
 ```bash
-cd /home/g00872988/vllm-ascend-vq2a8
 python -u tools/accept_vq2a8_ascendc_v3.py \
-  --model /home/g00872988/vq2a8 \
+  --model /path/to/vq2a8 \
+  --soc Ascend950DT_9574 --physical-npu 0 \
+  --preparation fused --preflight-only --jobs 4 --timeout 1800
+```
+
+随后依次测三组：默认 `eager/none`、`fused/none`、`fused/moe`，区分计算核、准备融合和图执行的收益。
+以下是第三组，仅测 v3 的热态 TPOT；前两组分别调整两个开关：
+
+```bash
+python -u tools/accept_vq2a8_ascendc_v3.py \
+  --model /path/to/vq2a8 \
   --library build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so \
   --physical-npu 0 \
   --engine-memory-fraction 0.98 \
   --memory-fraction 1.0 --cache-reserve-gib 3 \
+  --preparation fused --decode-graph moe \
   --v3-only --benchmark --cases 10:32 \
-  --warmups 2 --repeats 5 \
-  --progress-interval 5 --target-tpot-ms 20 --timeout 3600
-```
-
-这使用已编译的 v3 库，仅重跑算子检查；首次编译则去掉 `--library`，改传
-`--soc Ascend950DT_9574 --jobs 4`。`10:32` 每次提供 31 个 decode 间隔，
-比 `10:4` 的 3 个间隔更适合观察 TPOT。不传 `--profile` 可省去额外的性能跟踪请求。
-上述显式紧内存预算仍有前文所述 OOM 风险，不会自动减少预留空间。
-
-进度包括：阶段编号/耗时、每层常驻权重加载量、当前用例/轮次、
-限频的 token 完成数和距最近 token 的等待时间，以及请求结束后的 TTFT/TPOT/E2E。
-`--progress-interval 5` 控制后台 token 进度间隔；设为 `0` 关闭该进度线程，
-但保留阶段/用例结果。计时循环只更新 CPU 标量快照，不为日志逐 token 同步 NPU
-或写终端；后台日志仍可能影响主机调度，报告保留该配置用于复测。
-
-### 与 v1 严格对照
-
-先只编译并做短算子检查，不加载全模型：
-
-```bash
-cd /home/g00872988/vllm-ascend-vq2a8
-python -u tools/accept_vq2a8_ascendc_v3.py \
-  --model /home/g00872988/vq2a8 \
-  --soc Ascend950DT_9574 \
-  --physical-npu 0 \
-  --preflight-only \
-  --jobs 4 --timeout 1800
-```
-
-通过后使用刚编好的 v3 库，与已有旧版库对照并测量短 case：
-
-```bash
-python -u tools/accept_vq2a8_ascendc_v3.py \
-  --model /home/g00872988/vq2a8 \
-  --library build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so \
-  --baseline-library build/vq2a8-ascendc-v026/libvq2a8_ascendc.so \
-  --physical-npu 0 \
-  --engine-memory-fraction 0.98 \
-  --memory-fraction 1.0 --cache-reserve-gib 3 \
-  --benchmark --cases 10:4 --warmups 2 --repeats 5 \
+  --warmups 2 --repeats 5 --progress-interval 5 \
   --target-tpot-ms 20 --timeout 3600
 ```
 
-`--library` 跳过编译，但仍检查库/源码身份并执行算子 preflight。
-v1 参考运行与 v3 运行在不同子进程，避免同时保留两份模型。
-启用 benchmark 时，v3 同一引擎先做严格数值对照再计时，不重复加载 v3 模型。
-首次全量专家载入属于 startup，不计入热态 TPOT；每层加载有进度输出。
-`--timeout` 是每个子阶段上限，不是所有阶段的总上限。
+`--library` 跳过编译，仍校验身份并重跑算子 preflight。
+需要 v1 数值观察时，去掉 `--v3-only`，添加
+`--baseline-library build/vq2a8-ascendc-v026/libvq2a8_ascendc.so`；严格对照再添加 `--baseline-mode exact`。
+v1/v3 分进程加载。候选引擎先做重复性/有效性和执行覆盖检查，再 warmup、正式计时。
+图模式要求正式样本没有新增 capture，并且每次 decode 都有对应 replay。
 
-`10:4` 为 10 个输入 token、4 个输出 token，仅有 3 个 decode 间隔。
-短测通过后将参数改为 `--cases 10:64,32:64 --repeats 20` 做较长输出测量。
-这仍是 TP1/B1、总上下文不超过 128 的离线测试，不是服务吞吐或质量验收。
+`10:32` 有 31 个 decode 间隔；进一步可用 `--cases 10:64,32:64 --repeats 20`。
+这仍是 TP1/B1、总上下文不超过 128 的离线实验。
+启动/转换/常驻加载与图捕获均不计入热态 TPOT。
+加 `--profile` 会另采集一次 CPU/NPU trace，不混入计时样本。
+加 `--plan-only` 仅打印命令，不启动 NPU；`--timeout` 是每个子阶段的上限。
 
-需要定位剩余瓶颈时加 `--profile`：测速完成后，在同一 v3 引擎中额外采集一次
-CPU/NPU trace，不把该次请求计入性能样本。跟踪包含 `v3_device_route`、
-`v3_gate_up`、`v3_swiglu`、`v3_down` 范围；gate/down 包括准备及提交，
-不是纯内核时间。`PROFILE_STATUS` 单独报告，不代表原生指令或全模型图已验证。
+## 报告
 
-只查看将执行的步骤，不使用 NPU：在上述命令末尾加 `--plan-only`。
-也可用 `--reference-report <本工具生成的v1-reference/summary.json>`
-复用同模型、同代码、同设备、同配置、同 cases 的已验证参考；身份变更即拒绝复用。
+`reports/vq2a8-ascendc-v3-*/` 包含预检回执、日志、可选 v1 对照、
+`performance/summary.json` / `summary.txt` 和顶层汇总。
+报告记录准备模式、resident 布局/ABI、逻辑 decode/投影次数、prefill 次数、图 capture/replay 次数。
+逻辑投影计数不包含首次捕获的 warmup；它不是 profiler 实测的 kernel 数。
+TTFT、请求平均 TPOT 的中位数和逐 token 间隔 P95 分开报告；设备 event 包括 host 提交间隙。
+`--target-tpot-ms 20` 依据实测请求平均 TPOT 中位数判定，未测时为 `null`，不代表每个 token 都小于 20 ms。
 
-## 报告与验收含义
+## 本地验证边界（2026-09-12）
 
-报告位于 `reports/vq2a8-ascendc-v3-*/`：
-
-- `preflight.json` / `preflight.log`：独立数值 oracle、原生 grouped/prepared 路径检查。
-- `v1-reference/`：旧版逐 step logits、token 和源码/库/模型身份。
-- `performance/summary.txt`、`performance/summary.json`：
-  TTFT、请求平均 TPOT 中位数、逐 token 间隔 P95、设备 event 观察值和原始样本。
-  event 跨度含 host 提交间隙，不是纯 Cube 内核耗时。
-- 顶层 `summary.json`：各阶段结果及最终验收状态。
-
-严格对照模式中的 `BASELINE_EXACT=True` 必须由 v1/v3 的逐 step FP32 logits 字节及输出 token 比较产生。
-重复一致不代替 baseline 一致。热态样本要求全层执行、零专家换入/换出，
-并保留 v3 设备路由计数。未获得性能数据时目标结果为 `null`。
-`--v3-only` 中性能测量可以通过，但 `BASELINE_EXACT` 始终为 `NOT_REQUESTED`。
-`--target-tpot-ms 20` 根据实测请求平均 TPOT 的中位数报告目标是否满足；
-目标未满足不伪造功能失败，也不把 P50 达标冒充每个 token 均达标。
-
-原生 `grouped_projection_out` 是**可信内部工作区 ABI**：
-它接收设备上的指针记录，不能接受文件/RPC 提供的任意描述符。
-binding 的 shape 检查并不能认证任意描述符中的指针；它依赖运行时预验证并持有的
-不可变专家权重池和有界设备选择。不要把此入口作为通用对外算子接口。
-
-## 本地验证记录（2026-09-11）
-
-- CPU 全套回归：1,452 passed、213 skipped、2 failed（另有 4 subtests passed）。
-- 两个失败均为此前已有的 root-FP8 midpoint/FMA CPU 测试；本轮未改该路径，v3 仅启用 BF16 根权重。
-- Ruff、clang-format、Markdown 检查通过；`format.sh ci` 因本机缺少 pre-commit 未执行完整检查链。
-- 未进行 CANN 编译、NPU 执行或 TPOT 验证；上述 CPU 结果不代替服务器验收。
+本机有 CPU PyTorch、pytest 和主机 C++ 编译器，没有 vLLM、torch_npu、CANN 或 NPU。
+CPU 数学/契约测试通过隔离 package 启动依赖运行；图测试使用显式 fake backend，
+原生测试只编译可独立的布局/调度头文件，不编译 AscendC 设备内核。
+已覆盖转换、FP8 准备字节、动态/重复专家选择、固定地址、预算、配置、图输入更新及失败处理、验收工具。
+相关集成回归结果为 **873 passed、3 skipped**（跳过项均需 NPU），包含 v2、v3、准备、MoE、offline 和内存预算测试。
+Ruff、主机 clang-format、Markdown lint、禁用导入和布尔上下文检查通过；
+`bash format.sh ci` 在缺少 pre-commit 时退出，未完成完整 hook 链。
+未连接内网设备，未验证 CANN 编译、NPU 数值、真实图回放或 TPOT。

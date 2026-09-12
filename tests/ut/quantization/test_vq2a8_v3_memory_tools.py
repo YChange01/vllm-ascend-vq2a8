@@ -114,7 +114,7 @@ def configuration_evidence(tmp_path, monkeypatch):
     monkeypatch.setattr(bench, "model_identity", lambda _model: {"model": "test"})
     monkeypatch.setattr(bench, "python_source_hashes", lambda: {"source": "test"})
     report = dict(
-        schema_version=1,
+        schema_version=bench.SCHEMA_VERSION,
         status="PASS",
         mode="performance",
         implementation="ascendc_v3",

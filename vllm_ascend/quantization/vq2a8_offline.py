@@ -50,6 +50,9 @@ def offline_engine_options(
     ascendc_v2_sha256=None,
     ascendc_v3_library=None,
     ascendc_v3_sha256=None,
+    v3_preparation="eager",
+    v3_decode_graph="none",
+    v3_serving=False,
     verbose_experts=False,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
@@ -59,6 +62,12 @@ def offline_engine_options(
         raise ValueError("V2 library options require execution_policy=ascendc_v2.")
     if execution_policy != "ascendc_v3" and (ascendc_v3_library is not None or ascendc_v3_sha256 is not None):
         raise ValueError("V3 library options require execution_policy=ascendc_v3.")
+    if v3_preparation not in ("eager", "fused") or v3_decode_graph not in ("none", "moe"):
+        raise ValueError("V3 requires preparation=eager|fused and decode_graph=none|moe.")
+    if execution_policy != "ascendc_v3" and (v3_preparation != "eager" or v3_decode_graph != "none"):
+        raise ValueError("V3 preparation/graph options require execution_policy=ascendc_v3.")
+    if type(v3_serving) is not bool or (v3_serving and execution_policy != "ascendc_v3"):
+        raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     return {
@@ -94,6 +103,12 @@ def offline_engine_options(
                 "enabled": True,
                 "artifact": str(artifact),
                 "execution_policy": execution_policy,
+                **(
+                    {"v3_preparation": v3_preparation, "v3_decode_graph": v3_decode_graph}
+                    if execution_policy == "ascendc_v3"
+                    else {}
+                ),
+                **({"v3_serving": True} if v3_serving else {}),
                 "cache_experts": 256 if execution_policy in ("cached", "ascendc", "ascendc_v2", "ascendc_v3") else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
@@ -142,6 +157,9 @@ def validate_offline_config(config) -> dict:
         "ascendc_v2_sha256",
         "ascendc_v3_library",
         "ascendc_v3_sha256",
+        "v3_preparation",
+        "v3_decode_graph",
+        "v3_serving",
         "verbose_experts",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
@@ -223,8 +241,20 @@ def validate_offline_config(config) -> dict:
             raise ValueError("VQ2A8 v3 requires unchanged BF16 roots.")
         if options.get("cache_experts", 256) != 256:
             raise ValueError("VQ2A8 v3 requires full residency, not an eviction cache.")
+        if options.get("v3_preparation", "eager") not in ("eager", "fused") or options.get(
+            "v3_decode_graph", "none"
+        ) not in ("none", "moe"):
+            raise ValueError("Invalid V3 preparation/decode graph selection.")
     elif "ascendc_v3_library" in options or "ascendc_v3_sha256" in options:
         raise ValueError("VQ2A8 v3 library options require explicit execution_policy=ascendc_v3.")
+    if options.get("execution_policy") != "ascendc_v3" and any(
+        key in options for key in ("v3_preparation", "v3_decode_graph")
+    ):
+        raise ValueError("V3 preparation/graph options require execution_policy=ascendc_v3.")
+    if type(options.get("v3_serving", False)) is not bool or (
+        "v3_serving" in options and options.get("execution_policy") != "ascendc_v3"
+    ):
+        raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
     if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
         raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
     if type(options.get("verbose_experts", False)) is not bool:
@@ -342,6 +372,14 @@ class OfflineMoEOwner:
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
+                **(
+                    {
+                        "v3_preparation": self.options.get("v3_preparation", "eager"),
+                        "v3_decode_graph": self.options.get("v3_decode_graph", "none"),
+                    }
+                    if self.options.get("execution_policy") == "ascendc_v3"
+                    else {}
+                ),
                 **(
                     {"progress": True, "verbose_experts": self.options.get("verbose_experts", False)}
                     if issubclass(runtime_class, CachedVQ2TP1MoE)

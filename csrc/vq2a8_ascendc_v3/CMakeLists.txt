@@ -46,7 +46,7 @@ find_package(Torch REQUIRED)
 separate_arguments(TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 # Independent opt-in target: do not enable the unrelated direct kernels which
 # the root build deliberately excludes on A5. CANN performs native compilation.
-ascendc_library(vq2a8_ascendc_v3_kernel STATIC kernel.cpp)
+ascendc_library(vq2a8_ascendc_v3_kernel STATIC kernel.cpp resident_kernel.cpp prepare_kernel.cpp)
 ascendc_include_directories(vq2a8_ascendc_v3_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 add_library(vq2a8_ascendc_v3 SHARED torch_binding.cpp)
 target_compile_options(vq2a8_ascendc_v3 PRIVATE ${TORCH_FLAGS})

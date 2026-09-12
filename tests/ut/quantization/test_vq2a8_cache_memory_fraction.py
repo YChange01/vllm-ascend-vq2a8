@@ -206,13 +206,16 @@ def test_cache_fraction_oversized_cap_logs_before_rejection_and_never_plans(monk
 def test_cache_fraction_v3_shortfall_is_logged_before_any_bank_initialization(monkeypatch, capsys):
     value = owner(execution_policy="ascendc_v3", cache_memory_fraction=0.95)
     shapes = {}
-    for kind in ("gate_up", "down"):
+    specs = {}
+    for kind, k in (("gate_up", 4096), ("down", 2048)):
+        n = 4096
+        specs[kind] = NS(rows=n, columns=k, rht_true_columns=k, rht_block_size=128)
         shapes.update(
             {
-                f"{kind}_packed_indices": (1, 16, 64),
-                f"{kind}_codebooks": (1, 1, 1, 16, 2),
+                f"{kind}_packed_indices": (1, n // 2, k // 8),
+                f"{kind}_codebooks": (1, k // 256, n // 32, 16, 2),
                 **{
-                    f"{kind}_{field}": (1, 512)
+                    f"{kind}_{field}": (1, k)
                     for field in ("codebook_tile_ids", "weight_scale", "weight_bias", "rht_sign")
                 },
             }
@@ -221,9 +224,7 @@ def test_cache_fraction_v3_shortfall_is_logged_before_any_bank_initialization(mo
         layer_index=3,
         expert_ids=(0,),
         tensor_shapes=shapes,
-        specs={
-            kind: NS(rows=32, columns=512, rht_true_columns=512, rht_block_size=128) for kind in ("gate_up", "down")
-        },
+        specs=specs,
     )
     value.layers[3].initialize_resident = lambda **kwargs: pytest.fail("shortfall must not allocate weights")
     monkeypatch.setattr(offline, "device_cache_budget", lambda *args, **kwargs: {"budget_bytes": 0})

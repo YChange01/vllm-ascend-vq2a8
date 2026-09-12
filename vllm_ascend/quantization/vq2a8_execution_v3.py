@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in all-resident B1 device dispatch using V1 weights and rowwise math.
+"""All-resident B1 dispatch with a V2 pair-LUT core in the V3 library.
 
-This is not a full-model graph implementation. Exact preparation still launches
-PyTorch pointwise/GEMV operations and allocates intermediates. Prefill explicitly
-uses the legacy eager grouped ABI in the separate V3 library. Initialization,
-immutability checks and validity reporting belong outside measured decode.
+The legacy V3 kernel stays available for diagnostics. The default resident path
+converts compressed weights once, retains dense rowwise RHT/bias GEMV, and can
+fuse quantization/permutation and capture complete MoE decode layers. K ordering
+changes accumulation: V1 bitwise equivalence is measured, never presumed.
 """
 
 import json
@@ -18,12 +18,16 @@ import torch
 import torch.nn.functional as F
 
 from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
+from vllm_ascend.quantization.vq2a8_ascendc_v2 import convert_expert_payload, gather_prepared_activation
 from vllm_ascend.quantization.vq2a8_ascendc_v3 import (
     CONSTANT_WORDS,
+    FUSED_PREPARATION,
     JOB_WORDS,
     grouped_projection_out,
+    grouped_projection_resident,
     grouped_projection_v3,
     make_constants,
+    resident_library_capabilities,
 )
 from vllm_ascend.quantization.vq2a8_execution import (
     ALLOCATION_GRANULARITY,
@@ -35,6 +39,13 @@ from vllm_ascend.quantization.vq2a8_moe import route_vq2a8
 from vllm_ascend.quantization.vq2a8_optimization import FastMoEState, OptimizationOptions
 from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE, deepseek_v4_swiglu_reference
 from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_TORCH_DTYPES
+from vllm_ascend.quantization.vq2a8_v3_graph import MoEDecodeGraph
+from vllm_ascend.quantization.vq2a8_v3_workspace import (
+    RESIDENT_FIELDS,
+    ResidentV2ProjectionWorkspace,
+    resident_shapes,
+    resident_workspace_sizes,
+)
 
 KINDS = ("gate_up", "down")
 POINTER_FIELDS = ("packed_indices", "codebooks", "codebook_tile_ids")
@@ -48,7 +59,7 @@ def _rounded(size):
     return math.ceil(size / ALLOCATION_GRANULARITY) * ALLOCATION_GRANULARITY
 
 
-def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
+def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False, kernel="v2"):
     """Header-only device-storage plan; budget excludes roots, KV and scratch.
 
     Transform metadata is loaded directly into its final bank, never stacked
@@ -56,6 +67,8 @@ def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
     eager preparation/operator scratch, fragmentation and graph pools still
     require the caller's separate reserve. The plan never reduces expert count.
     """
+    if kernel not in ("v2", "legacy"):
+        raise ValueError("V3 resident kernel must be v2 or legacy.")
     if type(budget_bytes) is not int or budget_bytes < 0 or type(top_k) is not int or not 1 <= top_k <= 6:
         raise ValueError("V3 requires an explicit non-negative byte budget and top_k in [1,6].")
     plans = {}
@@ -68,6 +81,11 @@ def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
         for kind in KINDS:
             spec = layer.specs[kind]
             n, k = spec.rows, spec.columns
+            if kernel == "v2":
+                shapes = resident_shapes(layer, kind)
+                payload_bytes += sum(_rounded(math.prod(shapes[field]) * size) for field, _, size in RESIDENT_FIELDS)
+                workspace_bytes += sum(_rounded(size) for size in resident_workspace_sizes(experts, jobs, n, k))
+                continue
             if not (
                 0 < n <= 65536
                 and n % 32 == 0
@@ -99,9 +117,11 @@ def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
                     jobs * k,  # selected sign
                 )
             )
-        # One constants table and one H128 FP32 matrix per runtime.
+        # One H128 FP32 matrix and one cumulative validity flag per runtime.
         # The ID lookup is bounded by the router expert domain (<=256).
-        workspace_bytes += _rounded(CONSTANT_WORDS * 4) + _rounded(128 * 128 * 4) + _rounded(256 * 8)
+        workspace_bytes += _rounded(128 * 128 * 4) + _rounded(256 * 8) + _rounded(1)
+        if kernel == "legacy":
+            workspace_bytes += _rounded(CONSTANT_WORDS * 4)
         plans[layer.layer_index] = dict(
             experts=experts,
             jobs=jobs,
@@ -126,6 +146,7 @@ def resident_plan(layers, budget_bytes, *, top_k=6, report_budget=False):
         budget_bytes=budget_bytes,
         layer_plans=plans,
         all_experts_fit=True,
+        layout="zn_pair_lut_k256" if kernel == "v2" else "v1_packed",
         full_packed_bytes=totals["payload_bytes"],
         per_layer_cache_limit=max(plan["experts"] for plan in plans.values()),
         layer_limits={index: plan["experts"] for index, plan in plans.items()},
@@ -274,8 +295,17 @@ class ResidentProjectionWorkspace:
 class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
     execution_policy = "ascendc_v3"
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, v3_preparation="eager", v3_decode_graph="none", projection_kernel="v2", **kwargs):
+        if v3_preparation not in ("eager", "fused") or v3_decode_graph not in ("none", "moe"):
+            raise ValueError("V3 requires preparation=eager|fused and decode_graph=none|moe.")
+        if projection_kernel not in ("v2", "legacy"):
+            raise ValueError("V3 projection kernel must be v2 or legacy.")
+        if projection_kernel == "legacy" and (v3_preparation != "eager" or v3_decode_graph != "none"):
+            raise ValueError("Legacy V3 diagnostic runtime requires eager preparation and no graph.")
         super().__init__(*args, **kwargs)
+        self.projection_kernel = projection_kernel
+        self.v3_preparation, self.v3_decode_graph = v3_preparation, v3_decode_graph
+        self._decode_graph = None
         self._resident_ready = False
         self._resident_failed = False
         self._resident_valid = None
@@ -288,13 +318,22 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         self._optimization = self._v3_prefill_state
 
     def _retain_valid(self, valid):
-        self._resident_valid = valid if self._resident_valid is None else self._resident_valid & valid
+        if self._resident_valid is None:
+            self._resident_valid = valid.clone()
+        else:
+            # Graph replay must keep updating the SAME cumulative validity flag.
+            self._resident_valid.logical_and_(valid)
 
     def initialize_resident(self, *, budget_bytes):
         """Initialize once after root loading/budget admission, never inside decode."""
         if self._resident_ready or self._resident_failed or self._cache:
             raise RuntimeError("V3 residency requires a fresh empty runtime; no refresh or partial-cache fallback.")
-        plan = resident_plan([self.layer], budget_bytes, top_k=self.config.top_k)
+        kernel = getattr(self, "projection_kernel", "legacy")
+        plan = resident_plan([self.layer], budget_bytes, top_k=self.config.top_k, kernel=kernel)
+        if kernel == "v2":
+            capabilities = resident_library_capabilities()
+            if self.v3_preparation == "fused" and capabilities & FUSED_PREPARATION != FUSED_PREPARATION:
+                raise ValueError("Rebuild the V3 library with fused preparation support.")
         expert_ids = tuple(self.layer.expert_ids)
         domain = self.root["gate.weight"].shape[0]
         if not 1 <= domain <= 256 or any(type(index) is not int or not 0 <= index < domain for index in expert_ids):
@@ -311,10 +350,18 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         self._resident_failed = True
         progress_started = last_progress = time.monotonic()
         loaded_payload_bytes = 0
-        payload_bytes_per_expert = sum(
-            math.prod(self.layer.tensor_shapes[f"{kind}_{field}"][1:]) * size
-            for kind in KINDS
-            for field, size in ELEMENT_BYTES.items()
+        payload_bytes_per_expert = (
+            sum(
+                math.prod(resident_shapes(self.layer, kind)[field][1:]) * size
+                for kind in KINDS
+                for field, _, size in RESIDENT_FIELDS
+            )
+            if kernel == "v2"
+            else sum(
+                math.prod(self.layer.tensor_shapes[f"{kind}_{field}"][1:]) * size
+                for kind in KINDS
+                for field, size in ELEMENT_BYTES.items()
+            )
         )
         try:
             # Even when the caller is in inference_mode, these immutable banks
@@ -323,11 +370,21 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                 banks = {
                     kind: {
                         field: torch.empty(
-                            self.layer.tensor_shapes[f"{kind}_{field}"],
-                            dtype=VQ2_TP1_TORCH_DTYPES[field],
+                            (
+                                resident_shapes(self.layer, kind)[field]
+                                if kernel == "v2"
+                                else self.layer.tensor_shapes[f"{kind}_{field}"]
+                            ),
+                            dtype=dtype,
                             device=self.device,
                         )
-                        for field in ELEMENT_BYTES
+                        for field, dtype, _ in (
+                            RESIDENT_FIELDS
+                            if kernel == "v2"
+                            else tuple(
+                                (field, VQ2_TP1_TORCH_DTYPES[field], size) for field, size in ELEMENT_BYTES.items()
+                            )
+                        )
                     }
                     for kind in KINDS
                 }
@@ -337,8 +394,10 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                 for kind in KINDS:
                     with torch.device("cpu"):
                         host, spec = self.artifact.load_expert(self.layer_index, expert, kind, device="cpu")
+                        if kernel == "v2":
+                            host = convert_expert_payload(host, spec)
                     payload = {}
-                    for field in ELEMENT_BYTES:
+                    for field in banks[kind]:
                         banks[kind][field][row].copy_(host[field])
                         payload[field] = banks[kind][field][row]
                     resident[expert][kind] = (MappingProxyType(payload), spec)
@@ -359,18 +418,32 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             with torch.inference_mode(False):
                 preparation = RowwiseVQ2A8Preparation(compact=True, validity=self._retain_valid)
                 preparation._ensure_hadamard(self.device, 128)
-                constants = make_constants(self.root["gate.weight"])
-                self._resident_workspaces = {
-                    kind: ResidentProjectionWorkspace(
-                        [resident[expert][kind][0] for expert in expert_ids],
-                        self.layer.specs[kind],
-                        plan["layer_plans"][self.layer_index]["jobs"],
-                        constants,
-                        preparation,
-                        banks=banks[kind],
-                    )
-                    for kind in KINDS
-                }
+                if kernel == "v2":
+                    self._resident_workspaces = {
+                        kind: ResidentV2ProjectionWorkspace(
+                            [resident[expert][kind][0] for expert in expert_ids],
+                            self.layer.specs[kind],
+                            plan["layer_plans"][self.layer_index]["jobs"],
+                            preparation,
+                            banks=banks[kind],
+                            preparation_mode=self.v3_preparation,
+                        )
+                        for kind in KINDS
+                    }
+                else:
+                    constants = make_constants(self.root["gate.weight"])
+                    self._resident_workspaces = {
+                        kind: ResidentProjectionWorkspace(
+                            [resident[expert][kind][0] for expert in expert_ids],
+                            self.layer.specs[kind],
+                            plan["layer_plans"][self.layer_index]["jobs"],
+                            constants,
+                            preparation,
+                            banks=banks[kind],
+                        )
+                        for kind in KINDS
+                    }
+                self._resident_valid = torch.ones((), dtype=torch.bool, device=self.device)
                 lookup = torch.full((domain,), -1, device="cpu", dtype=torch.int64)
                 for row, expert in enumerate(expert_ids):
                     lookup[expert] = row
@@ -384,6 +457,8 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             self.h2d_bytes += sum(self._payload_bytes(expert) for expert in resident.values())
             self._row_preparation = preparation
             self._resident_plan = plan
+            if getattr(self, "v3_decode_graph", "none") == "moe":
+                self._decode_graph = MoEDecodeGraph(self.device)
             # Legacy roots may be inference tensors without version counters;
             # they still have pointer/shape guards and must not be mutated.
             self._resident_seals = tuple((value, self._seal(value)) for value in self._immutable_tensors())
@@ -427,7 +502,8 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         for workspace in self._resident_workspaces.values():
             yield from workspace.banks.values()
             yield workspace.pointer_bank
-            yield workspace.constants
+            if hasattr(workspace, "constants"):
+                yield workspace.constants
             yield workspace.preparation._hadamard
         yield from self.root.values()
         yield self._resident_lookup
@@ -440,6 +516,8 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                 raise RuntimeError("V3 workspace ownership is restricted to one stream.")
             return
         owners = list(self._immutable_tensors())
+        if self._resident_valid is not None:
+            owners.append(self._resident_valid)
         for workspace in self._resident_workspaces.values():
             owners.extend(workspace.owners)
             owners.append(workspace.descriptors)
@@ -465,21 +543,44 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
 
     def resident_report(self):
         self.check_resident_immutable()
+        kernel = getattr(self, "projection_kernel", "legacy")
+        graph = getattr(self, "_decode_graph", None)
         return dict(
             ready=True,
             plan=self._resident_plan,
             decode_device_calls=self.decode_device_calls,
             prefill_legacy_calls=self.prefill_legacy_calls,
             full_model_graph_verified=False,
+            layout="zn_pair_lut_k256" if kernel == "v2" else "v1_packed",
+            resident_abi_version=1 if kernel == "v2" else None,
+            resident_projection_launches=self.decode_device_calls * 2 if kernel == "v2" else 0,
+            resident_prefill_launches=getattr(self, "resident_prefill_launches", 0),
+            decode_graph=graph.report()
+            if graph is not None
+            else {
+                "scope": "none",
+                "captures": 0,
+                "replays": 0,
+                "entries": 0,
+                "failed": False,
+                "full_model_graph_verified": False,
+            },
             decode_route_host_reads=0,
             decode_descriptor_h2d=0,
-            preparation="v1_rowwise_dense_rht_no_fwht",
+            preparation=(
+                "dense_rht_bias_gemv_fused_quant_permute"
+                if getattr(self, "v3_preparation", "eager") == "fused"
+                else "dense_rht_bias_gemv_eager_quant_permute"
+                if kernel == "v2"
+                else "v1_rowwise_dense_rht_no_fwht"
+            ),
+            preparation_mode=getattr(self, "v3_preparation", "eager"),
             eager_intermediate_allocations=True,
             host_phase_timers_collected=False,
             decode_calls=self.decode_device_calls,
             descriptor_h2d_bytes=0,
             route_host_reads=0,
-            counter_scope="decode_only_prefill_remains_eager_host_routed",
+            counter_scope="logical_decode_calls_excludes_capture_warmups_prefill_is_eager_host_routed",
         )
 
     def v3_report(self):
@@ -501,11 +602,12 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         if any(type(value) is not bool for value in (measurement, profile, compact)):
             raise ValueError("V3 probe switches must be boolean.")
         if optimization not in (None, "v3", "batched"):
-            raise ValueError("V3 probe supports only the fixed resident V1-math path; FWHT/pipeline are not implicit.")
+            raise ValueError("V3 probe supports only the fixed resident path; FWHT/pipeline are not implicit.")
         self.check_resident_immutable()
         self.measurement_mode = measurement
         self.trace_native = False
-        self._resident_valid = None
+        if self._resident_valid is not None:
+            self._resident_valid.fill_(True)
         self._v3_prefill_state.valid = None
         self._v3_prefill_state.profile = profile
         # No caller can replace resident preparation with an optimization preset.
@@ -554,14 +656,28 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         return weights, ids.long()
 
     def _projections_many(self, requests):
-        # This explicit legacy ABI is only the B>1 prefill path. It keeps the
-        # original row preparation, namespace-isolated from the V1 library.
+        # B>1 prefill keeps original row preparation and eager submission,
+        # using the same converted banks and V2 core as resident decode.
         prepared = self._row_preparation.many(requests)
-        inputs = [
-            (*values, *(payload[field] for field in POINTER_FIELDS))
-            for values, (_, payload, _) in zip(prepared, requests)
-        ]
-        output = grouped_projection_v3(inputs)
+        if getattr(self, "projection_kernel", "legacy") == "v2":
+            inputs = [
+                (
+                    gather_prepared_activation(values[0], payload["activation_order"]),
+                    values[1].contiguous(),
+                    values[2].contiguous(),
+                    payload["packed_zn"],
+                    payload["pair_lut"],
+                )
+                for values, (_, payload, _) in zip(prepared, requests)
+            ]
+            output = grouped_projection_resident(inputs)
+            self.resident_prefill_launches = getattr(self, "resident_prefill_launches", 0) + 1
+        else:
+            inputs = [
+                (*values, *(payload[field] for field in POINTER_FIELDS))
+                for values, (_, payload, _) in zip(prepared, requests)
+            ]
+            output = grouped_projection_v3(inputs)
         rows = sum(hidden.shape[0] for hidden, _, _ in requests)
         self.native_calls += len(requests)
         self.native_launches += 1
@@ -591,31 +707,9 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             if hidden.shape[0] != 1:
                 self.prefill_legacy_calls += 1
                 return self._v3_prefill_state.forward(self, hidden, input_ids)
-            with self._v3_prefill_state.scope("v3_device_route"):
-                weights, ids = self._route_device(hidden, input_ids)
-            domain = self._resident_lookup.shape[0]
-            in_range = (ids >= 0) & (ids < domain)
-            slots = self._resident_lookup.index_select(0, ids.clamp(0, domain - 1).reshape(-1))
-            self._retain_valid(in_range.all() & (slots >= 0).all())
-            slots = slots.clamp_min(0)
+            graph = getattr(self, "_decode_graph", None)
+            result = self._decode(hidden, input_ids) if graph is None else graph.run(self._decode, hidden, input_ids)
             jobs = self._resident_workspaces["gate_up"].jobs
-            if jobs == 1:
-                slots = slots[:1]
-            with self._v3_prefill_state.scope("v3_gate_up"):
-                gates = self._resident_workspaces["gate_up"].project(hidden, slots)
-            with self._v3_prefill_state.scope("v3_swiglu"):
-                activation = deepseek_v4_swiglu_reference(gates, self.config.swiglu_limit)
-            with self._v3_prefill_state.scope("v3_down"):
-                values = self._resident_workspaces["down"].project(activation, slots)
-            # No atomics, no changed reduction or BF16 rounding boundary. Even
-            # singleton expert layers retain all six original top-k slots.
-            expanded = values.expand(self.config.top_k, -1) if jobs == 1 else values
-            result = (expanded.reshape(1, self.config.top_k, -1).float() * weights.unsqueeze(-1)).sum(1)
-            result *= self.config.routed_scale
-            if self.config.num_shared:
-                result += self.shared(hidden).float()
-            result = result.to(hidden.dtype)
-            self._retain_valid(torch.isfinite(result).all())
             self.native_calls += jobs * 2
             self.native_rows += jobs * 2
             self.native_experts += jobs
@@ -626,3 +720,32 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             return result  # owned allocation, never aliases next-token workspaces
         finally:
             self._resident_busy = False
+
+    def _decode(self, hidden, input_ids):
+        """Device-only MoE computation; counters and guards stay outside capture."""
+        with self._v3_prefill_state.scope("v3_device_route"):
+            weights, ids = self._route_device(hidden, input_ids)
+        domain = self._resident_lookup.shape[0]
+        in_range = (ids >= 0) & (ids < domain)
+        slots = self._resident_lookup.index_select(0, ids.clamp(0, domain - 1).reshape(-1))
+        self._retain_valid(in_range.all() & (slots >= 0).all())
+        slots = slots.clamp_min(0)
+        jobs = self._resident_workspaces["gate_up"].jobs
+        if jobs == 1:
+            slots = slots[:1]
+        with self._v3_prefill_state.scope("v3_gate_up"):
+            gates = self._resident_workspaces["gate_up"].project(hidden, slots)
+        with self._v3_prefill_state.scope("v3_swiglu"):
+            activation = deepseek_v4_swiglu_reference(gates, self.config.swiglu_limit)
+        with self._v3_prefill_state.scope("v3_down"):
+            values = self._resident_workspaces["down"].project(activation, slots)
+        # No atomics, no changed reduction or BF16 rounding boundary. Even
+        # singleton expert layers retain all six original top-k slots.
+        expanded = values.expand(self.config.top_k, -1) if jobs == 1 else values
+        result = (expanded.reshape(1, self.config.top_k, -1).float() * weights.unsqueeze(-1)).sum(1)
+        result *= self.config.routed_scale
+        if self.config.num_shared:
+            result += self.shared(hidden).float()
+        result = result.to(hidden.dtype)
+        self._retain_valid(torch.isfinite(result).all())
+        return result
