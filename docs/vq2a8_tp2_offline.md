@@ -4,10 +4,10 @@
 权重，提前完成 permutation 吸收、TP2 分片、K256 补位和 zN/FP8 pair-LUT 转换。
 原始文件不修改，不需要先生成 TP1 文件，不展开 dense BF16 权重，不使用 NPU。
 
-**边界：这是新的离线权重格式，不是已经接通的 TP2 服务。**
-当前 V3 loader、native shape checks 和 serving 仍是 TP1 合同；不能把输出传给现有
-TP1 入口，也不能仅加 `--tensor-parallel-size 2` 就认为接入完成。
-旧版、V2、V3 的默认运行路径均未改变。
+显式 TP2 loader、V2-compatible native shape checks 和 V3 双卡服务入口已接入。
+必须使用**完整 TP2 artifact、重新编译的 V3 库，以及 TP2 启动参数**；不能把 TP2
+文件传给 TP1 loader。旧版、V2、V3 TP1 默认运行路径均保留。
+当前验证是 CPU 合同/算术检查；真实 Ascend950 双卡执行、模型质量和 TPOT 仍须实测。
 
 ## 运行
 
@@ -81,7 +81,8 @@ python -u tools/repack_vq2a8_tp2.py \
 ## TP2 的切分含义
 
 这是真正的权重 tensor parallel 分片，不是把 256 个 MoE experts 分成每卡 128 个。
-两个 rank 都包含相同 expert IDs，未来运行时必须路由到相同 token/expert。
+两个 rank 都包含相同 expert IDs，运行时使用复制的 router/hash 根权重及相同输入，
+路由到相同 token/expert；这不是 expert parallel。
 
 | 矩阵 | TP2 逻辑分片 | 运行时要求 |
 | --- | --- | --- |
@@ -106,7 +107,8 @@ Down 切点必须对齐 RHT128，且必须在物理列坐标切分，不能把�
 4. dummy code 可以为合法 code 0，无需假设码本恰好存在零权重，因为相乘的激活是零。
 
 没有裁剪真实列、重新拟合码本或改写 FP8 字节。空码本不占 K256，因此不同 expert 的
-`packed_shape` 可能不同；未来 loader 必须读每个矩阵的 metadata，不能假设所有 K 一致。
+`packed_shape` 可能不同。新 loader 逐矩阵校验 metadata，并在装入最终设备 bank 时，
+将 down 统一补到计算 K2048，不能直接按磁盘 K 发射内核。
 
 对当前 `H=4096,I=2048` 的模型：
 
@@ -148,16 +150,100 @@ experts_vq_tp2_zn/
 各 LUT 的源码本编号和有效列数。根 manifest 的 `complete` **只表示层是否齐全**。
 `runtime_compatible=false` / `runtime_supported=false` 是刻意保留的状态，不应手工改为 true。
 
-## 数值与后续模型接入
+## V2 算子形状核对
+
+V3 resident projection 沿用 V2 的 N128 / AIC K1024 / AIV K512 / MMAD K256
+及双缓冲流水，计算内核没有为 TP2 重写。
+
+| 投影 | TP2 真实输入 K | 磁盘 packed K | native N × K |
+| --- | ---: | --- | --- |
+| Gate/up | 4096 | 4096 | 2048 × 4096 |
+| Down | 1024 | 1024 / 1280 / 1536 / 1792 / 2048 | 4096 × 2048 |
+
+K256 是码表块，不是计算尾块。当前 V2 流水收尾会等待两个 K1024 槽，K1024
+会缺少第二槽的完成信号，非 K1024 尾块也不会完整计算，因此不能简单放开 K 检查。
+补位只复制 packed 字节/metadata 并填零，不重新解码或拟合权重。计算 bank 的预算
+按统一 K2048 计，不按更小的磁盘 K 计。TP2 gate 的 N2048 恰好是 16 个 N128 块。
+
+新 V3 库必须具有 `RESIDENT_TP2_PROJECTION` capability bit 4；旧库提前拒绝。
+原 V2 目录和 V3 resident 计算流水保持不变。
+
+## 编译与双卡服务
+
+选择两张空闲、驱动/CANN 正常的 Ascend950 卡；不要重置其他任务正在使用的卡。
+以下命令不自动生成离线 artifact；先完成上面的全量生成。
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8
+python -u tools/build_vq2a8_ascendc_v3.py \
+  --soc Ascend950DT_9574 --jobs 4
+```
+
+建议先做不加载模型的双卡 smoke；只读所选 `.so` 的哈希，不需要验收报告：
+
+```bash
+VQ2_V3_LIBRARY="$PWD/build/vq2a8-ascendc-v3/libvq2a8_ascendc_v3.so"
+VQ2_V3_SHA=$(sha256sum "$VQ2_V3_LIBRARY" | cut -d ' ' -f 1)
+ASCEND_RT_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc-per-node=2 \
+  tools/validate_vq2a8_tp2_collective.py \
+  --library "$VQ2_V3_LIBRARY" --library-sha256 "$VQ2_V3_SHA" --timeout-s 180
+```
+
+终端分阶段输出设备映射、HCCL 初始化、routed SUM、两种 native 局部投影及重复执行。
+必须两 rank 都完成；默认不写报告，且不把 CPU/Gloo fallback 当作成功。
+`--communication-only` 可独立排查 HCCL，不加载 `.so`；smoke 不证明真实模型质量或 TPOT。
+
+服务终端（卡号按实际空闲卡修改）：
+
+```bash
+python -u tools/serve_vq2a8_v3.py \
+  --model /home/g00872988/vq2a8 \
+  --artifact /home/g00872988/vq2a8/experts_vq_tp2_zn \
+  --tensor-parallel-size 2 \
+  --physical-npus 0,1 \
+  --preparation eager --decode-graph none
+```
+
+内部使用标准 `vllm serve`、`mp` executor、两 rank TP group。原 `--physical-npu`
+仍用于 TP1，不与 TP2 卡列表混用。支持 `--dry-run` 查看实际启动参数。
+服务就绪后，另一个终端：
+
+```bash
+python tools/benchmark_vq2a8_serving.py --max-tokens 32 --repeats 3
+```
+
+计时为客户端 HTTP streaming TTFT/TPOT，不包含加载时间。首轮先用 eager；之后可单独
+改成 `--preparation fused` 测局部准备融合，TP2 的 `--decode-graph` 目前只允许 `none`。
+本入口仍限 TP2、B1、context ≤128，未开放 EP/PP/DP/CP、整模型图或 MTP。
+
+### Loader 与通信边界
+
+- 每 worker 绑定自己的 artifact rank，验证完整覆盖、config/metadata SHA、两个 rank
+  的 shape/分片映射及本 rank tensor SHA；按 shard 一次打开读取，不再逐 expert
+  执行原始 permutation/zN 转换。启动仍需文件读取、校验、H2D，并非零加载开销。
+- Gate/up 分列输出，本地 SwiGLU 后进入 down。每层在 routed top-k 加权和 scaling
+  完成后，对 **FP32 routed partial** 做一次 TP SUM，再加复制的 shared 输出，最后 BF16。
+  decode 和 bounded prefill 使用相同的归约位置；不对每个 expert 各做通信。
+- shared/router/hash 根权重每卡复制；attention/vocab 根权重走标准参数专属 TP loader，
+  attn_sink 按本地 heads 分片。attention 的输出投影保留父模型自己的归约，不能在
+  decoder 外再重复 SUM。
+- 不存在动态换出、TP1/cache fallback 或把不完整 artifact 当成完整模型的降级路径。
+
+## 数值与验证边界
+
+本次 Windows CPU 合同回归：2126 passed、257 skipped、15 个既有失败（2 个 CPU FP8/FMA
+平台差异，13 个旧测试的 Linux 路径/PYTHONPATH 假设），未新增失败。TP2/相关 runtime
+专项 350 passed，独立双卡 smoke 的 CPU 契约测试 44 passed；这些数字不包含真实 NPU 运行。
 
 CPU 回归独立检查 canonical 权重映射、gate/up 配对、任意跨 rank permutation、dummy、
 局部 RHT/bias 及序列化；但没有在 NPU 上执行模型。
 
 该合同采用 GPU 参考式 **TP2-local A8**：每个 rank 按自己 K 的 amax 量化。它与 TP1
 全 K 的 amax 不同，再加 K regrouping 和跨 rank SUM 的归约顺序变化，不能承诺 TP1
-逐位一致。未来必须做数值与模型质量验证；若改成跨 rank MAX 来共享量化 scale，应另行
+逐位一致。必须做真实 NPU 数值与模型质量验证；若改成跨 rank MAX 来共享量化 scale，应另行
 明确 runtime/格式合同，而不是静默改变当前描述。
 
-后续至少需要 TP2 artifact loader、native 的 N2048/真实 K 与 padded K 支持、局部激活
-准备、TP collective、普通权重 TP/sharing 策略，以及完整模型数值/峰值内存/性能实测。
-本脚本把昂贵的权重布局转换移到离线，但**不会自动接通上述运行路径**。
+已实现的代码接线不等同于实测通过。首次上机应先运行
+[TP2 native smoke](../csrc/vq2a8_ascendc_v3/TP2_NATIVE.md)，再验证两卡通信和服务。
+完整模型数值、峰值 HBM、长期稳定性、TTFT/TPOT 仍以真实 Ascend950 运行结果为准；
+不能由 CPU PASS 推断 20 ms TPOT。

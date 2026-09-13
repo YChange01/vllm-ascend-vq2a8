@@ -5,8 +5,10 @@
 
 namespace vq2a8_v3_resident {
 constexpr uint32_t kAbiVersion = 1;
-// Bit 0: zN/pair-LUT resident projection. Bit 1: fused FP8 preparation out ABI.
-constexpr uint32_t kCapabilities = 3;
+// Bit 0: zN/pair-LUT projection. Bit 1: fused FP8 preparation out ABI.
+// Bit 2: TP2 local projection shapes with the unchanged V2 N128/K1024 pipeline.
+constexpr uint32_t kTp2Projection = 4;
+constexpr uint32_t kCapabilities = 3 | kTp2Projection;
 constexpr uint32_t kMaxJobs = 6;
 constexpr uint32_t kMaxM = 32;
 constexpr uint32_t kN = 128;
@@ -58,6 +60,14 @@ VQ2_V3_RESIDENT_LAYOUT_FN bool ValidDimensions(int64_t m, int64_t n, int64_t k) 
   // Deliberately bounded to the real gate/up and down shapes. The standalone
   // reference's N6144 and M>32 branches are not certified by this model path.
   return m >= 1 && m <= kMaxM && n == 4096 && (k == 2048 || k == 4096);
+}
+VQ2_V3_RESIDENT_LAYOUT_FN bool ValidTp2Dimensions(int64_t m, int64_t n, int64_t k) {
+  // Extend only the model's TP2 gate/up shape; down is padded back to K2048.
+  // LUT K256 is NOT the compute tile. The unchanged V2 pipeline requires at
+  // least TWO complete K1024 tiles: both slots are unconditionally drained.
+  // K1024 would leave slot 1 without an acknowledgement; K256 tails are not
+  // computed by the k/kAicK loop. The loader must pad, not weaken this check.
+  return m >= 1 && m <= kMaxM && ((n == 2048 && k == 4096) || (n == 4096 && k == 2048));
 }
 VQ2_V3_RESIDENT_LAYOUT_FN uint32_t AlignedM(uint32_t m) { return (m + 15) / 16 * 16; }
 VQ2_V3_RESIDENT_LAYOUT_FN uint32_t HalfRows(uint32_t m, uint32_t half) {

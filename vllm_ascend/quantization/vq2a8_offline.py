@@ -54,6 +54,7 @@ def offline_engine_options(
     v3_decode_graph="none",
     v3_serving=False,
     verbose_experts=False,
+    tensor_parallel_size=1,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     if execution_policy != "ascendc" and (ascendc_library is not None or ascendc_sha256 is not None):
@@ -70,16 +71,25 @@ def offline_engine_options(
         raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
+    if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
+        raise ValueError("Offline tensor_parallel_size must be 1 or 2.")
+    if tensor_parallel_size == 2 and (
+        execution_policy != "ascendc_v3" or root_linear_mode != "bf16" or v3_decode_graph != "none"
+    ):
+        raise ValueError("TP2 requires V3, BF16 roots and decode_graph=none.")
     return {
         "model": str(model_root),
         "skip_tokenizer_init": True,
         "trust_remote_code": False,
-        "hf_overrides": {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None},
+        "hf_overrides": {
+            "architectures": [f"VQ2A8TP{tensor_parallel_size}OfflineForCausalLM"],
+            "quantization_config": None,
+        },
         "dtype": "bfloat16",
         "load_format": "safetensors",
-        "tensor_parallel_size": 1,
+        "tensor_parallel_size": tensor_parallel_size,
         "pipeline_parallel_size": 1,
-        "distributed_executor_backend": "uni",
+        "distributed_executor_backend": "mp" if tensor_parallel_size == 2 else "uni",
         "enforce_eager": True,
         "compilation_config": {"mode": 0, "cudagraph_mode": "NONE"},
         "async_scheduling": False,
@@ -165,7 +175,26 @@ def validate_offline_config(config) -> dict:
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
         raise ValueError("Invalid vq2a8_offline options/artifact path.")
     parallel, model = config.parallel_config, config.model_config
-    for name in ("tensor_parallel_size", "pipeline_parallel_size", "data_parallel_size"):
+    tp_size = getattr(parallel, "tensor_parallel_size", None)
+    if type(tp_size) is not int or tp_size not in (1, 2):
+        raise ValueError("Offline VQ2A8 requires tensor_parallel_size=1 or 2.")
+    if tp_size == 2:
+        if (
+            options.get("execution_policy") != "ascendc_v3"
+            or options.get("root_linear_mode", "bf16") != "bf16"
+            or options.get("v3_decode_graph", "none") != "none"
+        ):
+            raise ValueError("TP2 requires V3, BF16 roots and decode_graph=none.")
+        if getattr(parallel, "distributed_executor_backend", None) != "mp":
+            raise ValueError("TP2 requires the standard multiprocessing (mp) executor.")
+        extra = config.additional_config or {}
+        for name in ("enable_flashcomm1", "enable_dsa_cp", "mix_placement", "multistream_dsv4_dsa_overlap"):
+            if extra.get(name, False):
+                raise ValueError(f"TP2 requires {name}=False.")
+        finegrained = extra.get("finegrained_tp_config", {})
+        if not isinstance(finegrained, dict) or any(finegrained.values()):
+            raise ValueError("TP2 does not support finegrained TP overrides.")
+    for name in ("pipeline_parallel_size", "data_parallel_size"):
         if getattr(parallel, name, None) != 1:
             raise ValueError(f"Offline VQ2A8 requires {name}=1.")
     for name in ("prefill_context_parallel_size", "decode_context_parallel_size"):
@@ -309,10 +338,40 @@ def audit_offline_root(model_root: Path) -> dict:
     return inventory
 
 
-class OfflineMoEOwner:
-    """One artifact index per model; lazy per-layer caches share a byte budget."""
+def _validate_tp2_root_geometry(config):
+    fields = ("hidden_size", "num_attention_heads", "head_dim", "o_groups", "o_lora_rank", "q_lora_rank", "vocab_size")
+    if not isinstance(config, dict) or any(type(config.get(key)) is not int or config[key] <= 0 for key in fields):
+        raise ValueError("TP2 roots require positive integer hidden/head/group/LoRA/vocabulary geometry.")
+    if (
+        config["num_attention_heads"] % 2
+        or config["o_groups"] % 2
+        or config["num_attention_heads"] * config["head_dim"] % config["o_groups"]
+    ):
+        raise ValueError("TP2 root attention heads/groups must divide evenly into two valid output shards.")
 
-    def __init__(self, model_root: Path, options: dict, device: torch.device):
+
+class OfflineMoEOwner:
+    """One rank-bound artifact index; legacy caches or V3 banks share a byte budget."""
+
+    def __init__(self, model_root: Path, options: dict, device: torch.device, *, tp_size=1, tp_group=None):
+        if type(tp_size) is not int or tp_size not in (1, 2):
+            raise ValueError("Offline owner requires TP size 1 or 2.")
+        self.tp_size, self.tp_group, self.tp_rank = tp_size, tp_group, 0
+        if tp_size == 2:
+            if (
+                options.get("execution_policy") != "ascendc_v3"
+                or options.get("root_linear_mode", "bf16") != "bf16"
+                or options.get("v3_decode_graph", "none") != "none"
+                or type(getattr(tp_group, "world_size", None)) is not int
+                or getattr(tp_group, "world_size", None) != 2
+                or type(getattr(tp_group, "rank_in_group", None)) is not int
+                or tp_group.rank_in_group not in (0, 1)
+                or not callable(getattr(tp_group, "all_reduce", None))
+            ):
+                raise ValueError("TP2 owner requires V3/BF16/no graph and a matching two-rank TP group.")
+            self.tp_rank = tp_group.rank_in_group
+            self.root_config = json.loads((model_root / "config.json").read_text(encoding="utf-8"))
+            _validate_tp2_root_geometry(self.root_config)
         self.native_library = None
         if options.get("execution_policy") == "ascendc":
             from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
@@ -327,17 +386,35 @@ class OfflineMoEOwner:
                 raise ValueError("VQ2A8 v2 offline execution requires an NPU, without fallback.")
             self.native_library = load_pinned_library(options["ascendc_v2_library"], options["ascendc_v2_sha256"])
         elif options.get("execution_policy") == "ascendc_v3":
-            from vllm_ascend.quantization.vq2a8_ascendc_v3 import load_pinned_library
+            from vllm_ascend.quantization.vq2a8_ascendc_v3 import load_pinned_library, resident_library_capabilities
 
             if device.type != "npu":
                 raise ValueError("VQ2A8 v3 offline execution requires an NPU, without fallback.")
             self.native_library = load_pinned_library(options["ascendc_v3_library"], options["ascendc_v3_sha256"])
-        self.artifact = open_vq2a8_tp1_artifact(
-            Path(options["artifact"]),
-            model_root / "config.json",
-            require_complete=True,
-            require_reference_identity=True,
-        )
+            if tp_size == 2:
+                resident_library_capabilities(require_tp2=True)
+        if tp_size == 2:
+            from vllm.platforms import current_platform
+
+            from vllm_ascend.quantization.vq2a8_tp2_runtime import open_vq2a8_tp2_artifact
+
+            logical_device = device.index
+            physical_device = current_platform.visible_device_id_to_physical_device_id(logical_device)
+            print(
+                f"MODEL stage=tp2_owner tp_rank={self.tp_rank} tp_size=2 "
+                f"logical_device={logical_device} physical_device={physical_device}",
+                flush=True,
+            )
+            self.artifact = open_vq2a8_tp2_artifact(
+                Path(options["artifact"]), model_root / "config.json", tp_rank=self.tp_rank, verify_tensor_hashes=True
+            )
+        else:
+            self.artifact = open_vq2a8_tp1_artifact(
+                Path(options["artifact"]),
+                model_root / "config.json",
+                require_complete=True,
+                require_reference_identity=True,
+            )
         self.inventory = audit_offline_root(model_root)
         self.options = options
         self.device = device
@@ -362,9 +439,14 @@ class OfflineMoEOwner:
 
                 runtime_classes["ascendc_v2"] = AscendCV2VQ2TP1MoE
             if self.options.get("execution_policy") == "ascendc_v3":
-                from vllm_ascend.quantization.vq2a8_execution_v3 import AscendCV3VQ2TP1MoE
+                if getattr(self, "tp_size", 1) == 2:
+                    from vllm_ascend.quantization.vq2a8_execution_tp2 import AscendCV3VQ2TP2MoE
 
-                runtime_classes["ascendc_v3"] = AscendCV3VQ2TP1MoE
+                    runtime_classes["ascendc_v3"] = AscendCV3VQ2TP2MoE
+                else:
+                    from vllm_ascend.quantization.vq2a8_execution_v3 import AscendCV3VQ2TP1MoE
+
+                    runtime_classes["ascendc_v3"] = AscendCV3VQ2TP1MoE
             runtime_class = runtime_classes[self.options.get("execution_policy", "baseline")]
             layer = runtime_class(
                 self.artifact,
@@ -372,6 +454,11 @@ class OfflineMoEOwner:
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
+                **(
+                    {"tp_rank": self.tp_rank, "tp_group": self.tp_group, "projection_kernel": "v2"}
+                    if getattr(self, "tp_size", 1) == 2
+                    else {}
+                ),
                 **(
                     {
                         "v3_preparation": self.options.get("v3_preparation", "eager"),
@@ -498,6 +585,46 @@ class OfflineMoEOwner:
     def delegated_names(self) -> set[str]:
         return {f"layers.{index}.ffn.{name}" for index, layer in self.layers.items() for name in layer.root}
 
+    def _load_tp2_root(self, name, param, value, loader):
+        """Keep full checkpoint tensors; trusted vLLM loaders own sharding/padding.
+
+        Only the standard DeepSeek-V4 BF16 root families below may be sharded.
+        All other roots (including HC/RMS/indexer) retain exact replicated shapes.
+        Shared experts are delegated to the runtime and remain replicated.
+        """
+        cfg = self.root_config
+        h, heads, dim = cfg["hidden_size"], cfg["num_attention_heads"], cfg["head_dim"]
+        groups, rank = cfg["o_groups"], cfg["o_lora_rank"]
+        if heads % 2 or groups % 2:
+            raise ValueError("TP2 requires attention heads and output groups divisible by two.")
+        suffix = re.sub(r"^layers\.\d+\.attn\.", "", name)
+        shapes = {
+            "wq_b.weight": (heads * dim, cfg["q_lora_rank"]),
+            "wo_a.weight": (groups * rank, heads * dim // groups),
+            "wo_b.weight": (h, groups * rank),
+            "attn_sink": (heads,),
+        }
+        expected = shapes.get(suffix) if suffix != name else None
+        if name in ("embed.weight", "head.weight"):
+            expected = (cfg["vocab_size"], h)
+        if expected is None:
+            if tuple(value.shape) != tuple(param.shape):
+                raise ValueError(f"Replicated TP2 root shape mismatch: {name}.")
+            getattr(param, "weight_loader", loader)(param, value)
+            return
+        if tuple(value.shape) != expected:
+            raise ValueError(f"Canonical TP2 root shape mismatch: {name}: {tuple(value.shape)} != {expected}.")
+        if suffix == "attn_sink":
+            local = value.narrow(0, self.tp_rank * (heads // 2), heads // 2)
+            if tuple(local.shape) != tuple(param.shape):
+                raise ValueError("TP2 attention sink allocation does not match local heads.")
+            loader(param, local)
+            return
+        weight_loader = getattr(param, "weight_loader", None)
+        if not callable(weight_loader):
+            raise ValueError(f"TP2 root requires its parameter-specific weight loader: {name}.")
+        weight_loader(param, value)
+
     def load_root(self, parameters: dict, weights, loader) -> tuple[set[str], dict]:
         expected_delegated = self.delegated_names()
         seen, loaded, delegated, skipped = set(), set(), set(), set()
@@ -526,14 +653,20 @@ class OfflineMoEOwner:
                 and value.dtype == torch.bfloat16
                 and param.dtype == torch.float32
             )
-            if tuple(value.shape) != tuple(param.shape) or (value.dtype != param.dtype and not widen_norm):
+            tp2 = getattr(self, "tp_size", 1) == 2
+            if (not tp2 and tuple(value.shape) != tuple(param.shape)) or (
+                value.dtype != param.dtype and not widen_norm
+            ):
                 raise ValueError(
                     f"Root shape/dtype mismatch: {name} -> {target} ({value.shape}, {value.dtype}) "
                     f"!= ({param.shape}, {param.dtype})."
                 )
             if not bool(torch.isfinite(value).all()):
                 raise ValueError(f"Non-finite root tensor {name}.")
-            loader(param, value)
+            if tp2:
+                self._load_tp2_root(name, param, value, loader)
+            else:
+                loader(param, value)
             if widen_norm:
                 widened.append(name)
             loaded.add(target)

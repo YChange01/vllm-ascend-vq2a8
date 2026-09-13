@@ -20,6 +20,9 @@ RESIDENT_JOB_WORDS = 9
 RESIDENT_ABI_VERSION = 1
 RESIDENT_PROJECTION = 1
 FUSED_PREPARATION = 2
+RESIDENT_TP2_PROJECTION = 4
+TP1_RESIDENT_SHAPES = ((4096, 2048), (4096, 4096))
+TP2_RESIDENT_SHAPES = ((2048, 4096), (4096, 2048))
 
 
 def _require_loaded():
@@ -99,8 +102,10 @@ def grouped_projection_out(descriptors, constants, owners, *, jobs, m, n, k, til
     )
 
 
-def resident_library_capabilities():
+def resident_library_capabilities(*, require_tp2=False):
     """Reject an old V3 binary before constructing any resident workspace."""
+    if type(require_tp2) is not bool:
+        raise ValueError("require_tp2 must be boolean.")
     namespace = torch.ops.vq2a8_ascendc_v3
     if not all(
         hasattr(namespace, name)
@@ -115,28 +120,47 @@ def resident_library_capabilities():
     if namespace.resident_abi_version() != RESIDENT_ABI_VERSION:
         raise RuntimeError("V3 resident ABI version mismatch; rebuild the selected library.")
     capabilities = namespace.resident_capabilities()
+    if type(capabilities) is not int or capabilities < 0:
+        raise RuntimeError("V3 resident capability response must be a nonnegative integer.")
     if capabilities & RESIDENT_PROJECTION != RESIDENT_PROJECTION:
         raise RuntimeError("V3 library does not support resident pair-LUT projection.")
+    if require_tp2 and capabilities & RESIDENT_TP2_PROJECTION != RESIDENT_TP2_PROJECTION:
+        raise RuntimeError("Rebuild the V3 library: TP2 resident projection capability is unavailable.")
     return capabilities
 
 
-def grouped_projection_resident(inputs):
+def grouped_projection_resident(inputs, *, tp_size=1):
     """Grouped prefill using the converted layout in the V3 library."""
+    if type(tp_size) is not int or tp_size not in (1, 2):
+        raise ValueError("Resident projection tp_size must be integer 1 or 2.")
     if not 1 <= len(inputs) <= MAX_JOBS or any(len(row) != 5 for row in inputs):
         raise ValueError("Resident grouped projection requires 1..6 five-tensor jobs.")
+    shapes = TP2_RESIDENT_SHAPES if tp_size == 2 else TP1_RESIDENT_SHAPES
+    for x, _, _, packed, _ in inputs:
+        if (
+            x.ndim != 2
+            or packed.ndim != 4
+            or not 1 <= x.shape[0] <= 32
+            or (packed.shape[0] * 32, x.shape[1]) not in shapes
+        ):
+            raise ValueError(f"Resident V3 TP{tp_size} requires M1..32 and (N,K) in {shapes}.")
+    if tp_size == 2:
+        resident_library_capabilities(require_tp2=True)
     return torch.ops.vq2a8_ascendc_v3.grouped_projection_resident(*(list(values) for values in zip(*inputs)))
 
 
-def grouped_projection_resident_out(descriptors, owners, *, jobs, m, n, k):
+def grouped_projection_resident_out(descriptors, owners, *, jobs, m, n, k, tp_size=1):
     """Trusted nine-word workspace; no descriptor upload or output allocation."""
+    if type(tp_size) is not int or tp_size not in (1, 2):
+        raise ValueError("Resident projection tp_size must be integer 1 or 2.")
+    shapes = TP2_RESIDENT_SHAPES if tp_size == 2 else TP1_RESIDENT_SHAPES
     if (
         any(type(value) is not int for value in (jobs, m, n, k))
         or not 1 <= jobs <= MAX_JOBS
         or m != 1
-        or n != 4096
-        or k not in (2048, 4096)
+        or (n, k) not in shapes
     ):
-        raise ValueError("Resident V3 requires 1..6 M1/N4096/K2048-or-4096 jobs.")
+        raise ValueError(f"Resident V3 TP{tp_size} requires 1..6 M1 jobs with (N,K) in {shapes}.")
     if (
         descriptors.shape != (jobs, RESIDENT_JOB_WORDS)
         or descriptors.dtype != torch.int64
@@ -145,6 +169,8 @@ def grouped_projection_resident_out(descriptors, owners, *, jobs, m, n, k):
         raise ValueError("Expected contiguous int64[jobs,9] resident descriptors.")
     if not owners or any(value.device != descriptors.device for value in owners):
         raise ValueError("All resident pointer owners must share the descriptor device.")
+    if tp_size == 2:
+        resident_library_capabilities(require_tp2=True)
     return torch.ops.vq2a8_ascendc_v3.grouped_projection_resident_out(descriptors, list(owners), jobs, m, n, k)
 
 

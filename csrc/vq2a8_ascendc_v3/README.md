@@ -4,6 +4,11 @@
 本轮把 v2 的 register pair-LUT 计算接入 v3 的设备常驻运行时，并增加融合准备和 MoE 图执行选项。
 **20 ms TPOT 是待测目标；本地 CPU 验证不能证明 NPU 正确性或性能达标。**
 
+TP2 现有独立 rank loader / 双卡 eager 接线，默认仍是 TP1。使用从 canonical 原始权重
+离线生成的 TP2 artifact，并重新编译带 capability bit 4 的 V3 库。详细编译、启动命令与
+数值边界见 [TP2 接入说明](../../docs/vq2a8_tp2_offline.md)，V2 计算块与允许形状见
+[TP2 native 合同](TP2_NATIVE.md)。TP2 暂不支持 MoE decode 图。
+
 ## 快速服务测速
 
 日常迭代使用这两个轻量入口。启动器直接执行标准 `vllm serve`，模型保持加载；

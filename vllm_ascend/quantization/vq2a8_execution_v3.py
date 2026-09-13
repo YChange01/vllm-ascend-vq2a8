@@ -324,6 +324,40 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
             # Graph replay must keep updating the SAME cumulative validity flag.
             self._resident_valid.logical_and_(valid)
 
+    def _resident_capabilities(self):
+        return resident_library_capabilities()
+
+    def _resident_payloads(self):
+        """Yield one expert at a time; TP2 overrides this with shard streaming."""
+        for expert in self.layer.expert_ids:
+            values = {}
+            for kind in KINDS:
+                with torch.device("cpu"):
+                    host, spec = self.artifact.load_expert(self.layer_index, expert, kind, device="cpu")
+                    if getattr(self, "projection_kernel", "legacy") == "v2":
+                        host = convert_expert_payload(host, spec)
+                values[kind] = (host, spec)
+            yield expert, values
+
+    def _copy_resident_payload(self, banks, row, kind, host, spec):
+        payload = {}
+        for field in banks[kind]:
+            banks[kind][field][row].copy_(host[field])
+            payload[field] = banks[kind][field][row]
+        return MappingProxyType(payload), spec
+
+    def _make_resident_workspace(self, payloads, spec, jobs, preparation, banks):
+        return ResidentV2ProjectionWorkspace(
+            payloads, spec, jobs, preparation, banks=banks, preparation_mode=self.v3_preparation
+        )
+
+    def _launch_resident(self, inputs):
+        return grouped_projection_resident(inputs)
+
+    def _reduce_routed(self, result):
+        """TP1 is identity; TP2 SUMs only routed output before replicated shared."""
+        return result
+
     def initialize_resident(self, *, budget_bytes):
         """Initialize once after root loading/budget admission, never inside decode."""
         if self._resident_ready or self._resident_failed or self._cache:
@@ -331,7 +365,7 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         kernel = getattr(self, "projection_kernel", "legacy")
         plan = resident_plan([self.layer], budget_bytes, top_k=self.config.top_k, kernel=kernel)
         if kernel == "v2":
-            capabilities = resident_library_capabilities()
+            capabilities = self._resident_capabilities()
             if self.v3_preparation == "fused" and capabilities & FUSED_PREPARATION != FUSED_PREPARATION:
                 raise ValueError("Rebuild the V3 library with fused preparation support.")
         expert_ids = tuple(self.layer.expert_ids)
@@ -389,44 +423,45 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                     for kind in KINDS
                 }
             resident = {}
-            for row, expert in enumerate(expert_ids):
+            loaded_experts = set()
+            rows = {expert: row for row, expert in enumerate(expert_ids)}
+            for expert, host_values in self._resident_payloads():
+                if expert not in rows or expert in loaded_experts or set(host_values) != set(KINDS):
+                    raise ValueError("Resident payload iterator has duplicate, missing or unknown expert/kind.")
+                row = rows[expert]
                 resident[expert] = {}
                 for kind in KINDS:
-                    with torch.device("cpu"):
-                        host, spec = self.artifact.load_expert(self.layer_index, expert, kind, device="cpu")
-                        if kernel == "v2":
-                            host = convert_expert_payload(host, spec)
-                    payload = {}
-                    for field in banks[kind]:
-                        banks[kind][field][row].copy_(host[field])
-                        payload[field] = banks[kind][field][row]
-                    resident[expert][kind] = (MappingProxyType(payload), spec)
+                    host, spec = host_values[kind]
+                    resident[expert][kind] = self._copy_resident_payload(banks, row, kind, host, spec)
                     del host
                 resident[expert] = MappingProxyType(resident[expert])
+                loaded_experts.add(expert)
                 loaded_payload_bytes += payload_bytes_per_expert
                 if self.progress:
                     now = time.monotonic()
-                    if self._resident_load_progress_due(row + 1, len(expert_ids), now, last_progress):
+                    if self._resident_load_progress_due(len(loaded_experts), len(expert_ids), now, last_progress):
                         self._resident_load_progress(
-                            row + 1,
+                            len(loaded_experts),
                             len(expert_ids),
                             now - progress_started,
                             loaded_payload_bytes,
                             plan["planned_bytes"],
                         )
                         last_progress = now
+            if loaded_experts != set(expert_ids):
+                raise ValueError("Resident payload iterator did not populate every expert.")
+            del host_values
             with torch.inference_mode(False):
                 preparation = RowwiseVQ2A8Preparation(compact=True, validity=self._retain_valid)
                 preparation._ensure_hadamard(self.device, 128)
                 if kernel == "v2":
                     self._resident_workspaces = {
-                        kind: ResidentV2ProjectionWorkspace(
+                        kind: self._make_resident_workspace(
                             [resident[expert][kind][0] for expert in expert_ids],
                             self.layer.specs[kind],
                             plan["layer_plans"][self.layer_index]["jobs"],
                             preparation,
-                            banks=banks[kind],
-                            preparation_mode=self.v3_preparation,
+                            banks[kind],
                         )
                         for kind in KINDS
                     }
@@ -670,7 +705,7 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
                 )
                 for values, (_, payload, _) in zip(prepared, requests)
             ]
-            output = grouped_projection_resident(inputs)
+            output = self._launch_resident(inputs)
             self.resident_prefill_launches = getattr(self, "resident_prefill_launches", 0) + 1
         else:
             inputs = [
@@ -744,6 +779,7 @@ class AscendCV3VQ2TP1MoE(AscendCVQ2TP1MoE):
         expanded = values.expand(self.config.top_k, -1) if jobs == 1 else values
         result = (expanded.reshape(1, self.config.top_k, -1).float() * weights.unsqueeze(-1)).sum(1)
         result *= self.config.routed_scale
+        result = self._reduce_routed(result)
         if self.config.num_shared:
             result += self.shared(hidden).float()
         result = result.to(hidden.dtype)

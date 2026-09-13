@@ -249,8 +249,9 @@ void CheckResidentProjection(const at::Tensor& x, const at::Tensor& scale, const
   Check(packed, x, at::kByte, 4, "packed_zn");
   Check(table, x, at::kByte, 3, "pair_lut");
   const int64_t m = x.size(0), k = x.size(1), n = packed.size(0) * vq2a8_v3_resident::kN0;
-  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k),
-              "V3 resident projection supports M1..32, N4096, K2048/4096 only");
+  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k) || vq2a8_v3_resident::ValidTp2Dimensions(m, n, k),
+              "V3 resident projection requires M1..32 and (N,K)=(4096,2048),(4096,4096), or (2048,4096); "
+              "TP2 down must be padded to K2048");
   TORCH_CHECK(scale.numel() == m && bias.numel() == m, "row_scale/row_bias must contain M FP32 values");
   TORCH_CHECK(packed.size(1) == k / vq2a8_v3_resident::kK0 && packed.size(2) == vq2a8_v3_resident::kK0 &&
                   packed.size(3) == vq2a8_v3_resident::kN0 / 4,
@@ -343,7 +344,8 @@ void GroupedProjectionResidentOut(const at::Tensor& descriptors, const std::vect
   // on the same stream. Never inspect descriptor values through a host copy.
   TORCH_CHECK(descriptors.device().type() == c10::DeviceType::PrivateUse1, "V3 resident projection requires an NPU");
   TORCH_CHECK(jobs > 0 && jobs <= vq2a8_v3_resident::kMaxJobs && m == 1, "V3 resident decode requires 1..6 M1 jobs");
-  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k), "Unsupported V3 resident projection dimensions");
+  TORCH_CHECK(vq2a8_v3_resident::ValidDimensions(m, n, k) || vq2a8_v3_resident::ValidTp2Dimensions(m, n, k),
+              "Unsupported V3 resident projection dimensions; TP2 down must be padded to K2048");
   Check(descriptors, descriptors, at::kLong, 2, "resident_descriptors");
   TORCH_CHECK(descriptors.size(0) == jobs && descriptors.size(1) == vq2a8_v3_resident::kJobWords,
               "V3 resident descriptors must have shape [jobs,9]");

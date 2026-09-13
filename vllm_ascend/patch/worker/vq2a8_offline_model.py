@@ -114,8 +114,16 @@ class OfflineDecoderModel(DeepseekV4Model):
 
     def __init__(self, *, vllm_config, prefix=""):
         options = validate_offline_config(vllm_config)
+        owner_kwargs = {}
+        if vllm_config.parallel_config.tensor_parallel_size == 2:
+            from vllm.distributed import get_tp_group
+
+            owner_kwargs = {"tp_size": 2, "tp_group": get_tp_group()}
         self.offline_owner = OfflineMoEOwner(
-            Path(vllm_config.model_config.model), options, torch.device("npu", torch.npu.current_device())
+            Path(vllm_config.model_config.model),
+            options,
+            torch.device("npu", torch.npu.current_device()),
+            **owner_kwargs,
         )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
@@ -125,13 +133,28 @@ class OfflineDecoderModel(DeepseekV4Model):
 
 class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
     model_cls = OfflineDecoderModel
+    _offline_tp_size = 1
 
     def __init__(self, *, vllm_config, prefix=""):
         options = validate_offline_config(vllm_config)
+        expected_tp = getattr(self, "_offline_tp_size", 1)
+        if vllm_config.parallel_config.tensor_parallel_size != expected_tp:
+            raise ValueError(f"This VQ2A8 architecture requires tensor_parallel_size={expected_tp}.")
         ascend = get_ascend_config()
         for name in ("enable_flashcomm1", "mix_placement", "multistream_dsv4_dsa_overlap"):
             if getattr(ascend, name, False):
                 raise ValueError(f"Offline VQ2A8 requires {name}=False.")
+        if expected_tp == 2:
+            finegrained = getattr(ascend, "finegrained_tp_config", None)
+            for name in (
+                "oproj_tensor_parallel_size",
+                "olora_tensor_parallel_size",
+                "embedding_tensor_parallel_size",
+                "lmhead_tensor_parallel_size",
+                "mlp_tensor_parallel_size",
+            ):
+                if getattr(finegrained, name, 0):
+                    raise ValueError(f"VQ2A8 TP2 requires {name}=0.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         self._offline_loaded = False
         self._offline_trace = False
@@ -144,7 +167,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v3_serving = options.get("v3_serving", False)
 
     def set_moe_parameters(self):
-        # No FusedMoE allocation, expert extraction, EPLB or TP reduction.
+        # No FusedMoE allocation, expert extraction or EPLB. The TP2 runtime
+        # owns routed-only reduction; shared experts remain replicated.
         self.expert_weights = []
         self.moe_layers = []
         self.moe_mlp_layers = [layer.mlp for layer in self.model.layers]
@@ -261,7 +285,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "measurement": measurement,
             "compact": compact,
             "optimization": optimization,
-            "scope": "bounded_tp1_offline",
+            "scope": f"bounded_tp{getattr(owner, 'tp_size', 1)}_offline",
         }
 
     def performance_snapshot(self):
@@ -463,3 +487,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "native_fp8_expert_dot": False,
             "independent_reference": False,
         }
+
+
+class VQ2A8TP2OfflineForCausalLM(VQ2A8TP1OfflineForCausalLM):
+    """Explicit TP2 eager entry; never reinterpret the TP1 architecture name."""
+
+    _offline_tp_size = 2

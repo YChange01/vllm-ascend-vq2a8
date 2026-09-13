@@ -14,6 +14,10 @@ def register_model():
         "VQ2A8TP1OfflineForCausalLM",
         "vllm_ascend.patch.worker.vq2a8_offline_model:VQ2A8TP1OfflineForCausalLM",
     )
+    ModelRegistry.register_model(
+        "VQ2A8TP2OfflineForCausalLM",
+        "vllm_ascend.patch.worker.vq2a8_offline_model:VQ2A8TP2OfflineForCausalLM",
+    )
     ModelRegistry.register_model("DeepseekV4ForCausalLM", "vllm_ascend.models.deepseek_v4:AscendDeepseekV4ForCausalLM")
     ModelRegistry.register_model(
         "MiniMaxM3SparseForCausalLM",

@@ -184,6 +184,9 @@ class FastMoEState:
             with self.scope("mix_shared"):
                 result = (slots.reshape(x.shape[0], w.shape[1], x.shape[1]).float() * w.unsqueeze(-1)).sum(1)
                 result *= runtime.config.routed_scale
+                reduce_routed = getattr(runtime, "_reduce_routed", None)
+                if reduce_routed is not None:
+                    result = reduce_routed(result)
                 if runtime.config.num_shared:
                     if self.options.shared_batch:
                         shared = runtime.shared(x)
