@@ -29,6 +29,7 @@ import tempfile
 import time
 import types
 from dataclasses import asdict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -53,8 +54,8 @@ def _cpu_modules() -> tuple[Any, Any]:
     )
 
 
-def _progress(stage: str, **fields: Any) -> None:
-    print(f"VQ2_TP2_STAGE={stage} " + " ".join(f"{key}={value}" for key, value in fields.items()), flush=True)
+def _progress(stage: str, *, tp_size: int = 2, **fields: Any) -> None:
+    print(f"VQ2_TP{tp_size}_STAGE={stage} " + " ".join(f"{key}={value}" for key, value in fields.items()), flush=True)
 
 
 def _positive(value: str) -> int:
@@ -64,8 +65,8 @@ def _positive(value: str) -> int:
     return number
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+def parse_args(argv: list[str] | None = None, *, description: str | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=description or __doc__)
     parser.add_argument("--input", required=True, type=Path, help="original canonical experts_vq directory")
     parser.add_argument("--output", required=True, type=Path, help="new artifact directory; must not exist")
     parser.add_argument("--model-config", type=Path, help="default: INPUT/../config.json")
@@ -186,13 +187,15 @@ def _write_shard(
     experts: tuple[int, ...],
     tensors: dict[str, Any],
     matrices: list[dict[str, Any]],
+    *,
+    tp_size: int = 2,
 ) -> dict[str, Any]:
     # Lazy dependencies keep --help usable even before installing CPU torch.
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
 
-    directory = staging / "tp2" / f"rank{rank}" / f"layer_{layer:03d}"
+    directory = staging / f"tp{tp_size}" / f"rank{rank}" / f"layer_{layer:03d}"
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"experts_{experts[0]:04d}_{experts[-1] + 1:04d}.safetensors"
     temporary = path.with_suffix(".safetensors.partial")
@@ -223,10 +226,10 @@ def _write_shard(
     }
 
 
-def _payload_upper_bound(spec: Any) -> int:
+def _payload_upper_bound(spec: Any, tp_size: int = 2) -> int:
     # With canonical K256 groups, each rank holds at most the original number
     # of K256 blocks. Down padding may therefore retain the FULL original K.
-    rows = spec.rows // 2 if spec.kind == "gate_up" else spec.rows
+    rows = spec.rows // tp_size if spec.kind == "gate_up" else spec.rows
     columns = spec.columns
     return rows * columns // 4 + columns // 256 * rows + columns * (8 + 4 + 4 + 1)
 
@@ -244,12 +247,15 @@ def _convert_layer(
     artifact: Any,
     converter: Any,
     planned_metadata_sha256: str,
+    *,
+    tp_size: int = 2,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     from safetensors import safe_open
 
+    progress = partial(_progress, tp_size=tp_size)
     started = time.monotonic()
     paths = artifact.layer_artifact_paths(source, layer)
-    _progress("source_hash", layer=layer)
+    progress("source_hash", layer=layer)
     snapshot = _source_snapshot(paths)
     if snapshot[0]["sha256"] != planned_metadata_sha256:
         raise RuntimeError(f"Source layer {layer} metadata changed after planning; refusing to publish.")
@@ -259,16 +265,16 @@ def _convert_layer(
     with safe_open(paths[1], framework="pt", device="cpu") as handle:
         for offset in range(0, len(expert_ids), shard_size):
             experts = expert_ids[offset : offset + shard_size]
-            shard_tensors: list[dict[str, Any]] = [{}, {}]
-            shard_matrices: list[list[dict[str, Any]]] = [[], []]
+            shard_tensors: list[dict[str, Any]] = [{} for _ in range(tp_size)]
+            shard_matrices: list[list[dict[str, Any]]] = [[] for _ in range(tp_size)]
             for position, expert in enumerate(experts, offset + 1):
                 for kind in artifact.VQ2_MATRIX_KINDS:
                     spec = specs[f"{layer}.mlp.experts.{expert}.{kind}"]
                     original = {
                         field: handle.get_tensor(f"{spec.name}.{field}") for field in spec.expected_tensor_headers()
                     }
-                    for rank in (0, 1):
-                        tensors, metadata = converter.repack_matrix_tp2(original, spec, rank)
+                    for rank in range(tp_size):
+                        tensors, metadata = converter.repack_matrix_zn(original, spec, rank=rank, tp_size=tp_size)
                         tensor_metadata = _matrix_tensor_metadata(expert, kind, tensors)
                         shard_matrices[rank].append(
                             {
@@ -282,24 +288,28 @@ def _convert_layer(
                         shard_tensors[rank].update({tensor_metadata[field]["key"]: t for field, t in tensors.items()})
                     del original
                 if position % 8 == 0 or position == len(expert_ids):
-                    _progress(
+                    progress(
                         "convert",
                         layer=layer,
                         experts=f"{position}/{len(expert_ids)}",
                         elapsed_s=f"{time.monotonic() - started:.1f}",
                     )
-            for rank in (0, 1):
-                _progress("write_verify", layer=layer, rank=rank, experts=f"{experts[0]}..{experts[-1]}")
-                entries.append(_write_shard(staging, layer, rank, experts, shard_tensors[rank], shard_matrices[rank]))
+            for rank in range(tp_size):
+                progress("write_verify", layer=layer, rank=rank, experts=f"{experts[0]}..{experts[-1]}")
+                entries.append(
+                    _write_shard(
+                        staging, layer, rank, experts, shard_tensors[rank], shard_matrices[rank], tp_size=tp_size
+                    )
+                )
                 shard_tensors[rank].clear()
-    _progress("source_recheck", layer=layer)
+    progress("source_recheck", layer=layer)
     if snapshot != _source_snapshot(paths):
         raise RuntimeError(f"Source layer {layer} changed during conversion; refusing to publish.")
-    _progress("layer_done", layer=layer, elapsed_s=f"{time.monotonic() - started:.1f}")
+    progress("layer_done", layer=layer, elapsed_s=f"{time.monotonic() - started:.1f}")
     return entries, {"layer": layer, "files": snapshot}
 
 
-def run(args: argparse.Namespace) -> dict[str, Any]:
+def run(args: argparse.Namespace, *, tp_size: int = 2, entrypoint: Path | None = None) -> dict[str, Any]:
     """Plan, convert and publish a source-bound artifact without touching runtime.
 
     Keep validation, bounded conversion, and the final source/producer checks
@@ -316,6 +326,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if not source.is_dir() or not config.is_file():
         raise FileNotFoundError(f"Canonical input or model config missing: input={source}, config={config}")
     artifact, converter = _cpu_modules()
+    artifact_format = converter.zn_format(tp_size)
+    progress = partial(_progress, tp_size=tp_size)
     import torch
 
     torch.set_num_threads(args.threads)
@@ -328,35 +340,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     bytes_per_rank_upper = 0
     matrices = 0
     for layer in selected:
-        _progress("inspect", layer=layer, selected=len(selected))
+        progress("inspect", layer=layer, selected=len(selected))
         metadata_path = artifact.layer_artifact_paths(source, layer)[0]
         planned_metadata[layer] = _sha256(metadata_path)
         summaries.append(artifact.inspect_layer_artifact(source, layer))
         for spec in artifact.load_layer_specs(source, layer).values():
-            converter.validate_tp2_spec(spec)
-            bytes_per_rank_upper += _payload_upper_bound(spec)
+            converter.validate_zn_spec(spec, tp_size)
+            bytes_per_rank_upper += _payload_upper_bound(spec, tp_size)
             matrices += 1
         if _sha256(metadata_path) != planned_metadata[layer]:
             raise RuntimeError(f"Source layer {layer} metadata changed during planning.")
     complete = selected == tuple(range(layout.num_hidden_layers))
     artifact.validate_model_layout(summaries, layout, require_all_layers=args.layers == "all")
     plan = {
-        "format": converter.VQ2_TP2_ZN_FORMAT,
-        "tp_size": 2,
-        "tp_ranks": [0, 1],
+        "format": artifact_format,
+        "tp_size": tp_size,
+        "tp_ranks": list(range(tp_size)),
         "runtime_compatible": False,
         "complete": complete,
         "layers_selected": list(selected),
         "layers_expected": layout.num_hidden_layers,
         "per_rank_payload_upper_bytes": bytes_per_rank_upper,
         "per_rank_payload_upper_gib": bytes_per_rank_upper / 2**30,
-        "total_payload_upper_bytes": bytes_per_rank_upper * 2,
+        "total_payload_upper_bytes": bytes_per_rank_upper * tp_size,
         "scope": "expert_payload_only_excludes_root_weights_kv_workspace_graph_and_runtime",
         "dry_run": args.dry_run,
     }
-    print("VQ2_TP2_PLAN=" + json.dumps(plan, sort_keys=True), flush=True)
+    print(f"VQ2_TP{tp_size}_PLAN=" + json.dumps(plan, sort_keys=True), flush=True)
     if args.dry_run:
-        _progress("dry_run_done", PAYLOAD_VALUES_VERIFIED=False, RUNTIME_COMPATIBLE=False)
+        progress("dry_run_done", PAYLOAD_VALUES_VERIFIED=False, RUNTIME_COMPATIBLE=False)
         return plan
 
     producer_paths = (
@@ -364,17 +376,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         Path(artifact.__file__).resolve(),
         Path(converter.__file__).resolve(),
         Path(converter.__file__).with_name("vq2a8_repack.py").resolve(),
+        Path(converter.__file__).with_name("vq2a8_zn_contract.py").resolve(),
     )
+    if entrypoint is not None and entrypoint.resolve() not in producer_paths:
+        producer_paths += (entrypoint.resolve(),)
     producer = _source_snapshot(producer_paths)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Allow space for headers/JSON and filesystem overhead, not just tensors.
-    disk_required = 2 * bytes_per_rank_upper + max(64 * 2**20, bytes_per_rank_upper // 10, matrices * 16384)
+    disk_required = tp_size * bytes_per_rank_upper + max(64 * 2**20, bytes_per_rank_upper // 10, matrices * 16384)
     free_disk = shutil.disk_usage(output.parent).free
     if free_disk < disk_required:
         raise ValueError(f"Insufficient output disk space: free={free_disk}, required_upper={disk_required} bytes")
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.partial-", dir=output.parent)).resolve()
     published = False
-    _progress("convert_start", output=output, staging=staging, RUNTIME_COMPATIBLE=False)
+    progress("convert_start", output=output, staging=staging, RUNTIME_COMPATIBLE=False)
     try:
         # Discover unsupported publication primitives/filesystems before doing
         # a potentially long conversion, using only our private empty tree.
@@ -394,6 +409,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 artifact,
                 converter,
                 planned_metadata[summary.layer_index],
+                tp_size=tp_size,
             )
             shards.extend(layer_shards)
             source_layers.append(snapshot)
@@ -401,37 +417,39 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         # Recheck the full selected source snapshot before final publication.
         for snapshot in source_layers:
             layer = snapshot["layer"]
-            _progress("final_source_recheck", layer=layer)
+            progress("final_source_recheck", layer=layer)
             if _source_snapshot(artifact.layer_artifact_paths(source, layer)) != snapshot["files"]:
                 raise RuntimeError(f"Source layer {layer} changed before final publication.")
         if _sha256(config) != config_sha256 or _source_snapshot(producer_paths) != producer:
             raise RuntimeError("Model config or conversion code changed during conversion; refusing to publish.")
-        actual_bytes = [sum(shard["payload_bytes"] for shard in shards if shard["rank"] == rank) for rank in (0, 1)]
+        actual_bytes = [
+            sum(shard["payload_bytes"] for shard in shards if shard["rank"] == rank) for rank in range(tp_size)
+        ]
         manifest = {
             **plan,
             "schema_version": 1,
             "dry_run": False,
             "model_layout": asdict(layout),
             "source": {"config": {"file": config.name, "sha256": config_sha256}, "layers": source_layers},
-            "producer": {"tool": "tools/repack_vq2a8_tp2.py", "files": producer},
+            "producer": {"tool": "tools/" + (entrypoint or Path(__file__)).name, "files": producer},
             "per_rank_payload_bytes": actual_bytes,
             "shards": shards,
             "tensor_values_verified": True,
             "validation_scope": "canonical_checks_layout_roundtrip_serialization_not_device_or_model_accuracy",
             "tp1_a8_bitwise_equivalent": False,
-            "communication": {
-                "gate_up": "column_parallel_separate_gate_and_up_slices_concatenated_per_rank",
-                "down": "row_parallel_contiguous_physical_input_slice_sum_partials_across_tp_ranks",
-                "activation_quantization": "per_rank_per_row_amax_after_local_RHT128_and_weight_scale",
-                "bias_correction": "local_input_contribution_only_before_down_partial_sum",
-                "routing": "same_token_expert_assignments_on_both_ranks_not_expert_parallel",
-            },
+            "communication": converter.communication_contract(tp_size),
             "runtime_requirements": [
                 "A new TP2 loader: current TP1 serving rejects this format.",
                 "Native local-N support (gate_up N2048 for this model).",
                 "Prepare local physical activation; append zero dummy columns, then gather by activation_order.",
                 "Per-expert variable packed K handling where padding differs; persistent workspace budgeting.",
                 "TP routing and down partial SUM, root model TP and shared-expert ownership integration.",
+                "Device numerical, model quality, peak memory and performance validation.",
+            ]
+            if tp_size == 2
+            else [
+                "A TP1 packed-zN loader, distinct from the legacy TP1 direct format.",
+                "Prepare full physical activation, then byte-gather by activation_order; no TP collective.",
                 "Device numerical, model quality, peak memory and performance validation.",
             ],
         }
@@ -448,13 +466,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if staging.parent != output.parent or not staging.name.startswith(f".{output.name}.partial-"):
                 raise RuntimeError(f"Refusing to clean an unexpected staging path: {staging}")
             shutil.rmtree(staging)
-            _progress("partial_output_removed", path=staging, SOURCE_WRITES_BY_CONVERTER=False)
-    _progress(
+            progress("partial_output_removed", path=staging, SOURCE_WRITES_BY_CONVERTER=False)
+    progress(
         "done",
         OUTPUT=output,
         RUNTIME_COMPATIBLE=False,
-        rank0_gib=f"{actual_bytes[0] / 2**30:.3f}",
-        rank1_gib=f"{actual_bytes[1] / 2**30:.3f}",
+        **{f"rank{rank}_gib": f"{value / 2**30:.3f}" for rank, value in enumerate(actual_bytes)},
         elapsed_s=f"{time.monotonic() - started:.1f}",
     )
     return manifest

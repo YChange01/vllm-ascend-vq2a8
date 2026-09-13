@@ -9,6 +9,10 @@ TP2 现有独立 rank loader / 双卡 eager 接线，默认仍是 TP1。使用�
 数值边界见 [TP2 接入说明](../../docs/vq2a8_tp2_offline.md)，V2 计算块与允许形状见
 [TP2 native 合同](TP2_NATIVE.md)。TP2 暂不支持 MoE decode 图。
 
+TP1 也可从原始 `experts_vq` 离线生成同布局的 packed-zN，使用新入口
+`tools/repack_vq2a8_tp1_zn.py`，启动时显式指定新 artifact，省去在线布局转换。
+完整命令、TP1/TP2 形状区别与验证边界见 [TP1 packed-zN 说明](../../docs/vq2a8_tp1_zn_offline.md)。
+
 ## 快速服务测速
 
 日常迭代使用这两个轻量入口。启动器直接执行标准 `vllm serve`，模型保持加载；
@@ -54,7 +58,7 @@ cmake --build build/vq2a8-ascendc-v3 --target vq2a8_ascendc_v3 -j4
 
 | 部分 | 当前实现 |
 | --- | --- |
-| 权重 | 启动时将原制品转成 v2 的 K 排序、packed zN 与 pair-LUT，直接写最终常驻 bank |
+| 权重 | 旧 direct 制品启动时转换；离线 packed-zN 制品按分片校验后直接写最终常驻 bank |
 | 投影 | N128/K1024 分块、每个 AIV K512、Mmad K256、M 按 16 对齐、多级流水 |
 | decode 调度 | 设备选择专家指针及元数据；固定 9-word 描述符和输入/输出工作区；无路由 ID 回传或描述符 H2D |
 | `--preparation eager`（默认） | 原逐行 dense RHT、bias GEMV，然后量化和字节 permutation |
@@ -63,8 +67,8 @@ cmake --build build/vq2a8-ascendc-v3 --target vq2a8_ascendc_v3 -j4
 | `--decode-graph moe` | 每层捕获完整 B1 MoE：路由、准备、两次投影、SwiGLU、加权归约和共享专家 |
 | prefill | B>1 保持 host-routed eager，投影使用同一套已转换的常驻权重和 v2 计算内核 |
 
-读取的仍是 `experts_vq_ascend_v2` 制品，无需重新量化或改磁盘文件。
-运行时通过已有 `convert_expert_payload` 做一次 CPU 转换，不保留另一份长期设备权重。
+默认仍读取 `experts_vq_ascend_v2` direct 制品，通过 `convert_expert_payload` 做一次 CPU 转换。
+显式指定新的 TP1 packed-zN 制品时直接读取六字段；两条路径均不保留另一份长期设备权重。
 任意合法 `16×2` FP8 向量码本仍按 VQ 解释，不当成整数 INT4 或标量 FP4。
 新的 resident 投影范围是 N4096、K2048/4096、M1..32、1..6 jobs，硬件目标为 Ascend950。
 旧 v3 内核和入口留作诊断，正式 `ascendc_v3` 配置默认走新 resident ABI 1。

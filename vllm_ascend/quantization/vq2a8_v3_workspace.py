@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Owned V3 workspaces for the register pair-LUT projection.
 
-TP1 conversion happens once on the host. TP2 consumes prepacked offline files
-and zero-extends their K256 blocks to the retained V2 compute geometry. Decode
+Legacy direct TP1 conversion happens once on the host; packed-zN TP1 copies
+full-width offline bytes directly. TP2 consumes prepacked offline files and
+zero-extends their K256 blocks to the retained V2 compute geometry. Decode
 selects device pointers and writes quantized bytes in converted K order. Dense
 RHT and bias GEMV retain their rowwise geometry within each rank.
 """
@@ -16,6 +17,7 @@ from vllm_ascend.quantization.vq2a8_ascendc_v3 import (
     prepare_resident_out,
 )
 from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE
+from vllm_ascend.quantization.vq2a8_zn_contract import VQ2_TP1_ZN_FORMAT
 
 RESIDENT_FIELDS = (
     ("packed_zn", torch.uint8, 1),
@@ -33,6 +35,26 @@ def resident_shapes(layer, kind):
     """Validate source headers and describe the final converted bank geometry."""
     spec = layer.specs[kind]
     n, k, experts = spec.rows, spec.columns, len(layer.expert_ids)
+    if getattr(layer, "format", None) == VQ2_TP1_ZN_FORMAT:
+        expected = {"gate_up": (4096, 4096), "down": (4096, 2048)}
+        if (
+            getattr(layer, "tp_size", None) != 1
+            or kind not in expected
+            or (n, k) != expected[kind]
+            or spec.rht_true_columns != k
+            or spec.rht_block_size != 128
+            or not experts
+        ):
+            raise ValueError("TP1 packed-zN requires full gate N4096/K4096 and down N4096/K2048 without padding.")
+        shapes = {
+            "packed_zn": (experts, n // 32, k // 16, 16, 8),
+            "pair_lut": (experts, k // 256, n // 32, 32),
+            **{field: (experts, k) for field in RESIDENT_SELECTED_FIELDS},
+        }
+        for field, shape in shapes.items():
+            if layer.tensor_shapes.get(f"{kind}_{field}") != shape:
+                raise ValueError(f"TP1 packed-zN source header mismatch: {kind}.{field}.")
+        return shapes
     if getattr(layer, "tp_size", 1) == 2:
         # These are COMPUTE shapes, not variable per-expert on-disk K256
         # codebook populations. Two complete K1024 slots are mandatory in

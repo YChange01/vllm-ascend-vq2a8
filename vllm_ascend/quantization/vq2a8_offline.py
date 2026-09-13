@@ -20,7 +20,10 @@ from vllm_ascend.quantization.vq2a8_execution import (
     packed_cache_plan,
 )
 from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
+from vllm_ascend.quantization.vq2a8_repack import VQ2_DIRECT_TP1_FORMAT
 from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
+from vllm_ascend.quantization.vq2a8_tp1_zn_runtime import artifact_format, open_vq2a8_tp1_zn_artifact
+from vllm_ascend.quantization.vq2a8_zn_contract import VQ2_TP1_ZN_FORMAT
 
 OFFLINE_CONTEXT_LIMIT = 32
 OFFLINE_NEW_TOKENS = 4
@@ -409,12 +412,22 @@ class OfflineMoEOwner:
                 Path(options["artifact"]), model_root / "config.json", tp_rank=self.tp_rank, verify_tensor_hashes=True
             )
         else:
-            self.artifact = open_vq2a8_tp1_artifact(
-                Path(options["artifact"]),
-                model_root / "config.json",
-                require_complete=True,
-                require_reference_identity=True,
-            )
+            format_name = artifact_format(options["artifact"])
+            if format_name == VQ2_TP1_ZN_FORMAT:
+                if options.get("execution_policy") != "ascendc_v3":
+                    raise ValueError("TP1 packed-zN requires execution_policy=ascendc_v3; no format fallback.")
+                self.artifact = open_vq2a8_tp1_zn_artifact(
+                    options["artifact"], model_root / "config.json", verify_tensor_hashes=True
+                )
+            elif format_name == VQ2_DIRECT_TP1_FORMAT:
+                self.artifact = open_vq2a8_tp1_artifact(
+                    Path(options["artifact"]),
+                    model_root / "config.json",
+                    require_complete=True,
+                    require_reference_identity=True,
+                )
+            else:
+                raise ValueError(f"Unsupported artifact format for TP1: {format_name!r}; no format fallback.")
         self.inventory = audit_offline_root(model_root)
         self.options = options
         self.device = device
@@ -443,6 +456,10 @@ class OfflineMoEOwner:
                     from vllm_ascend.quantization.vq2a8_execution_tp2 import AscendCV3VQ2TP2MoE
 
                     runtime_classes["ascendc_v3"] = AscendCV3VQ2TP2MoE
+                elif getattr(self.artifact, "manifest", {}).get("format") == VQ2_TP1_ZN_FORMAT:
+                    from vllm_ascend.quantization.vq2a8_execution_tp1_zn import AscendCV3VQ2TP1ZNMoE
+
+                    runtime_classes["ascendc_v3"] = AscendCV3VQ2TP1ZNMoE
                 else:
                     from vllm_ascend.quantization.vq2a8_execution_v3 import AscendCV3VQ2TP1MoE
 

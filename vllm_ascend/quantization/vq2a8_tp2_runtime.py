@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-only, rank-bound reader for the frozen TP2 packed-zN artifact.
+"""CPU-only TP2 reader and shared strict TP1/TP2 packed-zN storage checks.
 
 Loading this format does not upgrade the exporter's historical runtime/device
-validation claims. Metadata/headers cover both ranks; optional tensor SHA-256
+validation claims. Metadata/headers cover every rank; optional tensor SHA-256
 checks cover this reader's rank. Value checks precede every device transfer.
 """
 
@@ -24,8 +24,15 @@ import torch
 from safetensors import safe_open
 
 from .vq2a8_artifact import VQ2ModelLayout, load_model_layout
+from .vq2a8_zn_contract import (
+    VQ2_TP2_ZN_FORMAT as VQ2_TP2_ZN_FORMAT,
+)
+from .vq2a8_zn_contract import (
+    activation_semantics,
+    communication_contract,
+    zn_format,
+)
 
-VQ2_TP2_ZN_FORMAT = "vq2a8_zn_tp2_v1"
 VQ2_TP2_FIELDS = ("packed_zn", "pair_lut", "activation_order", "weight_scale", "weight_bias", "rht_sign")
 _DTYPES = {
     "packed_zn": "U8",
@@ -39,19 +46,6 @@ _TORCH_DTYPES = {"U8": torch.uint8, "I64": torch.int64, "F32": torch.float32, "I
 _DTYPE_BYTES = {"U8": 1, "I64": 8, "F32": 4, "I8": 1}
 _KINDS = ("gate_up", "down")
 _MAX_HEADER_BYTES = 64 * 2**20
-_PREPARATION_ORDER = [
-    "physical_rht128",
-    "physical_bias_gemv_and_weight_scale",
-    "rank_local_dynamic_fp8",
-    "byte_gather_activation_order",
-]
-_COMMUNICATION = {
-    "gate_up": "column_parallel_separate_gate_and_up_slices_concatenated_per_rank",
-    "down": "row_parallel_contiguous_physical_input_slice_sum_partials_across_tp_ranks",
-    "activation_quantization": "per_rank_per_row_amax_after_local_RHT128_and_weight_scale",
-    "bias_correction": "local_input_contribution_only_before_down_partial_sum",
-    "routing": "same_token_expert_assignments_on_both_ranks_not_expert_parallel",
-}
 
 
 def _same(actual: Any, expected: Any) -> bool:
@@ -381,7 +375,9 @@ class VQ2TP2Artifact:
         ]
 
 
-def _matrix(entry: Any, layout: VQ2ModelLayout, layer: int, rank: int, expert_ids: tuple[int, ...]) -> VQ2TP2MatrixSpec:
+def _matrix(
+    entry: Any, layout: VQ2ModelLayout, layer: int, rank: int, expert_ids: tuple[int, ...], *, tp_size: int = 2
+) -> VQ2TP2MatrixSpec:
     if not isinstance(entry, dict):
         raise ValueError("TP2 matrix metadata must be an object.")
     expert = _integer(entry.get("expert_id"), "matrix.expert_id")
@@ -395,8 +391,8 @@ def _matrix(entry: Any, layout: VQ2ModelLayout, layer: int, rank: int, expert_id
         else (layout.hidden_size, layout.moe_intermediate_size)
     )
     n, source_k = canonical
-    logical = (n // 2, source_k) if kind == "gate_up" else (n, source_k // 2)
-    width = n // 4
+    logical = (n // tp_size, source_k) if kind == "gate_up" else (n, source_k // tp_size)
+    width = n // (2 * tp_size)
     output_ranges = (
         [[rank * width, (rank + 1) * width], [n // 2 + rank * width, n // 2 + (rank + 1) * width]]
         if kind == "gate_up"
@@ -405,8 +401,8 @@ def _matrix(entry: Any, layout: VQ2ModelLayout, layer: int, rank: int, expert_id
     input_range = [0, source_k] if kind == "gate_up" else [rank * logical[1], (rank + 1) * logical[1]]
     for key, expected in {
         "name": name,
-        "format": VQ2_TP2_ZN_FORMAT,
-        "tp_size": 2,
+        "format": zn_format(tp_size),
+        "tp_size": tp_size,
         "tp_rank": rank,
         "canonical_shape": list(canonical),
         "logical_shape": list(logical),
@@ -427,21 +423,15 @@ def _matrix(entry: Any, layout: VQ2ModelLayout, layer: int, rank: int, expert_id
         raise ValueError(f"{name}: invalid tile_valid_counts.")
     if packed_shape != (logical[0], len(tiles) * 256) or packed_shape[1] < logical[1] or packed_shape[1] > source_k:
         raise ValueError(f"{name}: invalid packed_shape.")
-    if kind == "gate_up" and (tiles != tuple(range(source_k // 256)) or any(count != 256 for count in counts)):
-        raise ValueError(f"{name}: gate/up must retain every source K256 block.")
+    if (kind == "gate_up" or tp_size == 1) and (
+        tiles != tuple(range(source_k // 256)) or any(count != 256 for count in counts)
+    ):
+        raise ValueError(f"{name}: full-K projections must retain every source K256 block without padding.")
     _equal(entry.get("padding_columns"), packed_shape[1] - logical[1], f"{name}.padding_columns")
     semantics = entry.get("activation_semantics")
     if not isinstance(semantics, dict):
         raise ValueError(f"{name}: missing activation semantics.")
-    for key, expected in {
-        "physical_input": "rank-local logical input followed by padding_columns zeros",
-        "preparation_order": _PREPARATION_ORDER,
-        "dummy_metadata": {"weight_scale": 0.0, "weight_bias": 0.0, "rht_sign": 1},
-        "quantization": "per-token per-expert TP-rank-local E4M3FN amax/448 with min_scale=1e-12",
-        "bias_correction": "rank-local rotated-input dot weight_bias, added once to that rank projection",
-        "down_aggregation": "sum rank-local down projection partials; never duplicate a full-K bias",
-        "tp1_bitwise_equivalent": False,
-    }.items():
+    for key, expected in activation_semantics(tp_size).items():
         _equal(semantics.get(key), expected, f"{name}.activation_semantics.{key}")
     spec = VQ2TP2MatrixSpec(name, layer, expert, kind, rank, canonical, logical, packed_shape, tiles, counts, entry)
     shapes = {field: list(shape) for field, shape in spec.tensor_shapes.items()}
@@ -465,15 +455,32 @@ def open_vq2a8_tp2_artifact(
     """
     if type(tp_rank) is not int or tp_rank not in (0, 1) or type(verify_tensor_hashes) is not bool:
         raise ValueError("TP2 rank must be integer 0/1 and verify_tensor_hashes must be bool.")
+    return _open_vq2a8_zn_artifact(
+        artifact_path, model_config_path, tp_size=2, tp_rank=tp_rank, verify_tensor_hashes=verify_tensor_hashes
+    )
+
+
+def _open_vq2a8_zn_artifact(
+    artifact_path: str | Path,
+    model_config_path: str | Path,
+    *,
+    tp_size: int,
+    tp_rank: int,
+    verify_tensor_hashes: bool,
+) -> VQ2TP2Artifact:
+    """Shared storage checks; public readers fix TP size and cannot cross-load."""
+    format_name = zn_format(tp_size)
+    if type(tp_rank) is not int or tp_rank not in range(tp_size) or type(verify_tensor_hashes) is not bool:
+        raise ValueError("Packed-zN rank/verification arguments are invalid.")
     root, config = _no_links(Path(artifact_path)), _no_links(Path(model_config_path))
     if not root.is_dir() or not config.is_file():
         raise ValueError("TP2 artifact/config must be a directory/regular file.")
     manifest = _json(_file(root, "manifest.json"))
     for key, expected in {
         "schema_version": 1,
-        "format": VQ2_TP2_ZN_FORMAT,
-        "tp_size": 2,
-        "tp_ranks": [0, 1],
+        "format": format_name,
+        "tp_size": tp_size,
+        "tp_ranks": list(range(tp_size)),
         "complete": True,
         "dry_run": False,
         "runtime_compatible": False,
@@ -481,7 +488,7 @@ def open_vq2a8_tp2_artifact(
         "tp1_a8_bitwise_equivalent": False,
     }.items():
         _equal(manifest.get(key), expected, f"manifest.{key}")
-    _equal(manifest.get("communication"), _COMMUNICATION, "manifest.communication")
+    _equal(manifest.get("communication"), communication_contract(tp_size), "manifest.communication")
     layout = load_model_layout(config)
     if layout.hidden_size % 256 or layout.moe_intermediate_size % 256:
         raise ValueError("TP2 model geometry must support K256 and complete local RHT128 blocks.")
@@ -496,7 +503,9 @@ def open_vq2a8_tp2_artifact(
     entries = manifest.get("shards")
     if not isinstance(entries, list) or not entries:
         raise ValueError("TP2 manifest must contain shards.")
-    grouped: dict[tuple[int, int], list[VQ2TP2Shard]] = {(layer, rank): [] for layer in selected for rank in (0, 1)}
+    grouped: dict[tuple[int, int], list[VQ2TP2Shard]] = {
+        (layer, rank): [] for layer in selected for rank in range(tp_size)
+    }
     used_paths: set[Path] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -508,7 +517,7 @@ def open_vq2a8_tp2_artifact(
         experts = _integers(entry.get("expert_ids"), "shard.expert_ids")
         if not experts or experts != tuple(range(experts[0], experts[-1] + 1)):
             raise ValueError("TP2 shard expert_ids must be sorted, contiguous and unique.")
-        stem = f"tp2/rank{rank}/layer_{layer:03d}/experts_{experts[0]:04d}_{experts[-1] + 1:04d}"
+        stem = f"tp{tp_size}/rank{rank}/layer_{layer:03d}/experts_{experts[0]:04d}_{experts[-1] + 1:04d}"
         tensor_path, metadata_path = _file(root, entry.get("file")), _file(root, entry.get("metadata_file"))
         _equal(entry["file"], stem + ".safetensors", "shard.file")
         _equal(entry["metadata_file"], stem + ".json", "shard.metadata_file")
@@ -526,7 +535,7 @@ def open_vq2a8_tp2_artifact(
             raise ValueError("TP2 shard must contain gate_up and down metadata for every expert.")
         specs = {}
         for matrix in matrices:
-            spec = _matrix(matrix, layout, layer, rank, experts)
+            spec = _matrix(matrix, layout, layer, rank, experts, tp_size=tp_size)
             key = (spec.expert_id, spec.kind)
             if key in specs:
                 raise ValueError("Duplicate TP2 matrix metadata.")
@@ -551,7 +560,7 @@ def open_vq2a8_tp2_artifact(
                 layer, rank, experts, tensor_path, metadata_path, tensor_sha, metadata_sha, payload_bytes, specs, before
             )
         )
-    rank_bytes = [0, 0]
+    rank_bytes = [0] * tp_size
     layers = {}
     for (layer, rank), shards in grouped.items():
         shards.sort(key=lambda shard: shard.expert_ids[0])
@@ -568,11 +577,11 @@ def open_vq2a8_tp2_artifact(
     for layer in selected:
         by_rank = [
             {expert: shard.specs[expert, "down"] for shard in grouped[layer, rank] for expert in shard.expert_ids}
-            for rank in (0, 1)
+            for rank in range(tp_size)
         ]
         for expert in layout.expected_expert_ids(layer):
             populations = [0] * (layout.moe_intermediate_size // 256)
-            for rank in (0, 1):
+            for rank in range(tp_size):
                 spec = by_rank[rank][expert]
                 for tile, count in zip(spec.lut_source_tile_ids, spec.tile_valid_counts):
                     populations[tile] += count

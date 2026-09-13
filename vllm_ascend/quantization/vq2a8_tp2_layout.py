@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Lossless CPU packing of canonical expert weights for a future TP2 runtime.
+"""Lossless CPU packing of canonical expert weights into TP1/TP2 packed-zN.
 
 Gate/up uses matching output-channel shards; down uses physical input-column
 shards. The latter generally split each source codebook's population, so each
 nonempty population is padded to K256 with *zero activation* columns. No dense
 weight is materialized, no codeword is fitted, and no FP8 byte is requantized.
+TP1 uses the identical byte layout without sharding or dummy K columns.
 
 This is an artifact contract, not a claim of current native/runtime support.
 In particular, down's rank-local dynamic A8 quantization differs from TP1's
@@ -21,8 +22,17 @@ import torch
 
 from .vq2a8_artifact import VQ2MatrixSpec, validate_matrix_payload
 from .vq2a8_repack import canonical_index_grid
+from .vq2a8_zn_contract import (
+    VQ2_TP2_ZN_FORMAT as VQ2_TP2_ZN_FORMAT,
+)
+from .vq2a8_zn_contract import (
+    activation_semantics,
+    zn_format,
+)
+from .vq2a8_zn_contract import (
+    communication_contract as communication_contract,
+)
 
-VQ2_TP2_ZN_FORMAT = "vq2a8_zn_tp2_v1"
 TP_SIZE = 2
 LUT_K = 256
 RHT_BLOCK_SIZE = 128
@@ -40,9 +50,15 @@ RESIDENT_FIELDS = (
 
 
 def validate_tp2_spec(spec: VQ2MatrixSpec) -> None:
+    """Backward-compatible TP2 geometry validation."""
+    validate_zn_spec(spec, TP_SIZE)
+
+
+def validate_zn_spec(spec: VQ2MatrixSpec, tp_size: int) -> None:
     """Validate shard geometry without reading or allocating weight tensors."""
+    zn_format(tp_size)
     if not isinstance(spec, VQ2MatrixSpec):
-        raise TypeError("TP2 packing requires a VQ2MatrixSpec.")
+        raise TypeError("Packed-zN packing requires a VQ2MatrixSpec.")
     for name in (
         "rows",
         "columns",
@@ -59,34 +75,34 @@ def validate_tp2_spec(spec: VQ2MatrixSpec) -> None:
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{spec.name}: {name} must be a positive integer.")
     if spec.kind not in ("gate_up", "down"):
-        raise ValueError(f"{spec.name}: unsupported TP2 matrix kind {spec.kind!r}.")
+        raise ValueError(f"{spec.name}: unsupported packed-zN matrix kind {spec.kind!r}.")
     if not all(value is True for value in (spec.enable_permutation, spec.enable_normalization, spec.enable_rht)):
-        raise ValueError(f"{spec.name}: TP2 packing requires permutation, normalization, and RHT.")
+        raise ValueError(f"{spec.name}: packed-zN packing requires permutation, normalization, and RHT.")
     if not isinstance(spec.norm_dimension, int) or isinstance(spec.norm_dimension, bool) or spec.norm_dimension != 0:
-        raise ValueError(f"{spec.name}: TP2 packing requires norm_dimension=0.")
+        raise ValueError(f"{spec.name}: packed-zN packing requires norm_dimension=0.")
     if spec.group_size != LUT_K or spec.row_group_size != ZN_N0 or spec.rht_block_size != RHT_BLOCK_SIZE:
         raise ValueError(f"{spec.name}: require group_size=256, row_group_size=32, and RHT block size=128.")
     if spec.rows % ZN_N0 or spec.columns % LUT_K:
         raise ValueError(f"{spec.name}: canonical N must align to 32 and K to 256.")
     if spec.rht_true_columns != spec.columns or spec.original_shape != (spec.rows, spec.columns):
-        raise ValueError(f"{spec.name}: TP2 packing requires unpadded canonical true K equal to K.")
+        raise ValueError(f"{spec.name}: packed-zN packing requires unpadded canonical true K equal to K.")
     if spec.row_tiles != spec.rows // ZN_N0 or spec.column_tiles != spec.columns // LUT_K:
         raise ValueError(f"{spec.name}: canonical tile counts disagree with N/K.")
     if spec.num_elements != spec.rows * spec.columns or spec.num_vectors != spec.rows * spec.columns // VECTOR_LENGTH:
         raise ValueError(f"{spec.name}: canonical element/vector counts disagree with N/K.")
-    if spec.kind == "gate_up" and spec.rows % (VECTOR_LENGTH * TP_SIZE * ZN_N0):
-        raise ValueError(f"{spec.name}: each TP2 gate and up slice must contain complete N32 output tiles.")
-    if spec.kind == "down" and (spec.columns % TP_SIZE or (spec.columns // TP_SIZE) % RHT_BLOCK_SIZE):
-        raise ValueError(f"{spec.name}: each TP2 down input slice must contain complete RHT128 blocks.")
+    if spec.kind == "gate_up" and spec.rows % (VECTOR_LENGTH * tp_size * ZN_N0):
+        raise ValueError(f"{spec.name}: each TP{tp_size} gate and up slice must contain complete N32 output tiles.")
+    if spec.kind == "down" and (spec.columns % tp_size or (spec.columns // tp_size) % RHT_BLOCK_SIZE):
+        raise ValueError(f"{spec.name}: each TP{tp_size} down input slice must contain complete RHT128 blocks.")
 
 
-def _shard_ranges(spec: VQ2MatrixSpec, rank: int) -> tuple[list[list[int]], list[int]]:
+def _shard_ranges(spec: VQ2MatrixSpec, rank: int, tp_size: int = TP_SIZE) -> tuple[list[list[int]], list[int]]:
     if spec.kind == "gate_up":
         intermediate = spec.rows // VECTOR_LENGTH
-        width = intermediate // TP_SIZE
+        width = intermediate // tp_size
         start = rank * width
         return [[start, start + width], [intermediate + start, intermediate + start + width]], [0, spec.columns]
-    width = spec.columns // TP_SIZE
+    width = spec.columns // tp_size
     return [[0, spec.rows]], [rank * width, (rank + 1) * width]
 
 
@@ -106,7 +122,7 @@ def _check_packed_mapping(
     """Independently unpack bytes and check their canonical coordinates."""
     packed_k = order.size
     if not np.array_equal(np.sort(order), np.arange(packed_k, dtype=np.int64)):
-        raise RuntimeError("Internal TP2 activation order is not a bijection over padded K.")
+        raise RuntimeError("Internal packed-zN activation order is not a bijection over padded K.")
     pairs = np.empty((*packed.shape[:-1], packed.shape[-1] * VECTOR_LENGTH), dtype=np.uint8)
     pairs[..., 0::2] = packed & np.uint8(15)
     pairs[..., 1::2] = packed >> np.uint8(4)
@@ -114,35 +130,42 @@ def _check_packed_mapping(
     real = order < logical_k
     expected = canonical[np.ix_(output_pairs, source_columns[order[real]])]
     if not np.array_equal(restored[:, real], expected) or np.any(restored[:, ~real] != 0):
-        raise RuntimeError("Internal TP2 packed-code/canonical-coordinate round trip failed.")
+        raise RuntimeError("Internal packed-zN packed-code/canonical-coordinate round trip failed.")
     if not np.all(tile_ids[order].reshape(-1, LUT_K) == source_books[:, None]):
-        raise RuntimeError("Internal TP2 K256 block contains mixed source codebooks.")
+        raise RuntimeError("Internal packed-zN K256 block contains mixed source codebooks.")
     expected_lut = raw_books[source_books][:, row_tiles].reshape(pair_lut.shape)
     if not np.array_equal(pair_lut, expected_lut):
-        raise RuntimeError("Internal TP2 pair LUT does not preserve canonical FP8 bytes.")
+        raise RuntimeError("Internal packed-zN pair LUT does not preserve canonical FP8 bytes.")
 
 
 def repack_matrix_tp2(
     tensors: dict[str, torch.Tensor], spec: VQ2MatrixSpec, rank: int
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    """Pack one canonical matrix for rank 0/1, retaining all logical weights.
+    """Backward-compatible TP2 packing, including identical metadata semantics."""
+    return repack_matrix_zn(tensors, spec, rank=rank, tp_size=TP_SIZE)
+
+
+def repack_matrix_zn(
+    tensors: dict[str, torch.Tensor], spec: VQ2MatrixSpec, rank: int = 0, *, tp_size: int = 1
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Pack a full TP1 matrix or TP2 shard without requantizing weight bytes.
 
     ``activation_order[j]`` maps a packed K coordinate to a rank-local physical
     coordinate. Coordinates below ``logical_shape[1]`` are real; all remaining
     coordinates are appended zero inputs. RHT/normalization/A8 happen BEFORE
     this byte-preserving gather, never in regrouped codebook order.
     """
-    validate_tp2_spec(spec)
-    if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < TP_SIZE:
-        raise ValueError("TP2 rank must be integer 0 or 1.")
+    validate_zn_spec(spec, tp_size)
+    if not isinstance(rank, int) or isinstance(rank, bool) or not 0 <= rank < tp_size:
+        raise ValueError(f"TP{tp_size} rank must be an integer in [0, {tp_size}).")
     if not isinstance(tensors, dict):
-        raise TypeError("Canonical TP2 payload must be a dictionary of CPU tensors.")
+        raise TypeError("Canonical packed-zN payload must be a dictionary of CPU tensors.")
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu" or not tensor.is_contiguous():
-            raise ValueError(f"{spec.name}.{name}: TP2 packing requires a contiguous CPU tensor.")
+            raise ValueError(f"{spec.name}.{name}: packed-zN packing requires a contiguous CPU tensor.")
     validate_matrix_payload(tensors, spec)
 
-    output_ranges, input_range = _shard_ranges(spec, rank)
+    output_ranges, input_range = _shard_ranges(spec, rank, tp_size)
     output_pairs = np.concatenate(
         [np.arange(start // VECTOR_LENGTH, end // VECTOR_LENGTH) for start, end in output_ranges]
     )
@@ -156,11 +179,11 @@ def repack_matrix_tp2(
     local_tile_ids = source_columns // LUT_K
     source_books, valid_counts = np.unique(local_tile_ids, return_counts=True)
     if np.any(valid_counts > LUT_K):
-        raise RuntimeError("Internal TP2 shard exceeds its canonical codebook population.")
+        raise RuntimeError("Internal packed-zN shard exceeds its canonical codebook population.")
     packed_k = int(source_books.size) * LUT_K
     padding_columns = packed_k - logical_k
     if padding_columns < 0 or packed_k % RHT_BLOCK_SIZE:
-        raise RuntimeError("Internal TP2 padded K geometry is invalid.")
+        raise RuntimeError("Internal packed-zN padded K geometry is invalid.")
 
     # Metadata and real codes stay in LOCAL PHYSICAL order. Dummy coordinates
     # form whole appended RHT128 blocks, so they cannot mix with real inputs.
@@ -181,7 +204,7 @@ def repack_matrix_tp2(
         consumed += count
         dummy += pad
     if consumed != logical_k or dummy != packed_k:
-        raise RuntimeError("Internal TP2 padding did not cover every local/dummy column.")
+        raise RuntimeError("Internal packed-zN padding did not cover every local/dummy column.")
 
     ordered_codes = extended_codes[:, order]
     zn_pairs = ordered_codes.reshape(logical_n // ZN_N0, ZN_N0 // VECTOR_LENGTH, packed_k // ZN_K0, ZN_K0)
@@ -216,8 +239,8 @@ def repack_matrix_tp2(
         payload[name] = values
 
     metadata: dict[str, Any] = {
-        "format": VQ2_TP2_ZN_FORMAT,
-        "tp_size": TP_SIZE,
+        "format": zn_format(tp_size),
+        "tp_size": tp_size,
         "tp_rank": rank,
         "kind": spec.kind,
         "canonical_shape": [spec.rows, spec.columns],
@@ -232,28 +255,15 @@ def repack_matrix_tp2(
         "tensor_shapes": {name: list(tensor.shape) for name, tensor in payload.items()},
         "rht_block_size": RHT_BLOCK_SIZE,
         "rht_true_columns": logical_k,
-        "activation_semantics": {
-            "physical_input": "rank-local logical input followed by padding_columns zeros",
-            "dummy_metadata": {"weight_scale": 0.0, "weight_bias": 0.0, "rht_sign": 1},
-            "preparation_order": [
-                "physical_rht128",
-                "physical_bias_gemv_and_weight_scale",
-                "rank_local_dynamic_fp8",
-                "byte_gather_activation_order",
-            ],
-            "quantization": "per-token per-expert TP-rank-local E4M3FN amax/448 with min_scale=1e-12",
-            "bias_correction": "rank-local rotated-input dot weight_bias, added once to that rank projection",
-            "down_aggregation": "sum rank-local down projection partials; never duplicate a full-K bias",
-            "tp1_bitwise_equivalent": False,
-            "floating_point_order": (
-                "stable codebook regrouping changes K reduction order; TP2 changes A8 scale/reduction scope"
-            ),
-        },
+        "activation_semantics": activation_semantics(tp_size),
         "validation": {"code_roundtrip_exact": True, "mapping_exact": True, "codebook_bytes_exact": True},
         "runtime_supported": False,
         "runtime_requirement": (
             "Requires a TP2 artifact loader, local-A8 preparation and TP collectives; "
             "current v3 runtime/native shape contract is TP1-only."
+            if tp_size == 2
+            else "Requires a TP1 packed-zN loader, full-K A8 preparation and byte gather; "
+            "device validation is separate."
         ),
     }
     return payload, metadata

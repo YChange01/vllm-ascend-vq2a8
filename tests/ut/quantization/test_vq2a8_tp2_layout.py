@@ -21,8 +21,7 @@ FIELD_DTYPES = {
 }
 
 
-def _canonical(kind="down", k=512, *, identity_perm=False):
-    n = 512
+def _canonical(kind="down", k=512, *, identity_perm=False, n=512):
     rng = np.random.default_rng(1901 + k)
     spec = VQ2MatrixSpec(
         name=f"3.mlp.experts.7.{kind}",
