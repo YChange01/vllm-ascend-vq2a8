@@ -133,7 +133,7 @@ def deadline(seconds, rank):
 
 @contextmanager
 def tp_environment(launch, timeout_s, *, config_module, parallel_state):
-    """Exact vLLM 0.26 API; model_config=None avoids model/download creation."""
+    """Initialize vLLM 0.26 TP without constructing or downloading a model."""
     parallel = config_module.ParallelConfig(
         tensor_parallel_size=2,
         pipeline_parallel_size=1,
@@ -143,7 +143,10 @@ def tp_environment(launch, timeout_s, *, config_module, parallel_state):
         disable_custom_all_reduce=True,
         rank=launch["rank"],
     )
-    config = config_module.VllmConfig(model_config=None, parallel_config=parallel)
+    # vLLM 0.26 intentionally leaves model_config's default None unvalidated.
+    # Passing None explicitly fails Pydantic's non-Optional ModelConfig field;
+    # constructing ModelConfig() instead can trigger a model config download.
+    config = config_module.VllmConfig(parallel_config=parallel)
     with config_module.set_current_vllm_config(config):
         try:
             parallel_state.init_distributed_environment(

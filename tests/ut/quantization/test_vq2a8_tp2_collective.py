@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from pydantic import ConfigDict, ValidationError
+from pydantic.dataclasses import dataclass
 
 from tools import validate_vq2a8_tp2_collective as tool
 
@@ -111,12 +113,13 @@ def fake_distributed(events, *, fail=False):
         return SimpleNamespace(**kwargs)
 
     def vllm_config(**kwargs):
-        assert kwargs["model_config"] is None
+        assert "model_config" not in kwargs
         events.append(("vllm_config", kwargs))
-        return SimpleNamespace(**kwargs)
+        return SimpleNamespace(model_config=None, **kwargs)
 
     @contextmanager
     def current(config):
+        assert config.model_config is None
         active.append(config)
         events.append(("enter", None))
         try:
@@ -163,6 +166,7 @@ def test_tp2_collective_uses_exact_v026_initialization_and_cleanup_contract(fail
         with tool.tp_environment(launch, 23, config_module=config, parallel_state=parallel) as group:
             assert group is expected_group
     values = dict(events)
+    assert set(values["vllm_config"]) == {"parallel_config"}
     assert values["init"] == {
         "world_size": 2,
         "rank": 1,
@@ -179,6 +183,43 @@ def test_tp2_collective_uses_exact_v026_initialization_and_cleanup_contract(fail
     assert values["parallel_config"]["distributed_timeout_seconds"] == 23
     assert values["parallel_config"]["cpu_distributed_timeout_seconds"] == 23
     assert values["parallel_config"]["distributed_executor_backend"] == "external_launcher"
+    assert [event for event, _ in events][-3:] == ["destroy_model", "destroy_world", "exit"]
+
+
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("fail", [False, True])
+def test_tp2_collective_pydantic_model_default_without_model_loading(rank, fail):
+    # Reproduce vLLM 0.26's non-Optional field and unvalidated default with
+    # real Pydantic validation, without importing vLLM or initializing an NPU.
+    @dataclass
+    class ModelConfig:
+        def __post_init__(self):
+            raise AssertionError("The communication smoke must not construct/download a model")
+
+    @dataclass(config=ConfigDict(extra="forbid"))
+    class VllmConfig:
+        model_config: ModelConfig = None
+        parallel_config: object = None
+
+    with pytest.raises(ValidationError) as exc:
+        VllmConfig(model_config=None)
+    assert exc.value.errors()[0]["type"] == "dataclass_type"
+    assert exc.value.errors()[0]["loc"] == ("model_config",)
+
+    events = []
+    config, parallel, expected_group = fake_distributed(events, fail=fail)
+    config.VllmConfig = VllmConfig
+    launch = tool.launch_environment(launch_env(rank))
+    if fail:
+        with (
+            pytest.raises(RuntimeError, match="injected init"),
+            tool.tp_environment(launch, 23, config_module=config, parallel_state=parallel),
+        ):
+            pytest.fail("Initialization failed, so no TP group can be yielded")
+    else:
+        with tool.tp_environment(launch, 23, config_module=config, parallel_state=parallel) as group:
+            assert group is expected_group
+    assert dict(events)["init"]["rank"] == rank
     assert [event for event, _ in events][-3:] == ["destroy_model", "destroy_world", "exit"]
 
 
