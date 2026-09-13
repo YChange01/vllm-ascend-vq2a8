@@ -9,7 +9,7 @@ import math
 import numpy as np
 import torch
 
-from vllm_ascend.quantization.vq2a8_artifact import (
+from .vq2a8_artifact import (
     VQ2_CODEBOOK_SIZE,
     VQ2_INDEX_BITS,
     VQ2_INDICES_PER_WORD,
