@@ -2,6 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Diagnostic only: no model, device reset, package install or system configuration writes.
 set -o pipefail
+
+usage() {
+    printf '%s\n' \
+        'Usage: bash tools/vq2_tp2_diagnose.sh [--allow-busy]' \
+        '  --allow-busy  Run tiny communication checks on occupied physical NPU 0,1.' \
+        '                May compete for HBM/communication resources and affect existing jobs.' \
+        '                Does not bypass failed/unknown device snapshots; not a performance test.' \
+        '  -h, --help    Show this help without collecting diagnostics or starting tests.' \
+        'Default: skip communication tests unless both physical NPU 0,1 are reported idle.'
+}
+
+VQ2_ALLOW_BUSY=0
+while (($#)); do
+    case "$1" in
+        --allow-busy) VQ2_ALLOW_BUSY=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'ERROR: unknown argument: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+readonly VQ2_ALLOW_BUSY
+
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 command -v timeout >/dev/null || { echo 'ERROR: timeout command missing'; exit 1; }
 command -v python >/dev/null || exit 1
@@ -25,29 +47,55 @@ check() {
 }
 
 idle() {
-    timeout -k 5s 20s npu-smi info > "$VQ2_DIAG_DIR/$1-idle.log" 2>&1 || return 1
+    timeout -k 5s 20s npu-smi info > "$VQ2_DIAG_DIR/$1-idle.log" 2>&1 || {
+        echo "SKIP: NPU snapshot query failed; LOG=$VQ2_DIAG_DIR/$1-idle.log"
+        return 2
+    }
     python - "$VQ2_DIAG_DIR/$1-idle.log" <<'PY'
 import re, sys
 from pathlib import Path
-text = Path(sys.argv[1]).read_text(errors="replace")
+try:
+    text = Path(sys.argv[1]).read_text(errors="replace")
+except OSError as error:
+    print(f"SKIP: cannot read NPU snapshot: {error}")
+    sys.exit(2)
 lines = text.splitlines()
 start = next((i for i, s in enumerate(lines) if "Process id" in s and "NPU ID" in s), None)
 if start is None:
     print("SKIP: cannot recognize NPU process table")
-    sys.exit(1)
+    sys.exit(2)
 table = "\n".join(lines[start:])
 empty = {int(x) for x in re.findall(r"No running processes found in NPU\s+(\d+)\s*\|", table)}
 busy = {int(x) for x in re.findall(r"(?m)^\s*\|\s*(\d+)\s*\|\s*\d+\s*\|", table)}
-safe = {0, 1} <= empty and not {0, 1} & busy
-print("IDLE_SNAPSHOT:", "0,1 clear; not an exclusive reservation" if safe else "busy/unknown: skip test")
-sys.exit(0 if safe else 1)
+targets = {0, 1}
+if not targets <= empty | busy or targets & empty & busy:
+    print("IDLE_SNAPSHOT: unknown or contradictory device state; skip test")
+    sys.exit(2)
+if targets & busy:
+    print("IDLE_SNAPSHOT: occupied physical NPUs=" + ",".join(map(str, sorted(targets & busy))))
+    # Distinct from Python's ordinary error exit code: only this may be overridden.
+    sys.exit(10)
+print("IDLE_SNAPSHOT: 0,1 clear; not an exclusive reservation")
+sys.exit(0)
 PY
 }
 
 run_test() {
-    local label=$1 pid rc
+    local label=$1 pid rc isolation=IDLE_SNAPSHOT
     shift
-    idle "$label" || { echo "$label=SKIPPED_BUSY_OR_UNKNOWN"; return; }
+    idle "$label"
+    rc=$?
+    if ((rc != 0)); then
+        if ((rc == 10 && VQ2_ALLOW_BUSY == 1)); then
+            isolation=SHARED_DEVICE
+            echo "WARNING: --allow-busy permits $label on occupied NPU 0,1; existing jobs may be affected."
+            echo "WARNING: NPU/HCCL runtime memory exceeds the tiny tensor size; resource contention can cause failure."
+        else
+            echo "$label=SKIPPED_BUSY_OR_UNKNOWN SNAPSHOT_EXIT=$rc ALLOW_BUSY=$VQ2_ALLOW_BUSY"
+            return
+        fi
+    fi
+    echo "TEST_ISOLATION=$isolation TEST=$label TIMING_VALID=False"
     printf '\n===== %s: only physical NPU 0,1; timeout 180s =====\n' "$label"
     timeout -k 10s 180s env ASCEND_RT_VISIBLE_DEVICES=0,1 ASCEND_LAUNCH_BLOCKING=1 \
         ASCEND_SLOG_PRINT_TO_STDOUT=1 ASCEND_GLOBAL_LOG_LEVEL=1 "$@" \
@@ -73,6 +121,11 @@ run_test() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+if ((VQ2_ALLOW_BUSY)); then
+    echo 'DIAG_POLICY=ALLOW_BUSY PHYSICAL_NPUS=0,1 TIMING_VALID=False'
+else
+    echo 'DIAG_POLICY=REQUIRE_IDLE PHYSICAL_NPUS=0,1 TIMING_VALID=False'
+fi
 check system uname -a
 check container-security grep -E '^(Cap|NoNewPrivs|Seccomp)' /proc/self/status
 check packages python -c 'from importlib.metadata import version; print({p: version(p) for p in ("torch","torch-npu","vllm")})'
