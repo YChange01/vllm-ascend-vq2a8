@@ -216,6 +216,25 @@ python tools/benchmark_vq2a8_serving.py --max-tokens 32 --repeats 3
 改成 `--preparation fused` 测局部准备融合，TP2 的 `--decode-graph` 目前只允许 `none`。
 本入口仍限 TP2、B1、context ≤128，未开放 EP/PP/DP/CP、整模型图或 MTP。
 
+### 一键排查容器和 HCCL 通信
+
+无需模型、artifact 或编译库，在仓库根目录运行：
+
+```bash
+bash tools/vq2_tp2_diagnose.sh
+```
+
+脚本固定测试物理卡 0、1：先收集容器设备、UB 库、驱动、验签状态和环境，
+再分别启动原生 PyTorch HCCL 和 vLLM communication-only 测试。
+每次通信测试前都要求 `npu-smi` 明确显示两卡无进程；占用、查询失败或无法识别时跳过，
+环境检查仍继续。空闲检查只是快照，请确保测试期间不会有新任务占用这两张卡。
+
+每项检查有超时，通信测试每 5 秒打印等待状态，完成后打印阶段、首批错误和退出码。
+完整输出在新建的 `/tmp/vq2-tp2-diag.*` 目录，末尾 `UPLOAD=...tar.gz` 给出打包路径。
+脚本不安装软件、不修改验签或通信配置、不重置设备；中断时只终止本次启动的测试。
+缺少诊断工具或可选文件不单独构成通信故障结论；两个短测通过也不代表模型质量或 TPOT 达标。
+分享日志前检查其中的设备地址、环境路径等运维信息。
+
 ### Loader 与通信边界
 
 - 每 worker 绑定自己的 artifact rank，验证完整覆盖、config/metadata SHA、两个 rank

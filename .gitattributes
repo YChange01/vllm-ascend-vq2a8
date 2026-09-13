@@ -1,0 +1,2 @@
+# Preserve Bash continuations and embedded Python when checked out on Windows.
+tools/vq2_tp2_diagnose.sh text eol=lf
