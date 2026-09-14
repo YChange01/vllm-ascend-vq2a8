@@ -4,6 +4,7 @@
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -320,6 +321,60 @@ def test_resident_callback_uses_opapi_release_queue_without_dropping_tensor_owne
     assert "SetCustomHandler" not in body and "command.Run(" not in body
     assert "RecordResidentInputs(" in body
     assert "return 0;" in body
+
+
+@pytest.mark.parametrize(
+    ("signature", "op_name"),
+    [
+        ("at::Tensor Run(", "Vq2a8AscendCProjection"),
+        ("std::vector<at::Tensor> GroupedProjection(", "Vq2a8AscendCGroupedProjection"),
+    ],
+)
+def test_v1_callbacks_share_resident_opapi_release_queue_without_forced_sync(signature, op_name):
+    # A ResidentBank-only migration leaves the old V1 reference/prefill callback
+    # in reusable producer slots. Mixing the paths must not restore that route.
+    # This checks source dispatch, not live mutex ownership or device completion.
+    source = (REPO / "csrc/vq2a8_ascendc/torch_binding.cpp").read_text()
+    body = cpp_function(source, signature)
+    normalized = " ".join(body.split())
+    assert body.count("at_npu::native::OpCommand::RunOpApi(") == 1
+    assert f'RunOpApi( "{op_name}",' in normalized
+    assert "}, false);" in normalized
+    assert "SetCustomHandler" not in body and "command.Run(" not in body
+    assert "getCurrentNPUStream().stream()" in body
+    assert "return 0;" in body and "return output;" in body
+    for forbidden in ("aclrtSynchronize", "synchronize(", ".cpu()", ".item("):
+        assert forbidden not in body
+
+
+def test_standalone_native_sources_have_no_legacy_tensor_callback_submission():
+    for path in (REPO / "csrc/vq2a8_ascendc").glob("*.cpp"):
+        source = re.sub(r"/\*.*?\*/|//[^\n]*", "", path.read_text(), flags=re.DOTALL)
+        assert not re.search(r"\b\w+\s*\.\s*(?:SetCustomHandler|Run)\s*\(", source), path.name
+
+
+def test_v1_opapi_migration_preserves_tensor_owners_and_original_launch_arguments():
+    source = (REPO / "csrc/vq2a8_ascendc/torch_binding.cpp").read_text()
+    run = " ".join(cpp_function(source, "at::Tensor Run(").split())
+    grouped = " ".join(cpp_function(source, "std::vector<at::Tensor> GroupedProjection(").split())
+    # The value capture retains actual tensors, including synthetic dense/scale/
+    # bias temporaries; replacing them with raw pointers would defeat ownership.
+    assert "[=]() -> int" in run
+    assert (
+        "Launch(stream, blocks, x.data_ptr(), scale.data_ptr(), bias.data_ptr(), "
+        "packed.defined() ? packed.data_ptr() : nullptr, book.defined() ? book.data_ptr() : nullptr, "
+        "ids.defined() ? ids.data_ptr() : nullptr, dense.defined() ? dense.data_ptr() : nullptr, "
+        "output.data_ptr(), x.size(0), n, x.size(1), tiles, mode);"
+    ) in run
+    assert "[stream, blocks, descriptors, jobs, groups, x, scale, bias, packed, book, ids, output]() -> int" in grouped
+    for owner in ("x", "scale", "bias", "packed", "book", "ids", "output"):
+        assert f"(void){owner};" in grouped
+    assert "auto descriptors = host.to(x[0].device(), at::kLong, false, true);" in grouped
+    assert "if constexpr (Pipeline)" in grouped
+    for launcher in ("LaunchGroupedPipeline", "LaunchGrouped"):
+        assert f"{launcher}(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);" in grouped
+    for name, variant in (("grouped_projection", "false"), ("grouped_projection_pipeline", "true")):
+        assert f'm.impl("{name}", &vq2a8_ascendc::GroupedProjection<{variant}>);' in source
 
 
 def test_resident_stream_ownership_records_all_payloads_only_at_construction():

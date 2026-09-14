@@ -23,7 +23,7 @@ import json
 import subprocess
 import tempfile
 import traceback
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,10 +40,12 @@ PAYLOAD_FIELDS = ("packed_indices", "codebooks", "codebook_tile_ids", "weight_sc
 VALID_ROUTES = ((0,), (3, 1), (0, 1, 2, 3, 1, 0), (3, 3, 3, 3, 3, 3), (2, 0, 3, 1, 2, 0))
 QUEUE_CAPACITY_REFERENCE = 4096
 QUEUE_CALLS_PER_ITERATION = 3  # select, project, ordinary matmul; excludes clones/checks.
+QUEUE_MIXED_CALLS_PER_ITERATION = 6  # Original three plus single/grouped/pipeline projection.
 QUEUE_MIN_ITERATIONS = QUEUE_CAPACITY_REFERENCE // QUEUE_CALLS_PER_ITERATION + 1
 QUEUE_DEFAULT_ITERATIONS = 2049
 QUEUE_MAX_ITERATIONS = 8192
 QUEUE_PROGRESS_INTERVAL = 256
+QUEUE_EARLY_PROGRESS_ITERATIONS = 8
 
 
 def parse_args(argv=None):
@@ -56,7 +58,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--queue-lifetime",
         action="store_true",
-        help="also stress asynchronous handler/input lifetime across task-queue slot reuse; no model loading",
+        help="also run resident-only then mixed V1/resident asynchronous lifetime pressure; no model loading",
     )
     parser.add_argument(
         "--queue-iterations",
@@ -101,11 +103,34 @@ def child_command(args):
     return command
 
 
+def queue_lifetime_phases(iterations):
+    resident_paths = ["resident_select", "resident_project", "matmul"]
+    return [
+        {
+            "stage": "queue_lifetime_wrap",
+            "iterations": iterations,
+            "minimum_operator_calls": iterations * QUEUE_CALLS_PER_ITERATION,
+            "operator_paths": resident_paths,
+            "grouped_descriptor_copy_is_blocking": False,
+        },
+        {
+            "stage": "queue_lifetime_mixed",
+            "iterations": iterations,
+            "minimum_operator_calls": iterations * QUEUE_MIXED_CALLS_PER_ITERATION,
+            "operator_paths": [*resident_paths, "projection", "grouped_projection", "grouped_projection_pipeline"],
+            "grouped_descriptor_copy_is_blocking": True,
+        },
+    ]
+
+
 def queue_lifetime_plan(args):
+    phases = queue_lifetime_phases(args.queue_iterations if args.queue_lifetime else 0)
     return {
         "enabled": args.queue_lifetime,
         "iterations": args.queue_iterations if args.queue_lifetime else 0,
-        "minimum_operator_calls": args.queue_iterations * QUEUE_CALLS_PER_ITERATION if args.queue_lifetime else 0,
+        "minimum_operator_calls": sum(phase["minimum_operator_calls"] for phase in phases),
+        "phases": phases,
+        "short_checks_and_pressure_share_process": True,
         "queue_capacity_reference": QUEUE_CAPACITY_REFERENCE,
         "runtime_queue_enabled_or_slots_measured": False,
         "requires_runtime_task_queue_enabled": True,
@@ -351,34 +376,119 @@ def run_native_contract_checks(device, *, bank_factory, projection, synchronize,
     return {"malformed_metadata_rejected": True, "other_stream_rejected": True, "owner_stream_reuse_exact": True}
 
 
-def _queue_lifetime_iteration(bank, template):
+def _queue_log_iteration(completed):
+    return completed <= QUEUE_EARLY_PROGRESS_ITERATIONS or completed % QUEUE_PROGRESS_INTERVAL == 0
+
+
+def _queue_step_recorder(phase, completed):
+    @contextmanager
+    def step(name):
+        # Unlike stage_recorder, these markers NEVER query a Tensor or fence.
+        fields = {"stage": phase, "iteration": completed, "step": name}
+        if _queue_log_iteration(completed):
+            emit(CASE, "QUEUE_STEP", phase="BEGIN", **fields)
+        try:
+            yield
+        except BaseException:
+            emit(CASE, "QUEUE_STEP", phase="FAIL", **fields)
+            raise
+        if _queue_log_iteration(completed):
+            emit(CASE, "QUEUE_STEP", phase="RETURN", **fields)
+
+    return step
+
+
+def _queue_lifetime_iteration(bank, template, *, step=nullcontext):
     """Drop Python input references before the next ordinary operator is queued."""
     import torch
 
-    ids = template["ids"].clone()
-    selected = bank.select(ids)
-    prepared = tuple(value.clone() for value in template["prepared"])
-    output, project_valid = bank.project(*prepared, ids)
+    with step("ids_clone"):
+        ids = template["ids"].clone()
+    with step("resident_select"):
+        selected = bank.select(ids)
+    with step("prepared_clone"):
+        prepared = tuple(value.clone() for value in template["prepared"])
+    with step("resident_project"):
+        output, project_valid = bank.project(*prepared, ids)
     # The native handler/allocator, not this Python loop, must keep these alive.
-    del prepared, ids
-    product = torch.matmul(template["left"].clone(), template["right"].clone())
-    valid = (project_valid == 1).all() & (selected[3] == 1).all()
-    valid = valid & torch.isfinite(output.float()).all()
-    valid = valid & (output.view(torch.uint8) == template["expected"].view(torch.uint8)).all()
-    valid = valid & (product == template["matmul_expected"]).all()
-    for actual, expected in zip(selected[:3], template["metadata"]):
-        valid = valid & (actual == expected).all()
+    with step("resident_release_inputs"):
+        del prepared, ids
+    with step("left_clone"):
+        left = template["left"].clone()
+    with step("right_clone"):
+        right = template["right"].clone()
+    with step("matmul"):
+        product = torch.matmul(left, right)
+    with step("matmul_release_inputs"):
+        del left, right
+    with step("resident_verify"):
+        valid = (project_valid == 1).all() & (selected[3] == 1).all()
+        valid = valid & torch.isfinite(output.float()).all()
+        valid = valid & (output.view(torch.uint8) == template["expected"].view(torch.uint8)).all()
+        valid = valid & (product == template["matmul_expected"]).all()
+        for actual, expected in zip(selected[:3], template["metadata"]):
+            valid = valid & (actual == expected).all()
+        del actual, expected
+    with step("resident_release_outputs"):
+        del selected, project_valid, product
     return output, valid
 
 
+def _queue_mixed_projection_checks(templates, projection, grouped_projection, grouped_projection_pipeline, step):
+    import torch
+
+    valid = None
+    for name, call in (
+        ("projection", projection),
+        ("grouped_projection", grouped_projection),
+        ("grouped_projection_pipeline", grouped_projection_pipeline),
+    ):
+        selected_templates = templates[:1] if name == "projection" else templates
+        with step(f"{name}_clone"):
+            jobs = [
+                (*[value.clone() for value in template["prepared"]], *template["projection_payload"])
+                for template in selected_templates
+            ]
+        with step(name):
+            outputs = [call(*jobs[0])] if name == "projection" else call(jobs)
+        with step(f"{name}_release_inputs"):
+            del jobs
+        with step(f"{name}_verify"):
+            if len(outputs) != len(selected_templates):
+                raise AssertionError(f"Queue lifetime {name} returned the wrong number of outputs")
+            for output, template in zip(outputs, selected_templates):
+                expected = template["expected"]
+                if output.shape != expected.shape or output.dtype != expected.dtype:
+                    raise AssertionError(f"Queue lifetime {name} output shape/dtype differs from V1 oracle")
+                current = torch.isfinite(output.float()).all()
+                current = current & (output.view(torch.uint8) == expected.view(torch.uint8)).all()
+                valid = current if valid is None else valid & current
+            del output, current
+        with step(f"{name}_release_outputs"):
+            del outputs
+    return valid
+
+
 def run_queue_lifetime_checks(
-    device, *, bank_factory, projection, synchronize, iterations=QUEUE_DEFAULT_ITERATIONS, stage=None, progress=None
+    device,
+    *,
+    bank_factory,
+    projection,
+    synchronize,
+    grouped_projection=None,
+    grouped_projection_pipeline=None,
+    iterations=QUEUE_DEFAULT_ITERATIONS,
+    stage=None,
+    progress=None,
+    mixed_progress=None,
 ):
     """Bounded lifetime regression; CPU injection tests orchestration, not an NPU.
 
-    Only setup/end stages explicitly synchronize. ResidentBank's stream check
-    can drain the host task queue; this is NOT a claim of zero host waiting.
-    Counts are operator-call lower bounds, not measured queue-slot indices.
+    Setup and the end of EACH phase explicitly synchronize. Keep the original
+    resident-only phase free of grouped descriptor copies, which are blocking
+    in the existing ABI. The additional mixed phase does not replace it.
+    ResidentBank's stream check can drain the host task queue. Counts are call
+    lower bounds, NOT measured queue-slot indices or a claim of zero waiting.
     """
     import torch
 
@@ -386,9 +496,14 @@ def run_queue_lifetime_checks(
 
     if type(iterations) is not int or not QUEUE_MIN_ITERATIONS <= iterations <= QUEUE_MAX_ITERATIONS:
         raise ValueError(f"Queue lifetime iterations must be {QUEUE_MIN_ITERATIONS}..{QUEUE_MAX_ITERATIONS}")
+    if not callable(grouped_projection) or not callable(grouped_projection_pipeline):
+        raise ValueError("Queue lifetime requires real grouped and grouped-pipeline entry points; no fallback")
     stage = stage or stage_recorder(CASE, synchronize)
     progress = progress or (
         lambda completed: emit(CASE, "QUEUE_PROGRESS", stage="queue_lifetime_wrap", iterations=completed)
+    )
+    mixed_progress = mixed_progress or (
+        lambda completed: emit(CASE, "QUEUE_PROGRESS", stage="queue_lifetime_mixed", iterations=completed)
     )
     with stage("queue_lifetime_setup"):
         reduction = REDUCTIONS[0]
@@ -409,6 +524,7 @@ def run_queue_lifetime_checks(
                 {
                     "ids": torch.tensor([expert], dtype=torch.int64, device=device),
                     "prepared": prepared,
+                    "projection_payload": tuple(payload[name] for name in PAYLOAD_FIELDS[:3]),
                     "expected": projection(*prepared, *(payload[name] for name in PAYLOAD_FIELDS[:3])),
                     "metadata": tuple(payload[name].unsqueeze(0) for name in PAYLOAD_FIELDS[3:]),
                     "left": left.to(device),
@@ -421,23 +537,42 @@ def run_queue_lifetime_checks(
     with stage("queue_lifetime_wrap"):
         for iteration in range(iterations):
             template = templates[iteration % len(templates)]
-            output, current_valid = _queue_lifetime_iteration(bank, template)
+            step = _queue_step_recorder("queue_lifetime_wrap", iteration + 1)
+            output, current_valid = _queue_lifetime_iteration(bank, template, step=step)
             valid = valid & current_valid
             if iteration in (0, iterations - 1):
                 preserved.append((output, template["expected"]))
             del output, current_valid
-            if (iteration + 1) % QUEUE_PROGRESS_INTERVAL == 0 or iteration + 1 == iterations:
+            if _queue_log_iteration(iteration + 1) or iteration + 1 == iterations:
                 progress(iteration + 1)  # Host counters only; no Tensor formatting/reads.
+    with stage("queue_lifetime_mixed"):
+        for iteration in range(iterations):
+            template = templates[iteration % len(templates)]
+            peer = templates[(iteration + 1) % len(templates)]
+            step = _queue_step_recorder("queue_lifetime_mixed", iteration + 1)
+            output, current_valid = _queue_lifetime_iteration(bank, template, step=step)
+            valid = valid & current_valid
+            del output, current_valid
+            current_valid = _queue_mixed_projection_checks(
+                [template, peer], projection, grouped_projection, grouped_projection_pipeline, step
+            )
+            valid = valid & current_valid
+            del current_valid
+            if _queue_log_iteration(iteration + 1) or iteration + 1 == iterations:
+                mixed_progress(iteration + 1)
     # All device checks were submitted in the loop; read one scalar after its
     # end fence. Preserve only first/last outputs, never every input/handler.
     if not bool(valid.cpu()):
         raise AssertionError("Queue lifetime metadata/projection/matmul validity or bitwise projection check failed")
     for output, expected in preserved:
         exact_tensor(output, expected, "queue_lifetime_preserved_output")
+    phases = queue_lifetime_phases(iterations)
     return {
-        "scope": "synthetic_async_handler_lifetime_only",
+        "scope": "synthetic_mixed_async_handler_lifetime_only",
         "iterations": iterations,
-        "minimum_operator_calls": iterations * QUEUE_CALLS_PER_ITERATION,
+        "minimum_operator_calls": sum(phase["minimum_operator_calls"] for phase in phases),
+        "phases": phases,
+        "mixed_grouped_jobs": 2,
         "queue_capacity_reference": QUEUE_CAPACITY_REFERENCE,
         "runtime_queue_enabled_or_slots_measured": False,
         "requires_runtime_task_queue_enabled": True,
@@ -445,7 +580,7 @@ def run_queue_lifetime_checks(
         "n": OUTPUT_COLUMNS,
         "experts": EXPERTS,
         "routes": 1,
-        "explicit_synchronization_stages": ["queue_lifetime_setup", "queue_lifetime_wrap"],
+        "explicit_synchronization_stages": ["queue_lifetime_setup", "queue_lifetime_wrap", "queue_lifetime_mixed"],
         "explicit_per_iteration_synchronize": False,
         "native_stream_check_may_drain_host_queue": True,
         "temporary_inputs_dropped_before_matmul": True,
@@ -472,7 +607,12 @@ def run_case_child(args):
 
             from tools.validate_vq2a8_ascendc import require_hardware_runtime
             from tools.validate_vq2a8_tp1_packed_kernel import _initialize_device
-            from vllm_ascend.quantization.vq2a8_ascendc import load_library, vq2a8_ascendc
+            from vllm_ascend.quantization.vq2a8_ascendc import (
+                grouped_projection,
+                grouped_projection_pipeline,
+                load_library,
+                vq2a8_ascendc,
+            )
 
         with stage("device"):
             require_hardware_runtime()
@@ -501,6 +641,8 @@ def run_case_child(args):
                         device,
                         bank_factory=bank_factory,
                         projection=vq2a8_ascendc,
+                        grouped_projection=grouped_projection,
+                        grouped_projection_pipeline=grouped_projection_pipeline,
                         synchronize=sync,
                         iterations=args.queue_iterations,
                         stage=stage,

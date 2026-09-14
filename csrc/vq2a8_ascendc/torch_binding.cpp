@@ -42,18 +42,21 @@ at::Tensor Run(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& b
   uint32_t blocks = std::min(cores, n / kN);
   auto output = at::empty({x.size(0), n}, x.options().dtype(at::kBFloat16));
   auto stream = c10_npu::getCurrentNPUStream().stream();
-  at_npu::native::OpCommand command;
-  command.Name("Vq2a8AscendCProjection");
-  // Retain Tensor owners through the custom handler. No host staging,
-  // synchronizations or value scans on the projection hot path.
-  command.SetCustomHandler([=]() -> int {
-    Launch(stream, blocks, x.data_ptr(), scale.data_ptr(), bias.data_ptr(),
-           packed.defined() ? packed.data_ptr() : nullptr, book.defined() ? book.data_ptr() : nullptr,
-           ids.defined() ? ids.data_ptr() : nullptr, dense.defined() ? dense.data_ptr() : nullptr, output.data_ptr(),
-           x.size(0), n, x.size(1), tiles, mode);
-    return 0;
-  });
-  command.Run();
+  // Transfer Tensor-owning handlers to the OPAPI release queue, just like
+  // ResidentBank. A legacy handler retained in a reused enqueue slot can
+  // destroy a Tensor under the enqueue lock while another thread frees a
+  // recorded Tensor under the allocator lock and tries to enqueue an event.
+  // Keep every owner captured; submission remains asynchronous.
+  at_npu::native::OpCommand::RunOpApi(
+      "Vq2a8AscendCProjection",
+      [=]() -> int {
+        Launch(stream, blocks, x.data_ptr(), scale.data_ptr(), bias.data_ptr(),
+               packed.defined() ? packed.data_ptr() : nullptr, book.defined() ? book.data_ptr() : nullptr,
+               ids.defined() ? ids.data_ptr() : nullptr, dense.defined() ? dense.data_ptr() : nullptr,
+               output.data_ptr(), x.size(0), n, x.size(1), tiles, mode);
+        return 0;
+      },
+      false);
   return output;
 }
 }  // namespace
@@ -127,9 +130,10 @@ std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, cons
   // Blocking copy keeps host lifetime unambiguous; included in grouped timing.
   auto descriptors = host.to(x[0].device(), at::kLong, false, true);
   auto stream = c10_npu::getCurrentNPUStream().stream();
-  at_npu::native::OpCommand command;
-  command.Name("Vq2a8AscendCGroupedProjection");
-  command.SetCustomHandler(
+  // This shared V1/prefill path must not leave Tensor owners in legacy queue
+  // slots either; both grouped variants can interleave with ResidentBank.
+  at_npu::native::OpCommand::RunOpApi(
+      "Vq2a8AscendCGroupedProjection",
       [stream, blocks, descriptors, jobs, groups, x, scale, bias, packed, book, ids, output]() -> int {
         // Explicitly retain EVERY pointer owner, even though Launch takes only the
         // descriptor address. Same-stream allocator reuse is ordered after launch.
@@ -146,8 +150,8 @@ std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, cons
           LaunchGrouped(stream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), groups);
         }
         return 0;
-      });
-  command.Run();
+      },
+      false);
   return output;
 }
 

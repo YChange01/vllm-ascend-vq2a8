@@ -125,15 +125,22 @@ python -u tools/validate_vq2a8_v4_device_route.py \
 不加载完整模型或专家文件。必须看到 `summary.json` 中 `status=PASS` 和
 `device_execution_verified=true`；这只验证合成 native 路径，不代表全模型数值或速度通过。
 
-### 修复 device-route 回调释放时的队列锁重入
+### 修复混合投影路径的回调释放与队列等锁
 
-若 native 栈出现 `ResidentBank::Project` 回调析构 → Tensor 释放 → `NPUEvent::record` →
-重复入队 → `pthread_mutex_lock`，应更新并重编本次修复的专用库。
-`ResidentBank::Select/Project` 改用 `OpCommand::RunOpApi(..., false)`，避免旧
-`SetCustomHandler/Run` 路径在队列槽复用的临界区析构 Tensor-owning handler。
-保留全部 Tensor/state 捕获、`recordStream`、同流限制及 V1 算术；不新增逐层同步，不切换图模式。
+第一版只将 `ResidentBank::Select/Project` 改为 `OpCommand::RunOpApi(..., false)`，
+目标设备的 `--queue-lifetime` 回归仍出现超时，另一轮出现 allocator `try_merge_blocks` 内部断言。
+后续双线程 native 栈直接显示：主线程在 `eq_Scalar` 入队过程中析构旧 `Run` 回调，
+释放线程则在析构新的 `ResidentBank::Project` 回调，并经 `NPUEvent::record` 再次入队。
+结合源码，这高度符合入队锁与分配器锁的反向等待；具体 mutex owner 未直接读取。
+不能将停留在 `eq` / `matmul` 的 Python 行号解释成该计算本身耗时过长。
+
+本次补齐同一个 `.so` 中 `torch_binding.cpp` 的 `Run` 和 `GroupedProjection`（包括 Pipeline 模板），
+统一改用 `OpCommand::RunOpApi(..., false)`，避免遗留 `SetCustomHandler/Run` 路径
+在队列槽复用的临界区析构 Tensor-owning handler。
+保留全部 Tensor/state/vector/descriptor 捕获、ResidentBank 的 `recordStream`、同流限制及 V1 算术；
+不删除生命周期保护，不新增逐层同步，不切换图模式。
 回调转移行为可参照 [torch-npu OPAPI 释放实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/framework/OpParamMaker.cpp#L806)。
-这是针对现场链的修复，不代表已在所有 torch-npu dev wheel 上验证。
+这是针对已观察到的混合路径的候选修复；尚需目标机器验证，也不能据此断言另一轮 allocator 崩溃已解决。
 
 先保留现场日志，停止自己原来的服务，确认目标卡空闲；不要停止其他任务或重置整卡。
 同步本次源码后在独立目录重编，只构建专用 `.so`，无需重新安装 vllm-ascend、编译全部 OPP 或 repack 权重。
@@ -143,25 +150,39 @@ python -u tools/validate_vq2a8_v4_device_route.py \
 cd /home/g00872988/vllm-ascend-vq2a8-v023
 python -u tools/build_vq2a8_ascendc.py \
   --soc Ascend950DT_9582 --cann /usr/local/Ascend/cann-9.1.0 \
-  --build-dir build/vq2a8-ascendc-v4-device-route-fix --jobs 4
+  --build-dir build/vq2a8-ascendc-v4-device-route-fix2 --jobs 4
 python -u tools/validate_vq2a8_v4_device_route.py \
-  --library build/vq2a8-ascendc-v4-device-route-fix/libvq2a8_ascendc.so \
+  --library build/vq2a8-ascendc-v4-device-route-fix2/libvq2a8_ascendc.so \
   --physical-npu 1 --queue-lifetime --timeout-s 300
 ```
 
-`--queue-lifetime` 是可选的小型合成回归，不读模型或专家文件；保留原短预检，并追加连续提交、
-临时 Tensor 丢引用、队列槽复用压力测试。保持 task queue 默认启用及 `--launch-blocking 0`；
+`--queue-lifetime` 是可选的小型合成回归，不读模型或专家文件；保留原短预检，
+在同一个子进程中追加连续提交、临时 Tensor 丢引用、队列槽复用和混合投影压力测试。
+不能以拆分后的独立 ResidentBank 测试通过代替混合回归通过。压力分两个阶段：
+
+- `queue_lifetime_wrap`：保留完整的 ResidentBank select/project 与普通 matmul 压力。
+- `queue_lifetime_mixed`：再交替调用普通投影、分组投影、Pipeline 分组投影、ResidentBank 和普通算子。
+
+默认每阶段 2049 轮，仍使用小型合成专家。第一阶段不引入 grouped 的描述符上传；
+第二阶段保留 grouped 原有的阻塞式描述符拷贝，并在报告中注明，不能将它称为零同步压力。
+两阶段共至少 18441 次相关算子调用；这是源码调用下界，不是实际队列槽位测量。
+保持 task queue 默认启用及 `--launch-blocking 0`；
 不要用关闭队列或同步启动的方式掩盖问题。循环不显式逐轮同步，仅在测试边界检查结果；
 原生同流检查仍可能等待 host 队列，因此这不是“无 CPU 等待”或性能测试，也不声称直接测得队列索引。
-默认自动创建新的 `/tmp/vq2-v4-device-route-*` 报告目录。超时/失败都不代表通过，不要继续压测。
+默认自动创建新的 `/tmp/vq2-v4-device-route-*` 报告目录。超时/失败都不代表通过，不要继续启动全模型或反复压测。
 
-回归通过并释放设备后，用全新进程启动原服务命令，只将 `--library` 换成上述 `-fix` 目录的库，
+`QUEUE_STEP` 只在前 8 轮及每 256 轮打印阶段、轮数、步骤和 `BEGIN/RETURN/FAIL`；
+拆开了输入 clone、native 调用、普通 matmul、结果校验及丢引用的位置。
+它们是纯 host 标记，`RETURN` 不表示设备已经完成，不新增同步或读取 Tensor 值。
+显式设备同步边界为 setup、原压力阶段结束、混合阶段结束；三者及最终正确性检查必须全部通过。
+
+回归通过并释放设备后，用全新进程启动原服务命令，只将 `--library` 换成上述 `-fix2` 目录的库，
 保留 `--device-route-decode`。已加载旧库的进程不能通过重编或再次 `load_library` 热修复。
 先确认一次 1/4 及 10/4 请求能够返回，再按原参数测 TTFT/TPOT；本修复不承诺固定加速比。
 
 ### 同引擎对照与服务测速
 
-以下命令沿用原构建目录；若验证上述修复，将各处 `--library` 统一换为 `-fix` 目录的新库。
+以下命令沿用原构建目录；若验证上述修复，将各处 `--library` 统一换为 `-fix2` 目录的新库。
 
 先做同一常驻模型内的数值和计时对照（此时不要同时启动 HTTP 服务）：
 
@@ -330,3 +351,12 @@ V4/activation/optimization 定向 CPU 回归为 667 passed、1 skipped；最终�
 3038 passed、258 skipped、2 failed，另有 4 个 subtests 通过。两项失败仍为上述既有 FP8 midpoint / CPU FMA 用例。
 Ruff、clang-format 和 `git diff --check` 通过；`format.sh ci` 仍受本地缺少 pre-commit 限制。
 本地没有 CANN/NPU，尚未编译新 `.so` 或运行实机异步回归，不能据 CPU 测试宣称服务死锁已在设备上消除。
+
+混合回调修复（第二版）：新增 V1 提交入口源码契约，旧代码为 3 failed / 1 passed，
+补齐两处封装后通过；覆盖原 Tensor 捕获、Launch 实参及 Pipeline 模板入口不变。
+混合生命周期与 native 契约定向 CPU 回归为 61 passed / 1 skipped，跳过项缺少主机 C++ 编译器。
+最终全量 CPU 回归为 3050 passed / 258 skipped / 2 failed，另有 4 个 subtests 通过；
+两项失败仍是上述既有 FP8 midpoint / CPU FMA 用例，本次未修改该路径。
+弱引用测试确认临时输入/输出按预期释放，原 ResidentBank 压力阶段没有插入 grouped 描述符拷贝，
+单投影、grouped、pipeline 各路径的错误会使回归失败。Ruff、clang-format 和 `git diff --check` 通过；
+完整 `format.sh ci` 仍因本地缺少 pre-commit 未执行完成。此结果不是 CANN 编译、NPU 数值或死锁消除证明。
