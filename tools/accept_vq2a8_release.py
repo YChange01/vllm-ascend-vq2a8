@@ -295,11 +295,13 @@ def worker(args):
     elif args.worker == "binary":
         collect_binary_evidence(library_evidence(args.library), args.output_dir)
     else:
-        from tools.validate_vq2a8_v023_environment import check_runtime_imports, require_v023_stack
+        from tools.validate_vq2a8_v023_environment import check_python_environment
 
-        environment = require_v023_stack()
-        environment["runtime"] = check_runtime_imports()
-        subprocess.run([sys.executable, "-m", "pip", "check"], check=True, timeout=120)
+        environment = check_python_environment()
+        print("VQ2A8_V023_ENVIRONMENT " + json.dumps(environment), flush=True)
+        if environment["errors"]:
+            raise RuntimeError("VQ2A8 0.23 environment mismatch: " + " ".join(environment["errors"]))
+        environment["runtime"] = environment["runtime_imports"]
         require_hardware_runtime()
         import torch
         import torch_npu  # noqa: F401

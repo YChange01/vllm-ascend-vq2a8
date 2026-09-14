@@ -313,7 +313,11 @@ def test_verified_scm_does_not_skip_pip_or_runtime_api_gates(checkout, monkeypat
             return checkout.git_run(command, **kwargs)
         assert command == [sys.executable, "-m", "pip", "check"]
         calls.append("pip")
-        return NS(returncode=int(outcome == "pip-fail"), stdout="dependency check\n", stderr="")
+        return NS(
+            returncode=int(outcome == "pip-fail"),
+            stdout="dependency check\n" if outcome == "pip-fail" else "No broken requirements found.\n",
+            stderr="",
+        )
 
     def runtime_check():
         calls.append("runtime")

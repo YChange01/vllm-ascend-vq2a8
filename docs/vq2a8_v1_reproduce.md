@@ -79,6 +79,11 @@ python -u tools/build_vq2a8_ascendc.py \
 更新后会核对 editable 安装路径、实际导入路径、迁移祖先及官方 0.23 框架文件指纹，
 通过后才接受该开发版本；具体边界见[环境说明](vq2a8_v023_migration.md)。
 
+对当前镜像的 `torch-npu 2.10.0.post4.dev20260715`，现已按用户要求允许继续测试。
+元数据检查、子进程检查和 `pip check` 采用同一规则；原始版本及 pip 退出码不改写。
+终端的 `OPTIMIZATION_WARNING` 表示记录了已允许差异，**不是 NPU 测试已通过**。
+其他开发日期、缺包、其他依赖冲突和真实运行错误仍会阻断，不需要添加跳过检查的参数。
+
 已经完成本机编译和 editable 安装时，更新脚本并复用现有 V1 库即可，不需要为本次工具修复重编译：
 
 ```bash
@@ -88,8 +93,8 @@ python -u tools/accept_vq2a8_optimizations.py --model /home/g00872988/vq2a8 --li
 ```
 
 如果仍失败，`OPTIMIZATION_ERROR` 会直接显示有限长度、常见凭据脱敏后的环境错误和失败的
-`pip check` 原因，不再只给日志路径；`run.json` 也记录 `failure_causes`。
-无法识别的日志仍给出完整日志路径，不盲目回显原始日志。依赖冲突、真实导入失败和预检错误仍会停止，
+`pip check` 的未接受阻塞项，不再只给日志路径；`run.json` 也记录 `failure_causes`。
+无法识别的日志仍给出完整日志路径，不盲目回显原始日志。未接受的依赖冲突、真实导入失败和预检错误仍会停止，
 不会跳过环境检查直接加载模型。环境通过不等于 NPU 推理或 TPOT 通过。
 
 ## 0.3 秒的来源与结果
@@ -117,3 +122,9 @@ V1 复现文档首次加入时：`--plan-only` 和相关 317 项 CPU 回归通�
 2507 passed、257 skipped、2 failed、4 subtests passed。两项失败仍是上述已知 FP8/FMA 用例，
 未放宽数值要求。四个改动/新增 Python 文件 Ruff check/format 与 `git diff --check` 通过；
 `bash format.sh ci` 仍因缺少 `pre-commit` 未运行完整 hooks。本次未在 NPU 上重编译或执行模型。
+
+版本差异统一处理验证（2026-09-14）：本轮新增 95 项 CPU 用例，相关 579 项回归通过；完整 CPU 套件为
+2602 passed、257 skipped、2 failed、4 subtests passed。失败仍为上述两项 FP8/FMA 用例，未修改它们或放宽断言。
+覆盖同一规则下的元数据、子进程、逐行 pip 冲突分类、release 环境入口，以及成功警告和失败摘要。
+六个改动/新增 Python 文件的 Ruff check/format、原复测命令的 `--plan-only` 和 `git diff --check` 通过；
+`bash format.sh ci` 已尝试，因缺少 `pre-commit` 未完成。未改官方依赖安装 pins，未在 NPU 上执行或测量 TPOT。

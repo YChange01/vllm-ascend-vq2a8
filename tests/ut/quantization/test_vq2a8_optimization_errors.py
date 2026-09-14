@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU-only failure reporting contracts; no child/NPU execution."""
+"""CPU-only warning/failure reporting contracts; no child/NPU execution."""
 
 import json
 import sys
@@ -41,6 +41,99 @@ def test_does_not_display_successful_pip_output_or_unselected_fields(tmp_path):
         runtime_imports={"exception": "DO_NOT_DISPLAY_ARBITRARY_VALUE"},
     )
     assert runner.failure_causes(log) == ["Runtime import failed: missing ABI symbol"]
+
+
+def test_new_pip_report_selects_blocking_issues_not_accepted_differences(tmp_path):
+    log = environment_log(
+        tmp_path / "environment.log",
+        errors=["pip check has blocking dependency issues."],
+        warnings=["APPROVED_DIFFERENCE"],
+        pip_check={
+            "exit": 1,
+            "output": "APPROVED_DIFFERENCE\nDO_NOT_DISPLAY_RAW_OUTPUT",
+            "accepted_issues": ["APPROVED_DIFFERENCE"],
+            "blocking_issues": ["alpha requires beta>=2; TOKEN=SecretValue"],
+        },
+    )
+    causes = runner.failure_causes(log)
+    assert causes == [
+        "pip check has blocking dependency issues.",
+        "pip check: alpha requires beta>=2; TOKEN=[REDACTED]",
+    ]
+    assert "APPROVED_DIFFERENCE" not in str(causes)
+    assert "DO_NOT_DISPLAY" not in str(causes)
+    assert "SecretValue" not in str(causes)
+
+
+@pytest.mark.parametrize("blocking", [[], None, "invalid", {}, [None, {}, ""]])
+def test_present_pip_blocking_field_never_falls_back_to_raw_output(tmp_path, blocking):
+    log = environment_log(
+        tmp_path / "environment.log",
+        errors=["Another gate failed."],
+        pip_check={"exit": 1, "output": "APPROVED_DIFFERENCE", "blocking_issues": blocking},
+    )
+    assert runner.failure_causes(log) == ["Another gate failed."]
+
+
+def test_new_pip_blocking_causes_are_bounded_and_sanitized(tmp_path):
+    log = environment_log(
+        tmp_path / "environment.log",
+        pip_check={
+            "exit": 1,
+            "blocking_issues": ["https://private:SecretValue@proxy.local --token TokenValue " + "x" * 1000] * 12,
+        },
+    )
+    causes = runner.failure_causes(log)
+    assert len(causes) == 1
+    assert len(causes[0]) <= runner.MAX_FAILURE_CAUSE_CHARS
+    assert "SecretValue" not in causes[0] and "TokenValue" not in causes[0]
+
+
+def test_environment_warnings_select_only_bounded_sanitized_strings(tmp_path):
+    log = environment_log(
+        tmp_path / "environment.log",
+        warnings=[
+            "Approved torch-npu difference; not NPU verification; TOKEN=SecretValue",
+            "duplicate",
+            "duplicate",
+            None,
+            {"token": "SecretObject"},
+            "https://user:PasswordValue@proxy.local/path --password 'Cli Secret' " + "x" * 1000,
+            "OUTSIDE_WARNING_LIMIT",
+        ],
+        errors=["DO_NOT_DISPLAY_ERROR"],
+        packages={"package": "DO_NOT_DISPLAY_PACKAGE"},
+        pip_check={"exit": 1, "output": "DO_NOT_DISPLAY_PIP_OUTPUT"},
+    )
+    warnings = runner.environment_warnings(log)
+    assert len(warnings) == 3
+    assert "not NPU verification" in warnings[0]
+    assert warnings.count("duplicate") == 1
+    assert all(len(warning) <= runner.MAX_FAILURE_CAUSE_CHARS for warning in warnings)
+    assert all(
+        value not in str(warnings)
+        for value in ("SecretValue", "SecretObject", "PasswordValue", "Cli Secret", "OUTSIDE", "DO_NOT_DISPLAY")
+    )
+
+
+@pytest.mark.parametrize("warnings", [None, {}, "invalid", [None, {}, ""]])
+def test_invalid_environment_warnings_are_not_forwarded(tmp_path, warnings):
+    log = environment_log(tmp_path / "environment.log", warnings=warnings)
+    assert runner.environment_warnings(log) == []
+
+
+def test_missing_or_malformed_warning_log_has_no_raw_fallback(tmp_path):
+    log = tmp_path / "environment.log"
+    assert runner.environment_warnings(log) == []
+    log.write_text('VQ2A8_V023_ENVIRONMENT {"warnings": ["RawSecret"\n', encoding="utf-8")
+    assert runner.environment_warnings(log) == []
+
+
+def test_latest_environment_warning_report_wins(tmp_path):
+    log = environment_log(tmp_path / "environment.log", warnings=["earlier warning"])
+    with log.open("a", encoding="utf-8") as out:
+        out.write(runner.ENVIRONMENT_PREFIX + json.dumps({"warnings": ["latest warning"]}) + "\n")
+    assert runner.environment_warnings(log) == ["latest warning"]
 
 
 @pytest.mark.parametrize(
@@ -199,3 +292,76 @@ def test_success_does_not_read_or_print_failure_logs(monkeypatch, tmp_path):
     report = json.loads((tmp_path / "report/run.json").read_text())
     assert report["status"] == "PASS"
     assert all("failure_causes" not in stage for stage in report["stages"])
+
+
+@pytest.mark.parametrize("preflight_fails", [False, True])
+def test_successful_environment_prints_and_persists_warnings_without_verifying_device(
+    monkeypatch, tmp_path, capsys, preflight_fails
+):
+    from tools import accept_vq2a8_release as release
+
+    _main_arguments(monkeypatch, tmp_path)
+    calls = []
+
+    def supervise(_command, log, _env, _timeout):
+        calls.append(log.stem)
+        if log.stem == "environment":
+            environment_log(
+                log,
+                warnings=["Approved torch-npu 2.10.0.post4.dev20260715 difference; no NPU proof; TOKEN=SecretValue"],
+                pip_check={"exit": 1, "output": "DO_NOT_DISPLAY_ACCEPTED_PIP", "blocking_issues": []},
+            )
+        else:
+            environment_log(log, warnings=["DO_NOT_DISPLAY_NON_ENVIRONMENT_WARNING"])
+        if log.stem == "performance":
+            result = log.parent / "result"
+            result.mkdir()
+            (result / "summary.json").write_text(json.dumps({"status": "PASS"}), encoding="utf-8")
+        return {"exit": int(preflight_fails and log.stem == "preflight"), "timeout": False, "log": str(log)}
+
+    monkeypatch.setattr(release, "supervise", supervise)
+    assert runner.main() == (1 if preflight_fails else 0)
+    assert calls == (["environment", "preflight"] if preflight_fails else ["environment", "preflight", "performance"])
+    stdout = capsys.readouterr().out
+    assert stdout.count("OPTIMIZATION_WARNING=") == 1
+    assert "torch-npu 2.10.0.post4.dev20260715" in stdout
+    assert "no NPU proof" in stdout and "SecretValue" not in stdout
+    assert "DO_NOT_DISPLAY" not in stdout
+    report = json.loads((tmp_path / "report/run.json").read_text())
+    assert not report["device_execution_verified"]
+    assert report["stages"][0]["warnings"] == [
+        "Approved torch-npu 2.10.0.post4.dev20260715 difference; no NPU proof; TOKEN=[REDACTED]"
+    ]
+    assert "SecretValue" not in json.dumps(report) and "DO_NOT_DISPLAY" not in json.dumps(report)
+    assert all("warnings" not in stage for stage in report["stages"][1:])
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_approved_pip_issue_does_not_bypass_failed_child_or_become_failure_cause(
+    monkeypatch, tmp_path, capsys, timed_out
+):
+    from tools import accept_vq2a8_release as release
+
+    _main_arguments(monkeypatch, tmp_path)
+    calls = []
+
+    def supervise(_command, log, _env, _timeout):
+        calls.append(log.stem)
+        environment_log(
+            log,
+            warnings=["APPROVED_DIFFERENCE"],
+            pip_check={"exit": 1, "output": "APPROVED_DIFFERENCE", "blocking_issues": []},
+        )
+        return {"exit": 0 if timed_out else 1, "timeout": timed_out, "log": str(log)}
+
+    monkeypatch.setattr(release, "supervise", supervise)
+    assert runner.main() == 1
+    assert calls == ["environment"]
+    stdout = capsys.readouterr().out
+    assert "OPTIMIZATION_WARNING=" not in stdout
+    assert "APPROVED_DIFFERENCE" not in stdout
+    assert "OPTIMIZATION_STATUS=FAIL" in stdout
+    report = json.loads((tmp_path / "report/run.json").read_text())
+    assert not report["device_execution_verified"]
+    assert "APPROVED_DIFFERENCE" not in json.dumps(report)
+    assert "warnings" not in report["stages"][0]

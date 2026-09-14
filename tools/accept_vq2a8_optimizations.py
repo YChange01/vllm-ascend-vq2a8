@@ -64,52 +64,79 @@ def _redact_cause(value):
     return value
 
 
-def failure_causes(log, *, timed_out=False):
-    """Read a bounded tail and select environment errors, never dump raw logs.
+def _environment_report(log):
+    """Read only the latest recognized report in a bounded log tail."""
+    with Path(log).open("rb") as source:
+        size = os.fstat(source.fileno()).st_size
+        offset = max(0, size - MAX_FAILURE_LOG_BYTES)
+        source.seek(offset)
+        raw = source.read(MAX_FAILURE_LOG_BYTES)
+    if offset:
+        raw = raw.partition(b"\n")[2]
+    for line in reversed(raw.splitlines()[-MAX_FAILURE_LINES:]):
+        if len(line) > MAX_FAILURE_LINE_BYTES:
+            continue
+        text = line.decode("utf-8", errors="replace")
+        if not text.startswith(ENVIRONMENT_PREFIX):
+            continue
+        try:
+            report = json.loads(text[len(ENVIRONMENT_PREFIX) :])
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(report, dict):
+            return report
+    return None
 
-    Unknown or malformed logs produce a fixed message. Only the environment
-    tool's errors and unsuccessful pip-check output are candidates for display;
-    package/environment dictionaries and successful subprocess output are not.
+
+def environment_warnings(log):
+    """Expose only selected, bounded warnings; never forward raw log content."""
+    try:
+        report = _environment_report(log)
+    except (OSError, ValueError):
+        return []
+    warnings = report.get("warnings") if report else None
+    if not isinstance(warnings, list):
+        return []
+    selected = (_redact_cause(warning) for warning in warnings[:MAX_FAILURE_CAUSES] if isinstance(warning, str))
+    return list(dict.fromkeys(warning for warning in selected if warning))
+
+
+def failure_causes(log, *, timed_out=False):
+    """Select environment errors and blocking pip issues, never dump raw logs.
+
+    Unknown or malformed logs produce a fixed message. New reports distinguish
+    blocking issues from approved dependency differences. Only older reports
+    without that field may use unsuccessful pip-check output as a fallback.
     """
     causes = []
     if timed_out:
         causes.append("Child exceeded its stage timeout.")
     try:
-        with Path(log).open("rb") as source:
-            size = os.fstat(source.fileno()).st_size
-            offset = max(0, size - MAX_FAILURE_LOG_BYTES)
-            source.seek(offset)
-            raw = source.read(MAX_FAILURE_LOG_BYTES)
-        if offset:
-            raw = raw.partition(b"\n")[2]
-        for line in reversed(raw.splitlines()[-MAX_FAILURE_LINES:]):
-            if len(line) > MAX_FAILURE_LINE_BYTES:
-                continue
-            text = line.decode("utf-8", errors="replace")
-            if not text.startswith(ENVIRONMENT_PREFIX):
-                continue
-            try:
-                report = json.loads(text[len(ENVIRONMENT_PREFIX) :])
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(report, dict):
-                continue
+        report = _environment_report(log)
+        if report:
             errors = report.get("errors")
             if isinstance(errors, list):
                 causes.extend(_redact_cause(error) for error in errors[:MAX_FAILURE_CAUSES] if isinstance(error, str))
             pip_check = report.get("pip_check")
-            if (
-                isinstance(pip_check, dict)
-                and type(pip_check.get("exit")) is int
-                and pip_check["exit"] != 0
-                and isinstance(pip_check.get("output"), str)
-            ):
-                causes.extend(
-                    _redact_cause("pip check: " + line)
-                    for line in pip_check["output"].splitlines()[:MAX_FAILURE_CAUSES]
-                    if line.strip()
-                )
-            break
+            if isinstance(pip_check, dict):
+                if "blocking_issues" in pip_check:
+                    issues = pip_check["blocking_issues"]
+                    if isinstance(issues, list):
+                        causes.extend(
+                            _redact_cause("pip check: " + issue)
+                            for issue in issues[:MAX_FAILURE_CAUSES]
+                            if isinstance(issue, str) and issue.strip()
+                        )
+                elif (
+                    type(pip_check.get("exit")) is int
+                    and pip_check["exit"] != 0
+                    and isinstance(pip_check.get("output"), str)
+                ):
+                    causes.extend(
+                        _redact_cause("pip check: " + line)
+                        for line in pip_check["output"].splitlines()[:MAX_FAILURE_CAUSES]
+                        if line.strip()
+                    )
     except (OSError, ValueError):
         causes.append("Child log is unavailable; no diagnostic text was read.")
     causes = list(dict.fromkeys(cause for cause in causes if cause))
@@ -236,6 +263,10 @@ def main():
             failed = result["exit"] != 0 or result["timeout"]
             if failed:
                 result["failure_causes"] = failure_causes(result["log"], timed_out=result["timeout"])
+            elif name == "environment":
+                result["warnings"] = environment_warnings(result["log"])
+                for warning in result["warnings"]:
+                    print(f"OPTIMIZATION_WARNING={warning}", flush=True)
             report["stages"].append(dict(name=name, **result))
             write_json(output / "run.json", report)
             if failed:

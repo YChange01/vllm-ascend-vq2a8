@@ -30,7 +30,9 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
 
-from packaging.specifiers import SpecifierSet
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import InvalidVersion, Version
 
 V023_REQUIREMENTS = {
@@ -41,6 +43,10 @@ V023_REQUIREMENTS = {
     "triton-ascend": "==3.2.2",
     "fastapi": ">=0.115.0,<0.124.0",
 }
+# Explicitly approved for testing on the user's existing Ascend950 image.
+# This permits preflight, not a claim of ABI, device, or model compatibility.
+# Do not generalize this to every torch-npu 2.10/post4 development build.
+V023_TORCH_NPU_TEST_VERSIONS = frozenset({"2.10.0.post4.dev20260715"})
 
 # setuptools-scm advances v0.23.0 to 0.23.1.devN after migration commits.
 # This is not permission to run an arbitrary 0.23.1/0.26 framework. These
@@ -124,6 +130,41 @@ def ascend_source_provenance(installed_version, repo=REPO):
     return proof
 
 
+def _accepted_version_difference(name, required, actual, *, ascend_source=None):
+    """One policy shared by metadata gates, workers, and pip-check conflicts."""
+    name = canonicalize_name(name)
+    official = "==0.23.0" if name == "vllm-ascend" else V023_REQUIREMENTS.get(name)
+    try:
+        if official is None or SpecifierSet(required) != SpecifierSet(official):
+            return None
+        installed = str(Version(actual or "missing"))
+    except (InvalidVersion, InvalidSpecifier):
+        return None
+    reason = None
+    if name == "torch-npu" and installed in V023_TORCH_NPU_TEST_VERSIONS:
+        reason = "Explicitly allowed Ascend950 development build for testing; runtime/device checks are still required."
+    elif (
+        name == "vllm-ascend"
+        and _is_v023_scm_version(installed)
+        and ascend_source is not None
+        and ascend_source.get("verified") is True
+        and ascend_source.get("version") == installed
+    ):
+        reason = "Editable SCM version with verified v023 source; runtime/device checks are still required."
+    if reason is None:
+        return None
+    return {"package": name, "required": official, "actual": installed, "reason": reason}
+
+
+def accepted_version_differences(packages, *, ascend_source=None):
+    differences = []
+    for name, required in {**V023_REQUIREMENTS, "vllm-ascend": "==0.23.0"}.items():
+        difference = _accepted_version_difference(name, required, packages.get(name), ascend_source=ascend_source)
+        if difference:
+            differences.append(difference)
+    return differences
+
+
 def stack_errors(packages, python_version, system, *, ascend_source=None):
     errors = []
     if system != "Linux":
@@ -133,18 +174,15 @@ def stack_errors(packages, python_version, system, *, ascend_source=None):
     for name, spec in V023_REQUIREMENTS.items():
         try:
             actual = Version(packages.get(name) or "missing")
-            if not SpecifierSet(spec).contains(actual):
+            if not SpecifierSet(spec).contains(actual) and not _accepted_version_difference(
+                name, spec, str(actual), ascend_source=ascend_source
+            ):
                 errors.append(f"{name}{spec} required, found {actual}.")
         except InvalidVersion:
             errors.append(f"{name}{spec} required, found {packages.get(name)!r}.")
     try:
         ascend = Version(packages.get("vllm-ascend") or "missing")
-        verified_scm = (
-            _is_v023_scm_version(str(ascend))
-            and ascend_source is not None
-            and ascend_source.get("verified") is True
-            and ascend_source.get("version") == str(ascend)
-        )
+        verified_scm = _accepted_version_difference("vllm-ascend", "==0.23.0", str(ascend), ascend_source=ascend_source)
         if (ascend.release != (0, 23, 0) or ascend < Version("0.23.0")) and not verified_scm:
             errors.append(f"vllm-ascend 0.23.0 or a verified v023 editable SCM build required, found {ascend}.")
             if ascend_source:
@@ -164,12 +202,19 @@ def environment_report():
     ascend_source = None
     if _is_v023_scm_version(packages["vllm-ascend"]):
         ascend_source = ascend_source_provenance(packages["vllm-ascend"])
+    differences = accepted_version_differences(packages, ascend_source=ascend_source)
     return {
         "python": sys.executable,
         "python_version": platform.python_version(),
         "system": platform.system(),
         "packages": packages,
         "ascend_source": ascend_source,
+        "accepted_version_differences": differences,
+        "validation_profile": "accepted_version_differences" if differences else "official_pins",
+        "warnings": [
+            f"Allowing {item['package']} {item['actual']} instead of {item['required']}: {item['reason']}"
+            for item in differences
+        ],
         "errors": stack_errors(packages, sys.version_info, platform.system(), ascend_source=ascend_source),
         "scope": "python_environment_only",
         "device_execution_verified": False,
@@ -182,6 +227,74 @@ def require_v023_stack():
     if report["errors"]:
         raise RuntimeError("VQ2A8 0.23 environment mismatch: " + " ".join(report["errors"]))
     return report
+
+
+def _accepted_pip_conflict(line, packages, *, ascend_source=None):
+    # Public `pip check` output grammar. Unknown/new formats remain blockers;
+    # never match a substring or discard every line mentioning torch-npu.
+    match = re.fullmatch(
+        r"(?P<owner>[A-Za-z0-9][A-Za-z0-9._-]*) (?P<owner_version>\S+) has requirement "
+        r"(?P<requirement>.+), but you have (?P<dependency>[A-Za-z0-9][A-Za-z0-9._-]*) (?P<actual>\S+)\.",
+        line,
+    )
+    if not match:
+        return False
+    try:
+        requirement = Requirement(match["requirement"])
+        name = canonicalize_name(requirement.name)
+        if (
+            name != canonicalize_name(match["dependency"])
+            or requirement.url is not None
+            or requirement.marker is not None
+            or requirement.extras
+            or Version(match["actual"]) != Version(packages.get(name) or "missing")
+        ):
+            return False
+        Version(match["owner_version"])
+        return bool(
+            _accepted_version_difference(name, str(requirement.specifier), match["actual"], ascend_source=ascend_source)
+        )
+    except (InvalidRequirement, InvalidVersion):
+        return False
+
+
+def classify_pip_check(returncode, stdout, stderr, packages, *, ascend_source=None):
+    """Retain raw pip failure evidence while classifying only known differences.
+
+    The original exit status is never rewritten to success. A failed pip check
+    may continue only if every issue is the same explicitly accepted version
+    difference that the metadata/worker gates recognize. No pip private APIs.
+    """
+    result = {
+        "exit": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "output": stdout + stderr,
+        "accepted_differences": [],
+        "blocking_issues": [],
+        "status": "failed",
+    }
+    lines = [line.strip() for text in (stdout, stderr) for line in text.splitlines() if line.strip()]
+    if returncode not in (0, 1):
+        result["blocking_issues"] = [f"pip check exited with unexpected status {returncode}.", *lines]
+    elif returncode == 0:
+        if lines == ["No broken requirements found."]:
+            result["status"] = "passed"
+        else:
+            result["blocking_issues"] = ["pip check returned unexpected success output.", *lines]
+    elif not lines:
+        result["blocking_issues"] = ["pip check failed without diagnostic output."]
+    else:
+        for line in lines:
+            target = (
+                "accepted_differences"
+                if _accepted_pip_conflict(line, packages, ascend_source=ascend_source)
+                else "blocking_issues"
+            )
+            result[target].append(line)
+        if not result["blocking_issues"]:
+            result["status"] = "passed_with_accepted_differences"
+    return result
 
 
 def _check_structured_output_manager(manager_type):
@@ -254,24 +367,29 @@ def check_runtime_imports():
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--metadata-only",
-        action="store_true",
-        help="Check metadata/source only; do not import NPU/vLLM or run pip check.",
-    )
-    args = parser.parse_args()
+def check_python_environment(*, metadata_only=False):
+    """Shared full Python check for the CLI and release environment worker."""
     report = environment_report()
-    if not report["errors"] and not args.metadata_only:
+    if not report["errors"] and not metadata_only:
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "check"], capture_output=True, text=True, timeout=120, check=False
             )
-            report["pip_check"] = {"exit": result.returncode, "output": result.stdout + result.stderr}
-            if result.returncode:
+            report["pip_check"] = classify_pip_check(
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                report.get("packages", {}),
+                ascend_source=report.get("ascend_source"),
+            )
+            if report["pip_check"]["blocking_issues"]:
                 report["errors"].append(
                     "pip check failed; do not start model acceptance with conflicting dependencies."
+                )
+            if report["pip_check"]["accepted_differences"]:
+                report.setdefault("warnings", []).append(
+                    "pip check included explicitly accepted version differences; "
+                    "the original exit/output are retained. Any remaining conflict still blocks execution."
                 )
         except (OSError, subprocess.TimeoutExpired) as exc:
             report["errors"].append(f"pip check could not complete: {type(exc).__name__}: {exc}")
@@ -280,7 +398,19 @@ def main():
                 report["runtime_imports"] = check_runtime_imports()
             except Exception as exc:
                 report["errors"].append(f"Runtime import failed: {type(exc).__name__}: {exc}")
-    report["status"] = "failed" if report["errors"] else "metadata_pass" if args.metadata_only else "passed"
+    report["status"] = "failed" if report["errors"] else "metadata_pass" if metadata_only else "passed"
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Check metadata/source only; do not import NPU/vLLM or run pip check.",
+    )
+    args = parser.parse_args()
+    report = check_python_environment(metadata_only=args.metadata_only)
     print("VQ2A8_V023_ENVIRONMENT " + json.dumps(report), flush=True)
     return 1 if report["errors"] else 0
 

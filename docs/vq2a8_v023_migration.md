@@ -134,7 +134,35 @@ checkout 或源码指纹不符时仍拒绝，并显示原因；分支名称或�
 
 上面的首次安装命令仍用显式 `SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0+vq2a8.v023` 生成固定标识；
 已经正确 editable 安装并编译的用户不必仅为开发版本号再重编译或重装。
-这不允许把 0.26 源码伪装成 0.23；也不放宽上游 `vllm ==0.23.0`、其他依赖或真实运行时检查。
+这不允许把 0.26 源码伪装成 0.23；上游 `vllm ==0.23.0` 和真实运行时检查保持不变。
+下面单独列出允许继续测试的依赖版本例外，未列出的差异仍会阻断。
+
+### 已允许测试的版本差异
+
+官方安装 pins 与复测时的兼容性判断分开处理。针对用户明确要求保留的现有 Ascend950 开发栈，
+复测工具允许精确的 `torch-npu 2.10.0.post4.dev20260715` 继续真实预检，不会仅因它不等于
+`2.10.0.post4` 而退出。这个例外**不扩展到任意开发日期、其他 post 版本或整个 2.10 系列**，
+也不是宣布该开发包的 ABI、算子、模型或性能已经验证通过。
+
+版本检查、`require_v023_stack()` 子进程检查、完整环境检查及 release 验收共用同一策略：
+
+- 保留 `packages` 中的真实版本，并记录 `accepted_version_differences` 与 `warnings`。
+- `pip check` 仍运行。只有完整冲突行中的包名、精确官方要求和实际安装版本都对应同一已允许差异，
+  才归类到 `pip_check.accepted_differences`。已通过来源验证的 Ascend SCM 版本对 `==0.23.0`
+  的差异也按此规则处理。
+- 其他依赖冲突、缺包、未知输出、异常退出或无法完成检查都进入 `blocking_issues` 并停止。
+  不能因为某一行出现 `torch-npu` 字样就忽略该行，更不能忽略所有 `pip check` 失败。
+- 原始 pip `exit`、`stdout`、`stderr`、`output` 保留；只有已允许差异时，pip 的分类状态为
+  `passed_with_accepted_differences`，随后仍运行真实导入和接口检查，再进入原有算子/模型预检。
+
+为兼容既有报告消费者，顶层 `status` 仍使用 `passed` / `metadata_pass` / `failed`，另以
+`validation_profile=accepted_version_differences` 明确区分偏离官方 pins 的测试环境。
+`metadata_pass` 不代表已执行 pip、运行时或设备测试。优化验收终端会显示脱敏、限长的
+`OPTIMIZATION_WARNING`；后续若有失败，只将尚未接受的阻塞项列为失败原因。
+
+本次不改 `requirements.txt` / `pyproject.toml` 的官方安装 pins，不重装任何包，不改包的版本号。
+因此在开发栈中单独执行原生 `python -m pip check` 仍可能返回这些差异；复测工具会保留并分类它们，
+而不是修改系统里的 pip 行为。更新 Python 脚本即可沿用已经编好的 V1 库，无需为此重编译。
 
 ```bash
 python -c 'import sys, vllm, vllm_ascend; print(sys.executable); print(vllm.__file__); print(vllm_ascend.__file__)'
