@@ -145,6 +145,149 @@ def test_default_request_schedule_is_unchanged_batched_only():
     ]
 
 
+def test_graph_plan_uses_same_engine_device_route_eager_no_v1_load(tmp_path):
+    args = arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--plan-only")
+    steps = dict(accept.commands(args, tmp_path / "report"))
+    assert "v1_reference" not in steps
+    assert "--queue-lifetime" in steps["graph_preflight"]
+    assert benchmark.parse_args(steps["v4"][3:]).decode_graph == "moe"
+    schedule = list(benchmark.request_schedule(2, 5, device_route_decode=True, decode_graph="moe"))
+    assert schedule[:4] == [
+        ("warmup", 0, "device_route_decode"),
+        ("warmup", 0, "moe_graph"),
+        ("warmup", 1, "moe_graph"),
+        ("warmup", 1, "device_route_decode"),
+    ]
+    assert "batched" not in {mode for _, _, mode in schedule}
+
+
+def test_graph_case_matrix_includes_singleton_prefill(tmp_path):
+    args = arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--cases", "1:4,10:4")
+    steps = dict(accept.commands(args, tmp_path / "report"))
+    assert benchmark.parse_args(steps["v4"][3:]).cases == [(1, 4), (10, 4)]
+
+
+@pytest.mark.parametrize("cases", [[], [(0, 4)], [(1, 1)], [(True, 4)], [(1, 128)], [(1, 4), (1, 4)]])
+def test_v4_singleton_case_support_keeps_other_bounds(cases):
+    with pytest.raises(ValueError):
+        benchmark.validate_v4_cases(cases)
+
+
+@pytest.mark.parametrize("extra", [[], ["--device-route-decode", "--compare-v1"]])
+def test_graph_plan_rejects_wrong_baseline(tmp_path, extra):
+    with pytest.raises(SystemExit):
+        arguments(tmp_path, "--decode-graph", "moe", *extra)
+
+
+def graph_activity(enabled=True):
+    before = {
+        str(i): {
+            "ready": True,
+            "enabled": enabled,
+            "captures": 1,
+            "entries": 1,
+            "replays": 10,
+            "signature": {"shape": [1, 4096]},
+        }
+        for i in range(benchmark.LAYERS)
+    }
+    after = copy.deepcopy(before)
+    for record in after.values():
+        record["replays"] += 3 if enabled else 0
+    return before, after
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_graph_evidence_excludes_prefill_and_captures(enabled):
+    before, after = graph_activity(enabled)
+    evidence = benchmark.check_graph_activity(before, after, 4, enabled=enabled)
+    assert evidence["per_layer_decode_replays"] == (3 if enabled else 0)
+    assert evidence["measured_capture_delta"] == 0 and not evidence["full_model_graph_verified"]
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("replays", 14),
+        ("replays", True),
+        ("captures", 2),
+        ("captures", True),
+        ("entries", 0),
+        ("entries", True),
+        ("ready", False),
+        ("enabled", False),
+        ("failed", True),
+        ("signature", {}),
+    ],
+)
+def test_graph_evidence_fails_closed_for_fallback_recapture_or_stale_state(key, value):
+    before, after = graph_activity()
+    after["42"][key] = value
+    with pytest.raises(ValueError):
+        benchmark.check_graph_activity(before, after, 4)
+
+
+def graph_receipt():
+    samples = []
+    for kind, count in (("warmup", 2), ("measured", 5)):
+        for mode in ("device_route_decode", "moe_graph"):
+            for repeat in range(count):
+                before, after = graph_activity(mode == "moe_graph")
+                samples.append(
+                    dict(
+                        case="p10-o4",
+                        kind=kind,
+                        repeat=repeat,
+                        optimization=mode,
+                        graph_before=before,
+                        graph_after=after,
+                    )
+                )
+    return {
+        "cases": {"p10-o4": {"status": "PASS", "graph_comparison": {"accepted": True}}},
+        "samples": samples,
+    }
+
+
+def test_graph_supervisor_rechecks_layer_evidence_for_both_modes(tmp_path):
+    accept.check_graph_receipt(graph_receipt(), arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe"))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "empty",
+        "missing_case",
+        "missing_sample",
+        "duplicate_index",
+        "baseline_replay",
+        "candidate_stale",
+        "missing_graph",
+        "nonexact",
+    ],
+)
+def test_graph_supervisor_rejects_empty_partial_or_mislabelled_pass(tmp_path, mutation):
+    result = graph_receipt()
+    if mutation == "empty":
+        result = {"cases": {}, "samples": []}
+    elif mutation == "missing_case":
+        result["cases"] = {"p1-o4": result["cases"]["p10-o4"]}
+    elif mutation == "missing_sample":
+        result["samples"].pop()
+    elif mutation == "duplicate_index":
+        result["samples"][-1]["repeat"] = 0
+    elif mutation == "baseline_replay":
+        result["samples"][0]["graph_after"]["0"]["replays"] += 1
+    elif mutation == "candidate_stale":
+        result["samples"][-1]["graph_after"] = result["samples"][-1]["graph_before"]
+    elif mutation == "missing_graph":
+        result["samples"][-1].pop("graph_before")
+    else:
+        result["cases"]["p10-o4"]["graph_comparison"]["accepted"] = False
+    with pytest.raises(ValueError):
+        accept.check_graph_receipt(result, arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe"))
+
+
 def test_device_route_schedule_warms_both_then_alternates_ab_ba_without_extra_loads():
     schedule = list(benchmark.request_schedule(2, 5, device_route_decode=True))
     assert len(schedule) == 14

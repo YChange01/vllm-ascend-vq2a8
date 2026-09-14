@@ -65,7 +65,15 @@ def _model(*, serving=True):
     cls = next(
         node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "VQ2A8TP1OfflineForCausalLM"
     )
-    methods = {"__init__", "load_weights", "_configure_v3_serving", "_retain_finite_flag", "forward", "compute_logits"}
+    methods = {
+        "__init__",
+        "load_weights",
+        "_configure_v3_serving",
+        "_retain_finite_flag",
+        "forward",
+        "_forward_without_v4_graph_phase",
+        "compute_logits",
+    }
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in methods]
     cls.bases = [ast.Name(id="Parent", ctx=ast.Load())]
     layers = {

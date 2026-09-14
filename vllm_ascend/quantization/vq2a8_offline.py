@@ -59,6 +59,7 @@ def offline_engine_options(
     v3_serving=False,
     v4_serving=False,
     v4_device_route_decode=False,
+    v4_decode_graph="none",
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
@@ -83,6 +84,10 @@ def offline_engine_options(
         raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
     if type(v4_device_route_decode) is not bool or (v4_device_route_decode and execution_policy != "ascendc_v4"):
         raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
+    if v4_decode_graph not in ("none", "moe") or (
+        v4_decode_graph != "none" and (execution_policy != "ascendc_v4" or not v4_device_route_decode)
+    ):
+        raise ValueError("v4_decode_graph requires none|moe; moe requires V4 device-route decode.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
@@ -133,6 +138,7 @@ def offline_engine_options(
                 **({"v3_serving": True} if v3_serving else {}),
                 **({"v4_serving": True} if v4_serving else {}),
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
+                **({"v4_decode_graph": v4_decode_graph} if v4_decode_graph != "none" else {}),
                 "cache_experts": 256 if execution_policy in CACHE_EXECUTION_POLICIES else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
@@ -186,6 +192,7 @@ def validate_offline_config(config) -> dict:
         "v3_serving",
         "v4_serving",
         "v4_device_route_decode",
+        "v4_decode_graph",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -314,6 +321,21 @@ def validate_offline_config(config) -> dict:
         "v4_device_route_decode" in options and options.get("execution_policy") != "ascendc_v4"
     ):
         raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
+    graph_mode = options.get("v4_decode_graph", "none")
+    if graph_mode not in ("none", "moe") or (
+        "v4_decode_graph" in options and options.get("execution_policy") != "ascendc_v4"
+    ):
+        raise ValueError("v4_decode_graph requires none|moe and execution_policy=ascendc_v4.")
+    if graph_mode == "moe" and (tp_size != 1 or options.get("v4_device_route_decode") is not True):
+        raise ValueError("V4 MoE decode graph requires TP1 and v4_device_route_decode=true.")
+    if graph_mode == "moe":
+        graph_kv_bytes = getattr(config.cache_config, "kv_cache_memory_bytes", None)
+        if type(graph_kv_bytes) is not int or graph_kv_bytes <= 0:
+            raise ValueError(
+                "V4 MoE decode graph requires explicit positive kv_cache_memory_bytes for headroom accounting."
+            )
+        if graph_kv_bytes > options.get("cache_reserve_gib", 16.0) * GIB:
+            raise ValueError("V4 MoE graph KV cache must fit inside cache_reserve_gib.")
     trace_mode = options.get("v3_startup_trace", "off")
     if trace_mode not in ("off", "async", "sync"):
         raise ValueError("v3_startup_trace must be off, async or sync.")

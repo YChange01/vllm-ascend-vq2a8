@@ -774,6 +774,10 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        # Opt-in MoE-only capture happens after profiling/warmup and before
+        # worker readiness. It never runs decoder/attention or writes KV state.
+        if self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") == "moe":
+            self.model_runner.get_model().prepare_v4_graphs()
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:

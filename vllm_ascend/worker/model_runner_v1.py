@@ -2317,6 +2317,15 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            if self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") == "moe":
+                # CPU scheduler progress distinguishes a one-token prefill
+                # from decode. _dummy_run deliberately never sets this marker.
+                is_v4_decode = (
+                    self.input_batch.num_reqs == 1
+                    and scheduler_output.total_num_scheduled_tokens == 1
+                    and self.input_batch.num_computed_tokens_cpu[0] >= self.input_batch.num_prompt_tokens[0]
+                )
+                get_forward_context().vq2a8_request_phase = "decode" if is_v4_decode else "prefill"
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )

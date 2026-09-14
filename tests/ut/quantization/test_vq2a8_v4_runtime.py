@@ -78,6 +78,78 @@ def initialize(runtime):
     return runtime.initialize_resident(budget_bytes=plan["planned_bytes"])
 
 
+class FakeGraphState:
+    def __init__(self):
+        self.prepared = self.closed = False
+        self.replays = 0
+
+    def prepare_graph(self, runtime):
+        self.prepared = True
+
+    def forward_graph(self, runtime, hidden, input_ids):
+        self.replays += 1
+        return hidden + 1
+
+    def graph_snapshot(self):
+        return {"prepared": self.prepared, "captures": int(self.prepared), "replays": self.replays, "entries": 1}
+
+    def close_graph(self):
+        self.closed = True
+
+
+def test_graph_requires_explicit_prepare_and_semantic_decode(runtime, monkeypatch):
+    initialize(runtime)
+    with pytest.raises(RuntimeError, match="not prepared"):
+        runtime.set_v4_graph_enabled(True)
+    runtime._optimization = state = FakeGraphState()
+    runtime.trace_native, runtime.native_steps = True, []
+    runtime.prepare_v4_graph()
+    runtime.set_v4_graph_enabled(True)
+    hidden, ids = torch.zeros((1, 4), dtype=torch.bfloat16), torch.zeros((1,), dtype=torch.int32)
+    eager = []
+    monkeypatch.setattr(v1.AscendCVQ2TP1MoE, "forward", lambda *a: eager.append(True) or hidden)
+    assert runtime.forward(hidden, ids) is hidden  # M1 prefill is not decode.
+    assert state.replays == 0
+    runtime.set_v4_graph_phase(True)
+    assert torch.equal(runtime.forward(hidden, ids), hidden + 1)
+    assert state.replays == 1 and len(eager) == 1
+    assert runtime.native_steps == [
+        {"tokens": 1, "graph_replays": 1, "counter_scope": "graph_replay_not_native_launch"}
+    ]
+    assert runtime.v4_graph_report()["ready"] is True
+    runtime.set_v4_graph_enabled(False)
+    runtime.forward(hidden, ids)
+    assert state.replays == 1 and len(eager) == 2
+    with pytest.raises(RuntimeError, match="single-shot"):
+        runtime.prepare_v4_graph()
+
+
+def test_graph_abort_releases_graph_before_resident_payload(runtime, monkeypatch):
+    initialize(runtime)
+    runtime._optimization = state = FakeGraphState()
+    runtime.prepare_v4_graph()
+    original = state.close_graph
+
+    def close():
+        assert runtime._cache
+        original()
+
+    monkeypatch.setattr(state, "close_graph", close)
+    runtime.abort_residency()
+    assert state.closed and not runtime._cache and runtime._v4_graph_state is None
+
+
+def test_graph_failed_fence_retains_every_owner(runtime, monkeypatch):
+    initialize(runtime)
+    runtime._optimization = state = FakeGraphState()
+    runtime.prepare_v4_graph()
+    monkeypatch.setattr(v4, "synchronize_execution", lambda device: (_ for _ in ()).throw(RuntimeError("fence failed")))
+    with pytest.raises(RuntimeError, match="fence failed"):
+        runtime.abort_residency()
+    assert runtime._v4_graph_state is state and runtime._cache and not state.closed
+    assert runtime._resident_failed
+
+
 def test_plan_is_v1_rounded_full_residency_not_a_reduced_lru_cap():
     unit = 12 * 512
     layers = [layer_header(0, (0,)), layer_header(3, tuple(range(256)))]

@@ -55,6 +55,45 @@ def test_v4_is_opt_in_and_uses_the_v1_library_with_unchanged_startup_geometry(tm
     assert legacy["additional_config"]["vq2a8_offline"]["execution_policy"] == "ascendc"
 
 
+def test_moe_graph_options_are_explicit_and_keep_engine_eager(tmp_path):
+    plan = engine_options(tmp_path, v4_device_route_decode=True, v4_decode_graph="moe")
+    assert plan["enforce_eager"] is True
+    assert plan["compilation_config"] == {"mode": 0, "cudagraph_mode": "NONE"}
+    cfg = config(tmp_path)
+    cfg.additional_config = plan["additional_config"]
+    cfg.cache_config.kv_cache_memory_bytes = plan["kv_cache_memory_bytes"]
+    assert offline.validate_offline_config(cfg)["v4_decode_graph"] == "moe"
+    assert "v4_decode_graph" not in engine_options(tmp_path)["additional_config"]["vq2a8_offline"]
+
+
+@pytest.mark.parametrize("kv", [None, True, 0, -1, 17 * 1024**3])
+def test_graph_requires_explicit_kv_covered_by_existing_reserve(tmp_path, kv):
+    cfg = config(tmp_path)
+    cfg.additional_config["vq2a8_offline"].update(v4_device_route_decode=True, v4_decode_graph="moe")
+    cfg.cache_config.kv_cache_memory_bytes = kv
+    with pytest.raises(ValueError, match="kv_cache_memory_bytes|KV cache"):
+        offline.validate_offline_config(cfg)
+
+
+@pytest.mark.parametrize("mode", [True, False, None, "full", "v3", 1])
+def test_v4_unknown_graph_modes_fail_before_loading(tmp_path, mode):
+    with pytest.raises(ValueError, match="v4_decode_graph"):
+        engine_options(tmp_path, v4_device_route_decode=True, v4_decode_graph=mode)
+    cfg = config(tmp_path)
+    cfg.additional_config["vq2a8_offline"].update(v4_device_route_decode=True, v4_decode_graph=mode)
+    with pytest.raises(ValueError, match="v4_decode_graph"):
+        offline.validate_offline_config(cfg)
+
+
+def test_graph_requires_device_route_even_when_config_is_supplied_directly(tmp_path):
+    with pytest.raises(ValueError, match="device-route"):
+        engine_options(tmp_path, v4_decode_graph="moe")
+    cfg = config(tmp_path)
+    cfg.additional_config["vq2a8_offline"]["v4_decode_graph"] = "moe"
+    with pytest.raises(ValueError, match="device_route"):
+        offline.validate_offline_config(cfg)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [

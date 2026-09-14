@@ -27,7 +27,7 @@ from pathlib import Path
 from tools.profile_vq2a8_ascendc import digest, write_json
 from tools.vq2a8_baseline import capture_input_identity
 from tools.vq2a8_optimization_report import numerical_gate
-from tools.vq2a8_perf_report import MAX_CONTEXT, distribution, token_metrics, validate_cases
+from tools.vq2a8_perf_report import MAX_CONTEXT, distribution, token_metrics
 
 REPO = Path(__file__).resolve().parents[1]
 LAYERS = 43
@@ -37,13 +37,28 @@ SOURCE_NAMES = (
     "vllm_ascend/quantization/vq2a8_execution.py",
     "vllm_ascend/quantization/vq2a8_execution_v4.py",
     "vllm_ascend/quantization/vq2a8_v4_device_route.py",
+    "vllm_ascend/quantization/vq2a8_v4_graph.py",
     "vllm_ascend/quantization/vq2a8_optimization.py",
     "vllm_ascend/quantization/vq2a8_activation.py",
     "vllm_ascend/quantization/vq2a8_moe.py",
     "vllm_ascend/quantization/vq2a8_offline.py",
     "vllm_ascend/patch/worker/vq2a8_offline_model.py",
+    "vllm_ascend/worker/worker.py",
+    "vllm_ascend/worker/model_runner_v1.py",
     "tools/benchmark_vq2a8_v4.py",
 )
+
+
+def validate_v4_cases(cases):
+    """Include singleton prefill coverage without relaxing historical runners."""
+    if not cases or len(cases) > 12 or len(set(cases)) != len(cases):
+        raise ValueError("Require 1..12 distinct V4 cases.")
+    for prompt, output in cases:
+        if type(prompt) is not int or type(output) is not int or prompt < 1 or output < 2:
+            raise ValueError("V4 requires integer prompt >=1 and output >=2 for TPOT.")
+        if prompt + output > MAX_CONTEXT:
+            raise ValueError("V4 cases support at most 128 total tokens.")
+    return cases
 
 
 def parse_args(argv=None):
@@ -69,9 +84,14 @@ def parse_args(argv=None):
         action="store_true",
         help="Compare batched baseline and device-route decode in one V4 resident engine (requires rebuilt library)",
     )
+    parser.add_argument("--decode-graph", choices=("none", "moe"), default="none")
     args = parser.parse_args(argv)
+    if args.decode_graph == "moe" and (not args.device_route_decode or args.reference_report or args.reference_only):
+        parser.error(
+            "MoE graph compares with same-engine device-route eager; require --device-route-decode, no V1 reference."
+        )
     try:
-        args.cases = validate_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
+        args.cases = validate_v4_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     if args.physical_npu < 0 or args.warmups < 2 or args.repeats < 5:
@@ -101,9 +121,11 @@ def parse_args(argv=None):
     return args
 
 
-def request_schedule(warmups, repeats, *, device_route_decode=False):
+def request_schedule(warmups, repeats, *, device_route_decode=False, decode_graph="none"):
     """Warm both paths before alternating AB/BA; never rebuild/reload the engine."""
     modes = ("batched", "device_route_decode") if device_route_decode else ("batched",)
+    if decode_graph == "moe":
+        modes = ("device_route_decode", "moe_graph")
     for kind, count in (("warmup", warmups), ("measured", repeats)):
         for index in range(count):
             order = modes if index % 2 == 0 else tuple(reversed(modes))
@@ -120,6 +142,50 @@ def measured_metrics(samples, case, optimization):
     return {
         key: distribution([sample[key] for sample in measured])
         for key in ("ttft_s", "tpot_s", "e2e_s", "output_tokens_per_s", "device_span_ms")
+    }
+
+
+def set_graph_worker(worker, enabled):
+    return worker.get_model().set_v4_graph_enabled(enabled)
+
+
+def configure_v4(llm, *, measurement, optimization, graph_available=False):
+    from tools.benchmark_vq2a8_offline import configure
+    from tools.validate_vq2a8_tp1_offline import single_worker_result
+
+    preset = "device_route_decode" if optimization == "moe_graph" else optimization
+    configure(llm, measurement=measurement, compact=True, optimization=preset)
+    if graph_available:
+        single_worker_result(llm.collective_rpc(set_graph_worker, args=(optimization == "moe_graph",)))
+
+
+def check_graph_activity(before, after, output_tokens, *, enabled=True):
+    """Logical replay evidence plus strict per-layer readiness; not kernel timing."""
+    if type(output_tokens) is not int or output_tokens < 2 or type(enabled) is not bool:
+        raise ValueError("Graph evidence requires output >=2 and a boolean mode.")
+    expected = output_tokens - 1 if enabled else 0
+    if set(before) != {str(index) for index in range(LAYERS)} or set(after) != set(before):
+        raise ValueError("Missing per-layer MoE graph evidence.")
+    for layer, current in after.items():
+        previous = before[layer]
+        for record in (previous, current):
+            if record.get("ready") is not True or record.get("enabled") is not enabled or record.get("failed", False):
+                raise ValueError(f"Layer {layer} graph is not in the requested ready mode.")
+            if any(type(record.get(key)) is not int or record[key] != 1 for key in ("captures", "entries")):
+                raise ValueError(f"Layer {layer} graph was not captured exactly once.")
+            if not isinstance(record.get("signature"), dict) or not record["signature"]:
+                raise ValueError(f"Layer {layer} graph signature is missing.")
+        left, right = previous.get("replays"), current.get("replays")
+        if any(type(value) is not int or value < 0 for value in (left, right)) or right - left != expected:
+            raise ValueError(f"Layer {layer} replay count does not match decode tokens (prefill excluded).")
+        if previous.get("signature") != current.get("signature"):
+            raise ValueError(f"Layer {layer} graph signature changed during request.")
+    return {
+        "layers": LAYERS,
+        "per_layer_decode_replays": expected,
+        "measured_capture_delta": 0,
+        "scope": "logical_wrapper_replays_not_profiler_kernel_launches",
+        "full_model_graph_verified": False,
     }
 
 
@@ -216,15 +282,17 @@ def validate_sample(sample, tokens, count, *, resident):
                 raise ValueError("V4 measured request loaded, evicted or transferred an expert payload.")
 
 
-def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256, optimization="batched"):
+def diagnostic(
+    llm, prompt, count, target, *, policy, vocab, library_sha256, optimization="batched", graph_available=False
+):
     import torch
     from safetensors.torch import save_file
     from vllm import SamplingParams
 
-    from tools.benchmark_vq2a8_offline import configure, snapshot
+    from tools.benchmark_vq2a8_offline import snapshot
     from tools.validate_vq2a8_tp1_offline import capture_worker_trace, reset_worker_trace, single_worker_result
 
-    configure(llm, measurement=False, compact=True, optimization=optimization)
+    configure_v4(llm, measurement=False, optimization=optimization, graph_available=graph_available)
     before = snapshot(llm)
     if policy == V4_POLICY:
         check_residency(before)
@@ -240,6 +308,11 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256, opt
         check_residency(after)
         check_no_payload_transfer(before, after)
     route_activity = None
+    graph_activity = None
+    if graph_available:
+        graph_activity = check_graph_activity(
+            before.get("graph", {}), after.get("graph", {}), count, enabled=optimization == "moe_graph"
+        )
     if optimization == "device_route_decode":
         route_activity = check_device_route_activity(before["optimization"], after["optimization"], len(prompt), count)
     if len(result) != 1 or not result[0].finished or len(result[0].outputs) != 1:
@@ -276,7 +349,11 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256, opt
     for record in records:
         if len(record["steps"]) != count:
             raise ValueError("Missing native per-step coverage.")
-        for actual, wanted in zip(record["steps"], expected):
+        for index, (actual, wanted) in enumerate(zip(record["steps"], expected)):
+            if optimization == "moe_graph" and index > 0:
+                if actual != {"tokens": 1, "graph_replays": 1, "counter_scope": "graph_replay_not_native_launch"}:
+                    raise ValueError("Missing decode graph trace evidence.")
+                continue
             if (
                 any(
                     type(actual.get(key)) is not int
@@ -296,6 +373,8 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256, opt
     record = {"tokens": tokens, "evidence": evidence, "logits_sha256": digest(target), "logits_file": target.name}
     if route_activity is not None:
         record["device_route_activity"] = route_activity
+    if graph_activity is not None:
+        record["graph_activity"] = graph_activity
     write_json(target.with_suffix(".json"), record)
     return record, logits
 
@@ -314,7 +393,7 @@ def comparison_reference(path, identity):
 
 
 def run(args):
-    from tools.benchmark_vq2a8_offline import configure, preparation_preflight, snapshot, timed_request
+    from tools.benchmark_vq2a8_offline import preparation_preflight, snapshot, timed_request
     from tools.validate_vq2a8_ascendc import checked_model_preflight, require_hardware_runtime
     from tools.validate_vq2a8_tp1_acceptance import acceptance_environment
     from tools.validate_vq2a8_v023_environment import check_runtime_environment
@@ -329,12 +408,17 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     path = output / "summary.json"
     policy = "ascendc" if args.reference_only else V4_POLICY
-    optimization = "device_route_decode" if args.device_route_decode else "batched"
+    graph_available = args.decode_graph == "moe"
+    optimization = (
+        "moe_graph" if graph_available else ("device_route_decode" if args.device_route_decode else "batched")
+    )
+    baseline_mode = "device_route_decode" if graph_available else "batched"
+    comparison_key = "graph_comparison" if graph_available else "device_route_comparison"
     report = dict(
         status="RUNNING",
         execution_policy=policy,
         optimization=optimization,
-        scope=SCOPE,
+        scope="TP1_B1_MOE_DECODE_GRAPH_WITH_EAGER_PREFILL_AND_ATTENTION" if graph_available else SCOPE,
         performance_measurement_verified=False,
         numerical_scope="repeatability_not_independent_model_accuracy",
         v1_comparison="NOT_RUN",
@@ -347,6 +431,13 @@ def run(args):
         full_model_graph_verified=False,
         performance_target_met=None,
         device_route_comparison="NOT_RUN",
+        graph_comparison="NOT_RUN",
+        requested_graph_mode=args.decode_graph,
+        effective_graph_mode="none",
+        graph_scope="moe_decode1_only" if graph_available else "none",
+        baseline_mode=baseline_mode,
+        graph_functional_verified=False,
+        graph_performance_target_met=None,
     )
     write_json(path, report)
     try:
@@ -409,6 +500,7 @@ def run(args):
             ascendc_library=library["path"],
             ascendc_sha256=library["sha256"],
             **({"v4_device_route_decode": True} if args.device_route_decode else {}),
+            v4_decode_graph=args.decode_graph,
             **({"cache_memory_fraction": args.memory_fraction} if args.memory_fraction is not None else {}),
         )
         options.update(
@@ -423,7 +515,7 @@ def run(args):
         llm = LLM(**options)
         report["engine_init_profile_kv_s"] = time.perf_counter() - started
         # Same point as V1: retain its original startup dummy geometry.
-        configure(llm, measurement=False, compact=True, optimization="batched")
+        configure_v4(llm, measurement=False, optimization=baseline_mode, graph_available=graph_available)
         report["startup_snapshot"] = snapshot(llm)
         if policy == V4_POLICY:
             check_residency(report["startup_snapshot"])
@@ -451,11 +543,12 @@ def run(args):
                     llm,
                     prompt,
                     count,
-                    output / f"{case}-batched.safetensors",
+                    output / f"{case}-{baseline_mode}.safetensors",
                     policy=policy,
                     vocab=config["vocab_size"],
                     library_sha256=library["sha256"],
-                    optimization="batched",
+                    optimization=baseline_mode,
+                    graph_available=graph_available,
                 )
                 entry["baseline_diagnostic"] = baseline_record
             record, logits = diagnostic(
@@ -467,15 +560,16 @@ def run(args):
                 vocab=config["vocab_size"],
                 library_sha256=library["sha256"],
                 optimization=optimization,
+                graph_available=graph_available,
             )
             entry["diagnostic"] = record
             if args.device_route_decode:
-                entry["device_route_comparison"] = numerical_gate(
+                entry[comparison_key] = numerical_gate(
                     baseline_record["tokens"], baseline_logits, record["tokens"], logits
                 )
-                if not entry["device_route_comparison"]["accepted"]:
+                if not entry[comparison_key]["accepted"]:
                     raise ValueError(
-                        "Device-route decode differs from same-engine batched logits/tokens; timing stopped."
+                        f"{optimization} differs from same-engine {baseline_mode} logits/tokens; timing stopped."
                     )
             repeated, repeat_logits = diagnostic(
                 llm,
@@ -486,6 +580,7 @@ def run(args):
                 vocab=config["vocab_size"],
                 library_sha256=library["sha256"],
                 optimization=optimization,
+                graph_available=graph_available,
             )
             entry["repeat"] = numerical_gate(record["tokens"], logits, repeated["tokens"], repeat_logits)
             if not entry["repeat"]["accepted"]:
@@ -505,9 +600,9 @@ def run(args):
                     raise ValueError("V4 differs from measured V1 batched logits/tokens; timing stopped.")
             write_json(path, report)
             for kind, index, sample_optimization in request_schedule(
-                args.warmups, args.repeats, device_route_decode=args.device_route_decode
+                args.warmups, args.repeats, device_route_decode=args.device_route_decode, decode_graph=args.decode_graph
             ):
-                configure(llm, measurement=True, compact=True, optimization=sample_optimization)
+                configure_v4(llm, measurement=True, optimization=sample_optimization, graph_available=graph_available)
                 before = snapshot(llm)
                 if policy == V4_POLICY:
                     check_residency(before)
@@ -518,6 +613,16 @@ def run(args):
                 report["samples"].append(sample)
                 write_json(path, report)
                 after = snapshot(llm)
+                if graph_available:
+                    sample["graph_before"], sample["graph_after"] = before.get("graph", {}), after.get("graph", {})
+                    sample["graph_activity"] = check_graph_activity(
+                        sample["graph_before"], sample["graph_after"], count, enabled=sample_optimization == "moe_graph"
+                    )
+                    sample["native_counter_scope"] = (
+                        "eager_prefill_submissions_only_graph_replays_reported_separately"
+                        if sample_optimization == "moe_graph"
+                        else "eager_prefill_and_decode_submissions"
+                    )
                 if policy == V4_POLICY:
                     check_residency(after)
                     check_no_payload_transfer(before, after)
@@ -549,10 +654,15 @@ def run(args):
                 )
             entry["metrics"] = measured_metrics(report["samples"], case, optimization)
             if args.device_route_decode:
-                entry["baseline_metrics"] = measured_metrics(report["samples"], case, "batched")
-                entry["tpot_ratio_vs_same_engine_batched"] = (
-                    entry["metrics"]["tpot_s"]["median"] / entry["baseline_metrics"]["tpot_s"]["median"]
-                )
+                entry["baseline_metrics"] = measured_metrics(report["samples"], case, baseline_mode)
+                ratio = entry["metrics"]["tpot_s"]["median"] / entry["baseline_metrics"]["tpot_s"]["median"]
+                entry[
+                    "tpot_ratio_vs_same_engine_device_route" if graph_available else "tpot_ratio_vs_same_engine_batched"
+                ] = ratio
+                if graph_available:
+                    entry["graph_performance_target_met"] = ratio <= 0.9 and (
+                        entry["metrics"]["ttft_s"]["median"] <= 1.05 * entry["baseline_metrics"]["ttft_s"]["median"]
+                    )
             entry["status"] = "PASS"
             write_json(path, report)
         if (
@@ -565,7 +675,15 @@ def run(args):
             status="PASS",
             performance_measurement_verified=True,
             v1_comparison="PASS" if reference is not None else "NOT_RUN",
-            device_route_comparison="PASS" if args.device_route_decode else "NOT_RUN",
+            device_route_comparison="PASS" if args.device_route_decode and not graph_available else "NOT_RUN",
+            graph_comparison="PASS" if graph_available else "NOT_RUN",
+            graph_functional_verified=graph_available,
+            effective_graph_mode=args.decode_graph,
+            graph_performance_target_met=(
+                all(case["graph_performance_target_met"] for case in report["cases"].values())
+                if graph_available
+                else None
+            ),
         )
         return 0
     except KeyboardInterrupt:

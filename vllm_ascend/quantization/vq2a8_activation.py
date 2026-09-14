@@ -21,6 +21,7 @@ class RowwiseVQ2A8Preparation:
     def __init__(self, *, compact=False, validity=None):
         self._key = None
         self._hadamard = None
+        self._graph_key = None
         self.compact = compact
         # A private offline probe may defer the decision until its snapshot.
         # Still scan every input: no cached or skipped validity decisions.
@@ -49,7 +50,7 @@ class RowwiseVQ2A8Preparation:
             return tuple(value.contiguous() for value in prepared[0])
         return tuple(torch.cat(values, dim=0).contiguous() for values in zip(*prepared))
 
-    def many(self, requests):
+    def many(self, requests, *, validity=None):
         """Batch pointwise work, but keep every RHT and bias GEMV one-row.
 
         All inputs are revalidated on every call, in one collective decision.
@@ -87,7 +88,10 @@ class RowwiseVQ2A8Preparation:
         # Equality with -1/+1 is exact in int8; no widening buffer is needed.
         signs = rht_sign if self.compact else rht_sign.to(torch.int16)
         valid = valid & ((signs == -1) | (signs == 1)).all()
-        self._validate(valid)
+        if validity is None:
+            self._validate(valid)
+        else:
+            validity(valid)
         self._ensure_hadamard(first.device, block)
         signed = x.reshape(-1, width // block, block) * rht_sign.float().reshape(-1, width // block, block)
         # Do not turn these into a batched GEMM: its rounding may differ on NPU.
@@ -139,8 +143,21 @@ class RowwiseVQ2A8Preparation:
             if tensor.shape != (width,) or tensor.dtype != dtype or tensor.device != activation.device:
                 raise ValueError(f"{name} must be {dtype}[{width}] on {activation.device}.")
 
+    def prepare_for_graph(self, device, rht_block_size):
+        """Initialize and freeze one projection's constant before capture.
+
+        Use a separate preparation object per projection geometry. This does
+        not cache validity or alter the original row-wise RHT arithmetic.
+        """
+        if type(rht_block_size) is not int or rht_block_size <= 0 or rht_block_size & (rht_block_size - 1):
+            raise ValueError("Graph preparation requires a positive power-of-two RHT block.")
+        self._ensure_hadamard(torch.device(device), rht_block_size)
+        self._graph_key = self._key
+
     def _ensure_hadamard(self, device, rht_block_size):
         key = (device, rht_block_size)
+        if self._graph_key is not None and key != self._graph_key:
+            raise RuntimeError("Graph preparation geometry changed; constants cannot initialize during capture/replay.")
         if self._key != key:
             # Never generate the FP64 Sylvester matrix on the default NPU.
             with torch.device("cpu"):

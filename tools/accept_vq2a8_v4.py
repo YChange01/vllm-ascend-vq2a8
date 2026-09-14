@@ -27,11 +27,10 @@ import time
 from pathlib import Path
 
 from tools.accept_vq2a8_optimizations import failure_causes
-from tools.benchmark_vq2a8_v4 import require_idle_device
+from tools.benchmark_vq2a8_v4 import check_graph_activity, require_idle_device, validate_v4_cases
 from tools.diagnose_vq2a8_tp1_startup import terminate_child
 from tools.profile_vq2a8_ascendc import write_json
 from tools.vq2a8_live_log import LiveChildLog
-from tools.vq2a8_perf_report import validate_cases
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -59,9 +58,15 @@ def parse_args(argv=None):
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--decode-graph", choices=("none", "moe"), default="none")
     args = parser.parse_args(argv)
+    if args.decode_graph == "moe" and (not args.device_route_decode or args.compare_v1):
+        parser.error(
+            "--decode-graph moe requires --device-route-decode and uses its same-engine eager baseline, "
+            "not --compare-v1."
+        )
     try:
-        cases = validate_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
+        cases = validate_v4_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
     if args.physical_npu < 0 or args.warmups < 2 or args.repeats < 5 or args.timeout < 1:
@@ -125,6 +130,23 @@ def commands(args, output):
                 ],
             )
         )
+    if args.decode_graph == "moe":
+        steps.append(
+            (
+                "graph_preflight",
+                [
+                    *base,
+                    str(REPO / "tools/validate_vq2a8_v4_graph.py"),
+                    "--library",
+                    str(args.library.resolve()),
+                    "--physical-npu",
+                    str(args.physical_npu),
+                    "--report-dir",
+                    str(output / "graph_preflight"),
+                    "--queue-lifetime",
+                ],
+            )
+        )
     worker = [
         *base,
         str(REPO / "tools/benchmark_vq2a8_v4.py"),
@@ -164,6 +186,7 @@ def commands(args, output):
                 "--output-dir",
                 str(output / "v4"),
                 *(["--device-route-decode"] if args.device_route_decode else []),
+                *(["--decode-graph", "moe"] if args.decode_graph == "moe" else []),
                 *(["--reference-report", str(output / "v1_reference/summary.json")] if args.compare_v1 else []),
             ],
         )
@@ -221,6 +244,41 @@ def supervise(command, log, environment, timeout):
     }
 
 
+def check_graph_receipt(result, args):
+    """Require the complete same-engine matrix, not just a top-level PASS."""
+    cases = [tuple(map(int, case.split(":"))) for case in args.cases.split(",")]
+    expected = {f"p{prompt}-o{count}": count for prompt, count in cases}
+    if set(result.get("cases", {})) != set(expected):
+        raise ValueError("Graph acceptance is missing the requested case matrix.")
+    samples = result.get("samples", [])
+    if len(samples) != len(expected) * 2 * (args.warmups + args.repeats):
+        raise ValueError("Graph acceptance has an incomplete or duplicated sample matrix.")
+    for name, count in expected.items():
+        case = result["cases"][name]
+        if case.get("status") != "PASS" or case.get("graph_comparison", {}).get("accepted") is not True:
+            raise ValueError("Graph acceptance requires exact per-case comparison evidence.")
+        for kind, size in (("warmup", args.warmups), ("measured", args.repeats)):
+            for mode in ("device_route_decode", "moe_graph"):
+                selected = [
+                    sample
+                    for sample in samples
+                    if sample.get("case") == name and sample.get("kind") == kind and sample.get("optimization") == mode
+                ]
+                if (
+                    len(selected) != size
+                    or any(type(sample.get("repeat")) is not int for sample in selected)
+                    or sorted(sample["repeat"] for sample in selected) != list(range(size))
+                ):
+                    raise ValueError("Graph acceptance is missing unique warmup/measured sample indices.")
+                for sample in selected:
+                    check_graph_activity(
+                        sample.get("graph_before", {}),
+                        sample.get("graph_after", {}),
+                        count,
+                        enabled=mode == "moe_graph",
+                    )
+
+
 def run(args):
     output = (
         args.output_dir
@@ -251,6 +309,11 @@ def run(args):
         default_v1_unchanged=True,
         device_snapshots=[],
         device_route_comparison="NOT_RUN",
+        graph_comparison="NOT_RUN",
+        requested_graph_mode=args.decode_graph,
+        effective_graph_mode="none",
+        graph_functional_verified=False,
+        full_model_graph_verified=False,
     )
     try:
         for name, command in steps:
@@ -272,20 +335,43 @@ def run(args):
             or (args.compare_v1 and result.get("v1_comparison") != "PASS")
             or (
                 args.device_route_decode
+                and args.decode_graph == "none"
                 and (
                     result.get("optimization") != "device_route_decode"
                     or result.get("device_route_comparison") != "PASS"
                 )
             )
+            or (
+                args.decode_graph == "moe"
+                and (
+                    result.get("optimization") != "moe_graph"
+                    or result.get("graph_comparison") != "PASS"
+                    or result.get("graph_functional_verified") is not True
+                    or result.get("effective_graph_mode") != "moe"
+                    or result.get("full_model_graph_verified") is not False
+                )
+            )
         ):
             raise ValueError("V4 child did not provide complete requested acceptance evidence.")
+        graph_mode = args.decode_graph == "moe"
+        if graph_mode:
+            check_graph_receipt(result, args)
         report.update(
             status="PASS",
             performance_measurement_verified=True,
             v1_comparison=result["v1_comparison"],
             result=str(output / "v4/summary.json"),
             device_route_comparison=result.get("device_route_comparison", "NOT_RUN"),
+            graph_comparison=result.get("graph_comparison", "NOT_RUN"),
+            graph_performance_target_met=result.get("graph_performance_target_met"),
+            effective_graph_mode=result.get("effective_graph_mode", "none"),
+            graph_functional_verified=result.get("graph_functional_verified", False),
+            graph_scope=result.get("graph_scope", "none"),
+            baseline_mode=result.get("baseline_mode", "batched"),
         )
+        candidate = "moe_graph" if graph_mode else "device_route_decode"
+        baseline_mode = "device_route_decode" if graph_mode else "batched"
+        comparison_key = "graph_comparison" if graph_mode else "device_route_comparison"
         for name, case in result["cases"].items():
             metrics = case["metrics"]
             measured = [
@@ -293,7 +379,7 @@ def run(args):
                 for sample in result["samples"]
                 if sample["case"] == name
                 and sample["kind"] == "measured"
-                and (not args.device_route_decode or sample.get("optimization") == "device_route_decode")
+                and (not args.device_route_decode or sample.get("optimization") == candidate)
             ]
             if len(measured) != args.repeats or any(
                 type(sample.get("expert_payload_h2d_bytes")) is not int or sample["expert_payload_h2d_bytes"] != 0
@@ -307,7 +393,7 @@ def run(args):
                     for sample in result["samples"]
                     if sample["case"] == name
                     and sample["kind"] == "measured"
-                    and sample.get("optimization") == "batched"
+                    and sample.get("optimization") == baseline_mode
                 ]
                 if (
                     len(baseline) != args.repeats
@@ -316,14 +402,22 @@ def run(args):
                         or sample["expert_payload_h2d_bytes"] != 0
                         for sample in baseline
                     )
-                    or case.get("device_route_comparison", {}).get("accepted") is not True
+                    or case.get(comparison_key, {}).get("accepted") is not True
                 ):
                     raise ValueError("Missing same-engine baseline or exact device-route comparison evidence.")
                 comparison = {
-                    "same_engine_batched_tpot_median_s": case["baseline_metrics"]["tpot_s"]["median"],
-                    "tpot_ratio_vs_same_engine_batched": case["tpot_ratio_vs_same_engine_batched"],
-                    "device_route_comparison": "PASS",
+                    "baseline_mode": baseline_mode,
+                    "same_engine_baseline_tpot_median_s": case["baseline_metrics"]["tpot_s"]["median"],
+                    "tpot_ratio_vs_same_engine_baseline": case[
+                        "tpot_ratio_vs_same_engine_device_route" if graph_mode else "tpot_ratio_vs_same_engine_batched"
+                    ],
+                    comparison_key: "PASS",
                 }
+                if not graph_mode:
+                    comparison.update(
+                        same_engine_batched_tpot_median_s=case["baseline_metrics"]["tpot_s"]["median"],
+                        tpot_ratio_vs_same_engine_batched=case["tpot_ratio_vs_same_engine_batched"],
+                    )
             print(
                 "V4_RESULT "
                 + json.dumps(

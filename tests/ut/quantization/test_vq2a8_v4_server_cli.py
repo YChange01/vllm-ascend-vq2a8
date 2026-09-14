@@ -35,6 +35,37 @@ def test_v4_server_defaults_are_single_card_small_eager_and_v1_library():
     assert args.library.parent.name == "vq2a8-ascendc-v023-v1"
     assert args.library.name == "libvq2a8_ascendc.so"
     assert args.device_route_decode is False
+    assert args.decode_graph == "none"
+
+
+def test_moe_subgraph_cli_keeps_engine_eager_and_does_not_change_budget(tmp_path):
+    argv, _, _ = assets(tmp_path)
+    args = server.parse_args(
+        [
+            *argv,
+            "--device-route-decode",
+            "--decode-graph",
+            "moe",
+            "--max-model-len",
+            "16",
+            "--kv-cache-mib",
+            "256",
+            "--reserve-gib",
+            "3",
+        ]
+    )
+    command = server.build_command(args)
+    config = json.loads(value(command, "--additional-config"))["vq2a8_offline"]
+    assert config["v4_decode_graph"] == "moe" and config["v4_device_route_decode"] is True
+    assert "--enforce-eager" in command
+    assert json.loads(value(command, "--compilation-config")) == {"mode": 0, "cudagraph_mode": "NONE"}
+    assert config["cache_reserve_gib"] == 3 and value(command, "--kv-cache-memory-bytes") == str(256 * 1024**2)
+
+
+@pytest.mark.parametrize("args", [["--decode-graph", "moe"], ["--device-route-decode", "--decode-graph", "full"]])
+def test_graph_cli_rejects_missing_device_route_and_unimplemented_full_mode(args):
+    with pytest.raises(SystemExit):
+        server.parse_args(args)
 
 
 def test_v4_server_uses_standard_cli_and_exact_tp1_contract_without_preflights(tmp_path):

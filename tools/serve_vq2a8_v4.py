@@ -58,7 +58,15 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dry-run", action="store_true", help="Print the command without importing or running vLLM/NPU"
     )
+    parser.add_argument(
+        "--decode-graph",
+        choices=("none", "moe"),
+        default="none",
+        help="Opt-in single-token MoE NPUGraph; requires --device-route-decode; Attention/prefill stay eager",
+    )
     args = parser.parse_args(argv)
+    if args.decode_graph == "moe" and not args.device_route_decode:
+        parser.error("--decode-graph moe requires --device-route-decode.")
     if args.physical_npu < 0 or not 1 <= args.port <= 65535:
         parser.error("Require a nonnegative physical NPU and port in [1,65535].")
     if not args.host or any(character.isspace() for character in args.host):
@@ -109,6 +117,8 @@ def build_command(args):
     }
     if args.device_route_decode:
         additional["vq2a8_offline"]["v4_device_route_decode"] = True
+    if args.decode_graph != "none":
+        additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
     overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
     return [
         sys.executable,
@@ -204,7 +214,8 @@ def main(argv=None):
             print(
                 f"Starting vllm serve at http://{args.host}:{args.port} "
                 f"(V4 TP1, device selector {args.physical_npu}, "
-                f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, full residency). "
+                f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
+                f"decode_graph={args.decode_graph}, full residency). "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
             )

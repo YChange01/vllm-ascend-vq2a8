@@ -99,6 +99,10 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         self._preload_elapsed_s = 0.0
         self._resident_cleanup_error = None
         self._device_route_banks = None
+        self._v4_graph_enabled = False
+        self._v4_graph_is_decode = False
+        self._v4_graph_state = None
+        self._v4_graph_bypasses = {}
 
     def _require_ready(self):
         if not self._resident_ready or self._resident_failed:
@@ -195,7 +199,75 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
 
     def forward(self, hidden, input_ids=None):
         self._require_ready()
+        if self._v4_graph_enabled:
+            if self._v4_graph_state is None:
+                raise RuntimeError("V4 MoE graph must be prepared before requests; lazy capture is forbidden.")
+            if self._v4_graph_is_decode:
+                if getattr(self, "_optimization", None) is not self._v4_graph_state:
+                    raise RuntimeError("V4 MoE graph requires the prepared device-route preset.")
+                output = self._v4_graph_state.forward_graph(self, hidden, input_ids)
+                if self.trace_native:
+                    if len(self.native_steps) >= 128:
+                        raise ValueError("Native model trace exceeded the offline step bound.")
+                    self.native_steps.append(
+                        {
+                            "tokens": hidden.shape[0],
+                            "graph_replays": 1,
+                            "counter_scope": "graph_replay_not_native_launch",
+                        }
+                    )
+                return output
+            reason = "prefill_or_dummy"
+            self._v4_graph_bypasses[reason] = self._v4_graph_bypasses.get(reason, 0) + 1
         return super().forward(hidden, input_ids)
+
+    def prepare_v4_graph(self):
+        """Explicit startup operation; preserve the eager bank and mathematics."""
+        self._require_ready()
+        state = getattr(self, "_optimization", None)
+        if state is None or not hasattr(state, "prepare_graph"):
+            raise RuntimeError("Prepare V4 graphs only after selecting device_route_decode.")
+        if self._v4_graph_state is not None:
+            raise RuntimeError("V4 MoE graph preparation is single-shot.")
+        # Keep owners even when capture/fencing fails; abort_residency releases
+        # only after a successful device completion fence.
+        self._v4_graph_state = state
+        state.prepare_graph(self)
+        return self.v4_graph_report()
+
+    def set_v4_graph_phase(self, is_decode: bool):
+        if type(is_decode) is not bool:
+            raise ValueError("V4 graph phase must be an explicit boolean.")
+        self._v4_graph_is_decode = is_decode
+
+    def set_v4_graph_enabled(self, enabled: bool):
+        if type(enabled) is not bool:
+            raise ValueError("V4 graph enabled must be boolean.")
+        if enabled and (self._v4_graph_state is None or self.v4_graph_report()["ready"] is not True):
+            raise RuntimeError("V4 MoE graph is not prepared.")
+        self._v4_graph_enabled = enabled
+
+    def v4_graph_report(self):
+        state = self._v4_graph_state
+        snapshot = (
+            state.graph_snapshot()
+            if state is not None
+            else {
+                "prepared": False,
+                "captures": 0,
+                "replays": 0,
+                "entries": 0,
+            }
+        )
+        return {
+            **snapshot,
+            "ready": snapshot.get("prepared") is True and not snapshot.get("failed", False),
+            "enabled": self._v4_graph_enabled,
+            "layer": self.layer_index,
+            "graph_scope": "moe_decode1_only",
+            "full_model_graph_verified": False,
+            "bypasses_by_reason": dict(self._v4_graph_bypasses),
+        }
 
     def clear_cache(self):
         raise RuntimeError("V4 resident weights cannot be evicted; stop the runtime or abort initialization.")
@@ -208,6 +280,7 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         """
         self._resident_failed = True
         self._resident_ready = False
+        self._v4_graph_enabled = False
         try:
             synchronize_execution(self.device)
         except BaseException as error:
@@ -215,6 +288,9 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
             raise
         # The optional native banks strongly own the same payload storage.
         # Release them only after the fence above, never while queued work runs.
+        if self._v4_graph_state is not None:
+            self._v4_graph_state.close_graph()
+            self._v4_graph_state = None
         self._device_route_banks = None
         self._optimization_states = {}
         self._optimization = None
