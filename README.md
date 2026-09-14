@@ -24,6 +24,11 @@ vLLM Ascend Plugin
 </p>
 
 ---
+
+**VQ2A8 v0.23 branch:** This fork is based on official vLLM Ascend v0.23.0.
+See the [VQ2A8 migration and installation guide](docs/vq2a8_v023_migration.md)
+before installing or reusing an existing v0.26 environment.
+
 *Latest News* 🔥
 
 - [2026/07] We released the new official version [v0.23.0](https://github.com/vllm-project/vllm-ascend/releases/tag/v0.23.0)! Please follow the [official guide](https://docs.vllm.ai/projects/ascend/en/v0.23.0/) to start using vLLM Ascend Plugin on Ascend.

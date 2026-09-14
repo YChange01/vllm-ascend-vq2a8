@@ -1,0 +1,390 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from safetensors.torch import save_file
+
+from tools import validate_vq2a8_tp1_acceptance as acceptance
+from tools import validate_vq2a8_tp1_moe as moe_gate
+from tools import validate_vq2a8_tp1_packed_kernel as gate
+from tools.validate_vq2a8_tp1_acceptance import acceptance_environment, format_compact_summary, summarize_log
+from vllm_ascend.quantization.vq2a8_reference import deepseek_v4_swiglu_reference
+from vllm_ascend.quantization.vq2a8_validation import audit_model_storage, validate_tolerances
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.1])
+def test_invalid_tolerance_cannot_make_a_gate_pass(value: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        validate_tolerances(value, 0.01)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        validate_tolerances(0.01, value)
+    with pytest.raises(ValueError):
+        deepseek_v4_swiglu_reference(torch.ones(1, 4), value)
+
+
+def test_small_signal_cannot_pass_only_because_of_large_atol() -> None:
+    with pytest.raises(AssertionError, match="relative_l2"):
+        gate._comparison_summary(torch.full((1, 8), 1e-6), torch.zeros(1, 8), rtol=0.03, atol=0.05)
+
+
+def test_passing_comparison_retains_scale_aware_metrics() -> None:
+    result = gate._comparison_summary(torch.ones(1, 8), torch.full((1, 8), 1.001), rtol=0.01, atol=0.001)
+    assert result["allclose"]
+    assert 0 < result["relative_l2_error"] < 0.002
+
+
+@pytest.mark.parametrize("returncode,timed_out,passed", [(0, False, True), (-6, False, False), (0, True, False)])
+def test_supervisor_does_not_trust_pass_text_after_abort(tmp_path, returncode, timed_out, passed) -> None:
+    log = tmp_path / "probe.log"
+    log.write_text("KERNEL 0:0:gate_up\nVQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS {}\nerrorStr: MTE alignment\n")
+    result = summarize_log(log, returncode, timed_out=timed_out)
+    assert result["passed"] is passed
+    assert result["last_stage"] == "KERNEL 0:0:gate_up"
+    assert result["error_excerpt"] == ["errorStr: MTE alignment"]
+
+
+def test_supervisor_requires_completion_marker(tmp_path) -> None:
+    log = tmp_path / "probe.log"
+    log.write_text('KERNEL_RESULT {"comparison": {"allclose": true}}\n')
+    assert not summarize_log(log, 0)["passed"]
+
+
+def test_supervisor_isolates_device_only_in_child(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("ASCEND_RT_VISIBLE_DEVICES", "4,5,6,7")
+    child = acceptance_environment(tmp_path, 4, "npu:0")
+    assert "WORLD_SIZE" not in child
+    assert child["ASCEND_RT_VISIBLE_DEVICES"] == "4"
+    assert os.environ["WORLD_SIZE"] == "4"
+
+
+def _audit_fixture(tmp_path: Path, route_id: int) -> SimpleNamespace:
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"vocab_size": 4, "num_experts_per_tok": 2}))
+    save_file(
+        {
+            "layers.0.ffn.gate.tid2eid": torch.full((4, 2), route_id, dtype=torch.int64),
+            "some_weight": torch.ones(2, 4, dtype=torch.bfloat16),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    layer = SimpleNamespace(expert_ids=(0,), tensor_shapes={"down_packed_indices": (1, 4, 4)})
+    return SimpleNamespace(
+        model_config_path=config,
+        layers={0: layer},
+        model_layout=SimpleNamespace(num_hash_layers=1),
+        manifest={"complete": True},
+        layer=lambda _: layer,
+    )
+
+
+def test_model_inventory_checks_hash_table_values_and_counts_bytes(tmp_path) -> None:
+    result = audit_model_storage(_audit_fixture(tmp_path, 0))
+    assert result["root_checkpoint_tensor_bytes"] == 80
+    assert result["artifact_expert_tensor_bytes"] == 64
+    assert result["hash_routing"][0]["duplicate_ids_within_topk"] is True
+    assert result["peak_hbm_verified"] is False
+
+
+def test_hash_layer_cannot_route_to_absent_stored_expert(tmp_path) -> None:
+    with pytest.raises(ValueError, match="missing artifact experts"):
+        audit_model_storage(_audit_fixture(tmp_path, 1))
+
+
+def test_expert_chain_uses_actual_gate_output(monkeypatch, tmp_path) -> None:
+    config = tmp_path / "config.json"
+    config.write_text('{"swiglu_limit": 10}')
+    cpu = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    actual = cpu + 0.001
+    calls = []
+
+    def projection(*positional, **kwargs):
+        calls.append(kwargs)
+        return {}, cpu, actual
+
+    monkeypatch.setattr(gate, "_run_projection", projection)
+    args = SimpleNamespace(cases=["deterministic"], warmups=0, repeats=1, rtol=0.03, atol=0.05, chain=True)
+    artifact = SimpleNamespace(model_config_path=config, model_layout=SimpleNamespace(num_routed_experts=256))
+    results = gate.run_probe_cases(artifact, gate.Probe(0, 0), torch.device("cpu"), args)
+    assert len(calls) == 3
+    assert "activation_device" not in calls[1]
+    torch.testing.assert_close(calls[2]["activation_device"], deepseek_v4_swiglu_reference(actual, 10))
+    torch.testing.assert_close(calls[2]["activation_cpu"], deepseek_v4_swiglu_reference(cpu, 10))
+    assert results[-1]["path"] == "gate_up_swiglu_down"
+
+
+def test_bad_middle_repeat_is_not_hidden_by_a_good_last_repeat(monkeypatch) -> None:
+    spec = SimpleNamespace(rht_true_columns=512, columns=512, rows=32, rht_block_size=128)
+    payload = {
+        "weight_scale": torch.ones(512),
+        "weight_bias": torch.zeros(512),
+        "rht_sign": torch.ones(512, dtype=torch.int8),
+        "packed_indices": torch.zeros(16, 64, dtype=torch.int32),
+        "codebooks": torch.zeros(2, 1, 16, 2).to(torch.float8_e4m3fn),
+        "codebook_tile_ids": torch.zeros(512, dtype=torch.uint8),
+    }
+    artifact = SimpleNamespace(load_expert=lambda *args: (payload, spec))
+    monkeypatch.setattr(gate, "decode_repacked_vq2a8_codebook_weight", lambda *a, **kw: torch.zeros(32, 512))
+    monkeypatch.setattr(gate, "vq2a8_predecoded_matmul_reference", lambda *a, **kw: torch.zeros(1, 32))
+    monkeypatch.setattr(
+        gate,
+        "prepare_repacked_vq2a8_activation_reference",
+        lambda *a: (torch.zeros(1, 512).to(torch.float8_e4m3fn), torch.ones(1), torch.zeros(1)),
+    )
+    monkeypatch.setattr(gate, "_synchronize", lambda *a: None)
+    outputs = iter([torch.zeros(1, 32), torch.zeros(1, 32), torch.ones(1, 32), torch.zeros(1, 32)])
+    monkeypatch.setattr(gate, "vq2a8_tp1_m1_packed_gemm", lambda *a: next(outputs))
+    with pytest.raises(AssertionError, match="Packed kernel mismatch"):
+        gate._run_projection(
+            artifact, gate.Probe(0, 0), 0, "gate_up", torch.device("cpu"), warmups=0, repeats=3, rtol=0.03, atol=0.05
+        )
+
+
+def test_supervisor_keeps_numerical_failure_and_prepared_input_evidence(tmp_path) -> None:
+    log = tmp_path / "probe.log"
+    log.write_text(
+        'PREPARED_INPUT_RESULT {"comparison": {"allclose": true}}\n'
+        'NUMERIC_FAILURE {"allclose": false, "relative_l2_error": 0.002}\n'
+    )
+    result = summarize_log(log, 1)
+    assert not result["passed"]
+    assert [record["type"] for record in result["records"]] == ["PREPARED_INPUT_RESULT", "NUMERIC_FAILURE"]
+
+
+def _report_fixture() -> dict:
+    probes = ["0:0", "1:0", "2:0", "3:0", "3:127", "3:255", "42:255"]
+    comparison = {"max_abs_error": 0.015625, "relative_l2_error": 0.0002}
+    records = [
+        {"type": "ENVIRONMENT", "data": {"git": {"head": "bb3b4fca", "status": ""}}},
+        {
+            "type": "CHAIN_RESULT",
+            "data": {
+                "case": "zero",
+                "comparison": comparison,
+                "same_prepared_input_comparison": comparison,
+                "determinism": {"allclose": True},
+                "repeats_checked": 3,
+            },
+        },
+        {"type": "VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS", "data": {"native_fp8_dot": False}},
+    ]
+    return {
+        "status": "passed",
+        "probes": probes,
+        "cases": ["zero"],
+        "device": "npu:0",
+        "physical_npu": 4,
+        "results": [{"probe": p, "passed": True, "records": records} for p in probes],
+    }
+
+
+def test_short_report_is_copyable_and_preserves_numeric_limits() -> None:
+    text = format_compact_summary(_report_fixture())
+    assert len(text) < 2500
+    assert len(text.splitlines()) == 13
+    assert "completed=7/7 passed=7" in text
+    assert "RUN_GIT=bb3b4fca" in text
+    assert "PROBE=42:255 PASS chain_cases=1 abs=0.015625 rel_l2=0.0002" in text
+    assert "same_fp8_abs=0.015625 repeat_min=3 det=PASS" in text
+    assert "NATIVE_FP8_DOT=False" in text
+    assert "SERVING_VERIFIED=False" in text
+
+
+def test_short_report_preserves_abort_and_truncates_error_text() -> None:
+    report = _report_fixture()
+    report.update(
+        status="failed",
+        results=[
+            {
+                "probe": "0:0",
+                "passed": False,
+                "returncode": -6,
+                "last_stage": "KERNEL 0:0",
+                "error_excerpt": ["MTE error " * 1000],
+            }
+        ],
+    )
+    text = format_compact_summary(report)
+    assert "ACCEPTANCE=FAIL completed=1/7 passed=0" in text
+    assert "exit=-6" in text and "stage=KERNEL 0:0" in text and "MTE error" in text
+    assert "abs=?" in text and "det=UNKNOWN_OR_FAIL" in text
+    assert len(text) < 1000
+
+
+def test_short_report_cannot_mark_partial_results_all_pass() -> None:
+    report = _report_fixture()
+    report["results"].pop()
+    assert "ACCEPTANCE=INCOMPLETE completed=6/7" in format_compact_summary(report)
+
+
+def test_summarize_cli_reads_old_report_without_model_or_device(tmp_path) -> None:
+    path = tmp_path / "summary.json"
+    original = json.dumps(_report_fixture())
+    path.write_text(original)
+    result = subprocess.run(
+        [sys.executable, str(Path(acceptance.__file__).resolve()), "--summarize", str(path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "ACCEPTANCE=PASS completed=7/7" in result.stdout
+    assert path.read_text() == original
+    assert list(tmp_path.iterdir()) == [path]
+
+
+def test_new_acceptance_run_writes_both_reports(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "report"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acceptance",
+            "--model",
+            str(tmp_path),
+            "--artifact",
+            str(tmp_path),
+            "--probes",
+            "0:0",
+            "--output-dir",
+            str(output),
+        ],
+    )
+
+    def child(*args, **kwargs):
+        kwargs["stdout"].write("VQ2A8_TP1_M1_PACKED_KERNEL_GATE=PASS {}\n")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(acceptance.subprocess, "run", child)
+    assert acceptance.main() == 0
+    assert json.loads((output / "summary.json").read_text())["status"] == "passed"
+    assert "ACCEPTANCE=PASS completed=1/1" in (output / "summary.txt").read_text()
+
+
+def test_moe_stage_launches_isolated_layer_and_has_short_report(monkeypatch, tmp_path) -> None:
+    output = tmp_path / "moe-report"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "acceptance",
+            "--stage",
+            "moe",
+            "--model",
+            str(tmp_path),
+            "--artifact",
+            str(tmp_path),
+            "--layers",
+            "0,3",
+            "--output-dir",
+            str(output),
+        ],
+    )
+    commands = []
+
+    def child(command, **kwargs):
+        commands.append(command)
+        comparison = {"allclose": True, "max_abs_error": 0.01, "relative_l2_error": 0.001}
+        data = {
+            "case": "zero:m=3",
+            "comparison": comparison,
+            "router_comparison": comparison,
+            "token_chunk_comparison": comparison,
+            "determinism": {"allclose": True},
+            "repeats_checked": 3,
+        }
+        kwargs["stdout"].write("MOE layer0 case=zero:m=3 stage=repeat\nMOE_RESULT " + json.dumps(data) + "\n")
+        kwargs["stdout"].write('VQ2A8_TP1_MOE_GATE=PASS {"native_fp8_dot": false}\n')
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(acceptance.subprocess, "run", child)
+    assert acceptance.main() == 0
+    assert len(commands) == 2
+    for command, layer in zip(commands, ("0", "3")):
+        assert command[1].endswith("validate_vq2a8_tp1_moe.py")
+        assert command[command.index("--layer") + 1] == layer
+        assert command[command.index("--token-counts") + 1 : command.index("--cases")] == ["1", "3"]
+        assert "--chain" not in command and "--probes" not in command
+    report = json.loads((output / "summary.json").read_text())
+    assert report["stage"] == "moe" and report["probes"] == ["layer0", "layer3"]
+    assert report["cases"] == ["deterministic", "zero"]
+    text = (output / "summary.txt").read_text()
+    assert "ACCEPTANCE=PASS completed=2/2 passed=2" in text
+    assert "moe_cases=1 abs=0.01 rel_l2=0.001 router=PASS chunks=PASS repeat_min=3 det=PASS" in text
+    assert "NATIVE_FP8_DOT=False" in text and "SERVING_VERIFIED=False" in text
+    assert len(text) < 1500
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [["--layers", "0,0"], ["--layers", "-1"], ["--layers", ""], ["--token-counts", "0"], ["--token-counts", "-1"]],
+)
+def test_moe_stage_rejects_invalid_plan_before_creating_report(monkeypatch, tmp_path, arguments) -> None:
+    monkeypatch.setattr(sys, "argv", ["acceptance", "--stage", "moe", "--model", str(tmp_path), *arguments])
+    with pytest.raises(SystemExit) as error:
+        acceptance.main()
+    assert error.value.code == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_moe_completion_marker_cannot_hide_device_abort(tmp_path) -> None:
+    log = tmp_path / "moe.log"
+    log.write_text("MOE layer3 stage=repeat\nVQ2A8_TP1_MOE_GATE=PASS {}\n")
+    assert not summarize_log(log, -6)["passed"]
+    assert summarize_log(log, -6)["last_stage"] == "MOE layer3 stage=repeat"
+
+
+def _fake_moe_gate_runtime():
+    return SimpleNamespace(
+        layer_index=0,
+        device=torch.device("cpu"),
+        cache_experts=2,
+        token_chunk=2,
+        config=SimpleNamespace(hidden_size=128, vocab_size=5, num_shared=1, routed_scale=1.5),
+        route=lambda hidden, tokens: (
+            torch.ones(hidden.shape[0], 1),
+            torch.zeros(hidden.shape[0], 1, dtype=torch.int64),
+        ),
+        forward=lambda hidden, tokens: hidden.clone(),
+        cache_stats=lambda: {},
+    )
+
+
+def test_moe_gate_uses_expert_case_amplitude_without_hidden_rescaling(monkeypatch):
+    runtime = _fake_moe_gate_runtime()
+    observed = []
+
+    def forward(hidden, tokens):
+        observed.append(hidden.clone())
+        return hidden.clone()
+
+    runtime.forward = forward
+    monkeypatch.setattr(moe_gate, "_synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda: 0)
+    result = moe_gate.run_case(runtime, runtime, 3, "deterministic", 0, 1)
+    expected = torch.cat([gate.activation_case(128, row, 0, "deterministic") for row in range(3)])
+    torch.testing.assert_close(observed[0], expected, rtol=0, atol=0)
+    assert result["token_chunk_comparison"]["allclose"] is True
+    assert result["serving_integration_verified"] is False
+
+
+def test_moe_gate_checks_every_repeat_not_only_final_result(monkeypatch):
+    cpu, runtime = _fake_moe_gate_runtime(), _fake_moe_gate_runtime()
+    outputs = iter(
+        [torch.zeros(1, 128), torch.zeros(1, 128), torch.zeros(1, 128), torch.ones(1, 128), torch.zeros(1, 128)]
+    )
+    runtime.forward = lambda hidden, tokens: next(outputs)
+    monkeypatch.setattr(moe_gate, "_synchronize", lambda device: None)
+    with pytest.raises(AssertionError, match="Packed kernel mismatch"):
+        moe_gate.run_case(cpu, runtime, 1, "zero", 0, 3)

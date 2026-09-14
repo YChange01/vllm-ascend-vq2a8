@@ -84,8 +84,10 @@ bool KvQuantSparseAttnSharedkvMetadataCpuKernel::CheckSingleParam() {
     KERNEL_CHECK_NULLPTR(metaShape, false, "shape of metadata is null");
     KERNEL_CHECK_NULLPTR(metaData_->GetData(), false, "data of metadata is null");
     // 核心数校验
-    if (aicCoreNum_ == 0 || aivCoreNum_ == 0) {
-        KERNEL_LOG_ERROR("AIC num or AIV num should not be 0, but got %u and %u", aicCoreNum_, aivCoreNum_);
+    if (aicCoreNum_ == 0 || aicCoreNum_ > AIC_CORE_NUM ||
+        aivCoreNum_ == 0 || aivCoreNum_ > AIV_CORE_NUM) {
+        KERNEL_LOG_ERROR("Core counts exceed SAS metadata capacity or are zero: aic:%u, aiv:%u",
+                         aicCoreNum_, aivCoreNum_);
         return false;
     }
     // batch_size 非负校验
@@ -1009,6 +1011,14 @@ bool KvQuantSparseAttnSharedkvMetadataCpuKernel::BalanceSchedule(SplitResult &sp
 bool KvQuantSparseAttnSharedkvMetadataCpuKernel::GenMetaData(SplitResult &splitRes)
 {
     optiling::detail::SasMetaData* metaDataPtr = (optiling::detail::SasMetaData*)metaData_->GetData();
+
+    // The consumer indexes the fixed 36-FA/72-FD ABI by its block ID. Runtime
+    // platform counts can be smaller than the launch envelope. torch::empty
+    // does not initialize the remaining slots: a stale enable/interval would
+    // send those cores to arbitrary GM addresses. Initialize all defined words,
+    // not just the runtime-count prefix (nor the reserved output tail).
+    // N128's idle-core FA_S2_MAX_NUM barrier counts are populated below.
+    *metaDataPtr = {};
 
     // FA Metadata Generate
     if (isN128) {

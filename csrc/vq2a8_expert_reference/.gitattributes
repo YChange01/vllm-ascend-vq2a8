@@ -1,0 +1,3 @@
+# Preserve supplied chat-source bytes, including CRLF and trailing spaces.
+# This archive is not compiled; restored and adapted source files remain checked.
+code.txt -text -whitespace

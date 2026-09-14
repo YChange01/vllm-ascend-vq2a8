@@ -1,0 +1,337 @@
+// Internal expert reference; chat transcription, NOT a verified build. See README.md.
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
+#define __aicore__ [aicore]
+#endif
+#include "mat_fp4_tiling.h"
+#ifdef __DAV_C310_CUBE__
+class MatFP4 {
+private:
+    static constexpr uint64_t kMxScaleGroupSize = 32;
+    static constexpr uint32_t kMxE8m0OneU32 = 0x7F7F7F7F;
+    // Author's hardware assumption: 64 KiB L0B / 16 -> 4 KiB L0B_MX window.
+    static constexpr uint64_t kL0bMxMappedBytes = 4 * 1024;
+    static constexpr uint64_t kL0bMxFillN = 128;
+    static constexpr uint64_t kL0bMxFillK = 1024;
+    __aicore__ inline void gm_l1_nd2nz(__cbuf__ void *l1, __gm__ void *gm, uint64_t actual_rows,
+                                      uint64_t aligned_rows, uint64_t reduction, uint64_t source_row_stride) {
+        uint64_t cfg0 = 0;
+        cfg0 |= source_row_stride << 4;
+        cfg0 |= actual_rows << 48;
+        const uint64_t cfg1 = reduction;
+        uint64_t nz_parameter = 1;
+        nz_parameter |= static_cast<uint64_t>(1) << 16;
+        nz_parameter |= aligned_rows << 32;
+        nz_parameter |= aligned_rows << 48;
+        set_mte2_nz_para(nz_parameter);
+        copy_gm_to_cbuf_multi_nd2nz((__cbuf__ float8_e4m3_t *)l1, (__gm__ float8_e4m3_t *)gm, cfg0, cfg1);
+    }
+    // A scales GM [M,K/64,2] E8M0: reinterpret pairs as BF16 for DN2NZ.
+    // source_row_stride_bytes is the row pitch, not the end-of-row gap.
+    __aicore__ inline void gm_l1_scale_dn2nz(__cbuf__ void *l1, __gm__ void *gm, uint64_t actual_rows,
+        uint64_t aligned_rows, uint64_t tile_k, uint64_t source_row_stride_bytes) {
+        const uint64_t scale_n_b16 = tile_k >> 6;
+        uint64_t cfg0 = 0;
+        cfg0 |= source_row_stride_bytes << 4;
+        cfg0 |= scale_n_b16 << 48;
+        uint64_t cfg1 = 0;
+        cfg1 |= actual_rows;
+        uint64_t nz_parameter = 1;
+        nz_parameter |= static_cast<uint64_t>(1) << 16;
+        nz_parameter |= scale_n_b16 << 32;
+        set_mte2_nz_para(nz_parameter);
+        copy_gm_to_cbuf_multi_dn2nz((__cbuf__ bfloat16_t *)l1, (__gm__ bfloat16_t *)gm, cfg0, cfg1);
+        (void)aligned_rows;
+    }
+    __aicore__ inline void l1_l0a(__ca__ void *l0a, __cbuf__ void *l1, uint64_t row_offset,
+        uint64_t reduction_offset, uint64_t rows, uint64_t reduction, uint64_t source_row_stride) {
+        uint64_t cfg0 = 0;
+        cfg0 |= row_offset >> 4;
+        cfg0 |= (reduction_offset >> 5) << 16;
+        cfg0 |= (rows >> 4) << 32;
+        cfg0 |= (reduction >> 5) << 40;
+        uint64_t cfg1 = source_row_stride >> 4;
+        cfg1 |= (rows >> 4) << 16;
+        load_cbuf_to_ca((__ca__ float8_e4m3_t *)l0a, (__cbuf__ float8_e4m3_t *)l1, cfg0, cfg1, false);
+    }
+    __aicore__ inline void l1_l0b(__cb__ void *l0b, __cbuf__ void *l1, uint64_t k_offset,
+        uint64_t n_offset, uint64_t k_extent, uint64_t n_extent, uint64_t source_k_stride) {
+        uint64_t cfg0 = 0;
+        cfg0 |= k_offset >> 4;
+        cfg0 |= (n_offset >> 5) << 16;
+        cfg0 |= (k_extent >> 4) << 32;
+        cfg0 |= (n_extent >> 5) << 40;
+        uint64_t cfg1 = source_k_stride >> 4;
+        cfg1 |= (n_extent >> 4) << 16;
+        // L1B zN [K0=16,N0=32] -> L0B nZ [K0=32,N0=16].
+        load_cbuf_to_cb((__cb__ float8_e4m3_t *)l0b, (__cbuf__ float8_e4m3_t *)l1, cfg0, cfg1, true);
+    }
+    __aicore__ inline void l1_l0a_mx(__cbuf__ void *l1mx, __ca__ void *l0a, uint64_t m, uint64_t k,
+                                   uint64_t source_k, uint64_t k_offset) {
+#ifdef test_sync
+        return;
+#endif
+        uint64_t cfg0 = 0;
+        cfg0 |= (k_offset >> 6) << 16;
+        cfg0 |= (m >> 4) << 32;
+        cfg0 |= (k >> 6) << 40;
+        // Keep full source K pitch even when moving a mad_k subwindow.
+        uint64_t cfg1 = source_k >> 6;
+        cfg1 |= (k >> 6) << 16;
+        load_cbuf_to_ca_mx(((uint64_t)l0a) >> 4, (__cbuf__ void *)l1mx, cfg0, cfg1);
+    }
+    __aicore__ inline void l1_l0b_mx(__cbuf__ void *l1mx, __cb__ void *l0b, uint64_t n, uint64_t k) {
+#ifdef test_sync
+        return;
+#endif
+        const uint64_t x_step = n >> 4, y_step = k >> 6;
+        uint64_t cfg0 = 0;
+        cfg0 |= x_step << 32;
+        cfg0 |= y_step << 40;
+        const uint64_t src_stride = y_step, dst_stride = y_step;
+        uint64_t cfg1 = src_stride;
+        cfg1 |= dst_stride << 16;
+        load_cbuf_to_cb_mx(((uint64_t)l0b) >> 4, (__cbuf__ int8_t *)l1mx, cfg0, cfg1);
+    }
+    __aicore__ inline void fill_cbuf(__cbuf__ uint32_t *dst, uint64_t block_num, uint32_t value) {
+#ifdef test_sync
+        return;
+#endif
+        uint64_t cfg0 = 0;
+        cfg0 |= 1ULL;
+        cfg0 |= (block_num & 0x7FFFULL) << 16;
+        // INFERRED cast width; the pasted static_cast lost its type argument.
+        create_cbuf_matrix(dst, static_cast<uint32_t>(cfg0), value);
+    }
+    __aicore__ inline void init_l0b_mx_scale_one() {
+        fill_cbuf((__cbuf__ uint32_t *)l1_base, kL0bMxMappedBytes / 32, kMxE8m0OneU32);
+        set_flag(PIPE_MTE2, PIPE_MTE1, 2); wait_flag(PIPE_MTE2, PIPE_MTE1, 2);
+        l1_l0b_mx(l1_base, b0[0], kL0bMxFillN, kL0bMxFillK);
+        set_flag(PIPE_MTE1, PIPE_M, 2); wait_flag(PIPE_MTE1, PIPE_M, 2);
+    }
+    __aicore__ inline void l0c_gm(__gm__ bfloat16_t *gm, __cc__ void *l0c, uint64_t actual_rows,
+                                 uint64_t aligned_rows, uint64_t columns, uint64_t destination_row_stride) {
+        uint64_t cfg0 = 0;
+        cfg0 |= columns << 4;
+        cfg0 |= actual_rows << 16;
+        cfg0 |= destination_row_stride << 32;
+        uint64_t cfg1 = aligned_rows;
+        cfg1 += (((uint64_t)0) << 29);
+        cfg1 += (((uint64_t)16) << 34);
+        // Original alternative, NOT enabled: cfg1 |= uint64_t(2) << 34; // F322BF16 RINT.
+        // REVIEW: active 16 versus commented 2 needs the matching ISA/author confirmation.
+        cfg1 |= static_cast<uint64_t>(1) << 43;
+        set_loop3_para(1);
+        copy_matrix_cc_to_gm(gm, (__cc__ float *)l0c, cfg0, cfg1);
+    }
+    __aicore__ inline void mmad(__cc__ void *l0c, __ca__ void *l0a, __cb__ void *l0b,
+        uint64_t rows, uint64_t reduction, uint64_t columns, bool clear_accumulator) {
+        uint64_t cfg = rows;
+        cfg |= reduction << 12;
+        cfg |= columns << 24;
+        cfg |= static_cast<uint64_t>(1) << 61;
+        cfg |= static_cast<uint64_t>(clear_accumulator) << 63;
+        mad_mx((__cc__ float *)l0c, (__ca__ float8_e4m3_t *)l0a, (__cb__ float8_e4m3_t *)l0b, cfg);
+    }
+    __aicore__ inline void InitBuffer() {
+        l1_base = (__cbuf__ void *)get_imm(0);
+        const uint64_t small_a0_bytes = small_m_limit * small_mad_k;
+        const uint64_t middle_a0_bytes = kMatFP4MaxTileM * middle_mad_k;
+        const uint64_t a0_bytes = small_a0_bytes > middle_a0_bytes ? small_a0_bytes : middle_a0_bytes;
+        __ca__ uint8_t *l0a_base = (__ca__ uint8_t *)get_imm(0);
+        a0[0] = (__ca__ void *)l0a_base;
+        a0[1] = (__ca__ void *)(l0a_base + a0_bytes);
+        const uint64_t small_b0_bytes = narrow_nbs * small_mad_k;
+        const uint64_t middle_b0_bytes = narrow_nbs * middle_mad_k;
+        const uint64_t wide_b0_bytes = wide_nbs * middle_mad_k;
+        const uint64_t narrow_b0_bytes = small_b0_bytes > middle_b0_bytes ? small_b0_bytes : middle_b0_bytes;
+        const uint64_t b0_bytes = narrow_b0_bytes > wide_b0_bytes ? narrow_b0_bytes : wide_b0_bytes;
+        __cb__ uint8_t *l0b_base = (__cb__ uint8_t *)get_imm(0);
+        b0[0] = (__cb__ void *)l0b_base;
+        b0[1] = (__cb__ void *)(l0b_base + b0_bytes);
+        const uint64_t double_c0_m = n_only_mode != 0 ? small_m_limit : kMatFP4MaxTileM;
+        const uint64_t c0_bytes = double_c0_m * narrow_nbs * sizeof(float);
+        __cc__ uint8_t *l0c_base = (__cc__ uint8_t *)get_imm(0);
+        c0[0] = (__cc__ void *)l0c_base;
+        c0[1] = (__cc__ void *)(l0c_base + c0_bytes);
+    }
+    __aicore__ inline void sync_l0c_mode() {
+        wait_flag(PIPE_FIX, PIPE_M, 0); wait_flag(PIPE_FIX, PIPE_M, 1);
+        set_flag(PIPE_FIX, PIPE_M, 0); set_flag(PIPE_FIX, PIPE_M, 1);
+    }
+    __aicore__ inline void process_tile(__gm__ uint8_t *group_a, __gm__ uint8_t *group_a_scale,
+        __gm__ bfloat16_t *group_c, uint64_t n_tile_id, MatFP4TileDesc tile, uint64_t &cnt_c, uint64_t &cnt_k) {
+        const bool small_tile = tile.mode == MAT_FP4_SMALL;
+        const bool wide_tile = tile.mode == MAT_FP4_WIDE;
+        const uint64_t tile_n = wide_tile ? wide_nbs : narrow_nbs;
+        const uint64_t aic_kbs = small_tile ? small_aic_kbs : middle_aic_kbs;
+        const uint64_t mad_k = small_tile ? small_mad_k : middle_mad_k;
+        const uint64_t a1_m_capacity = small_tile ? small_m_limit :
+            (wide_tile ? kMatFP4WideTileM : kMatFP4MaxTileM);
+        const uint64_t a1_bytes = a1_m_capacity * aic_kbs;
+        const uint64_t b1_bytes = tile_n * aic_kbs;
+        const uint64_t act_m = (tile.rows + 15) / 16 * 16;
+        const uint64_t a1_scale_bytes = act_m * aic_kbs / kMxScaleGroupSize;
+        const bool scale_fits_after_b = a1_bytes + b1_bytes + a1_scale_bytes <= kMatFP4L1SlotBytes;
+        const bool scale_fits_a_tail = act_m * aic_kbs + a1_scale_bytes <= a1_bytes;
+        const bool scale_reuses_a1 = !scale_fits_after_b && !scale_fits_a_tail;
+        const uint64_t mad_kb = aic_kbs / mad_k;
+        const uint64_t kb = K / aic_kbs;
+        const bool single_l0c = wide_tile || (n_only_mode != 0 && !small_tile);
+        const uint64_t id_c = single_l0c ? 0 : (cnt_c & 1);
+        for (uint64_t ki = 0; ki < kb; ++ki) {
+            const uint64_t id = cnt_k & 1;
+            __cbuf__ uint8_t *l1_slot = (__cbuf__ uint8_t *)l1_base + id * kMatFP4L1SlotBytes;
+            __cbuf__ void *a1_addr = (__cbuf__ void *)l1_slot;
+            __cbuf__ void *b1_addr = (__cbuf__ void *)(l1_slot + a1_bytes);
+            __cbuf__ void *a1_scale_addr = scale_fits_after_b ?
+                (__cbuf__ void *)(l1_slot + a1_bytes + b1_bytes) :
+                (scale_fits_a_tail ? (__cbuf__ void *)(l1_slot + act_m * aic_kbs) : (__cbuf__ void *)l1_slot);
+            wait_flag(PIPE_MTE1, PIPE_MTE2, id);
+            gm_l1_nd2nz(a1_addr, (__gm__ void *)(group_a + tile.offset * K + ki * aic_kbs),
+                       tile.rows, act_m, aic_kbs, K);
+            if (!scale_reuses_a1) {
+                __gm__ uint8_t *scale_source = group_a_scale + tile.offset * (K / kMxScaleGroupSize) +
+                    ki * (aic_kbs / kMxScaleGroupSize);
+                gm_l1_scale_dn2nz(a1_scale_addr, (__gm__ void *)scale_source, tile.rows, act_m,
+                                 aic_kbs, K / kMxScaleGroupSize);
+            }
+            set_flag(PIPE_MTE2, PIPE_MTE1, id);
+            wait_intra_block(PIPE_MTE1, id * 2 + 1);
+            wait_intra_block(PIPE_MTE1, id * 2 + 1 + 16);
+            wait_flag(PIPE_MTE2, PIPE_MTE1, id);
+            if (ki == 0) wait_flag(PIPE_FIX, PIPE_M, id_c);
+            for (uint64_t ki2 = 0; ki2 < mad_kb; ++ki2) {
+                const uint64_t cnt = ki2 & 1;
+                wait_flag(PIPE_M, PIPE_MTE1, cnt);
+                l1_l0a(a0[cnt], a1_addr, 0, ki2 * mad_k, act_m, mad_k, act_m);
+                l1_l0b(b0[cnt], b1_addr, ki2 * mad_k, 0, mad_k, tile_n, aic_kbs);
+                if (scale_reuses_a1) {
+                    // A(mad_k) has reached L0A; reuse only its consumed L1 region for scales.
+                    set_flag(PIPE_MTE1, PIPE_MTE2, cnt + 4); wait_flag(PIPE_MTE1, PIPE_MTE2, cnt + 4);
+                    __cbuf__ uint8_t *scale_scratch = (__cbuf__ uint8_t *)a1_addr + act_m * ki2 * mad_k;
+                    __gm__ uint8_t *scale_source = group_a_scale + tile.offset * (K / kMxScaleGroupSize) +
+                        ki * (aic_kbs / kMxScaleGroupSize) + ki2 * (mad_k / kMxScaleGroupSize);
+                    gm_l1_scale_dn2nz((__cbuf__ void *)scale_scratch, (__gm__ void *)scale_source,
+                                     tile.rows, act_m, mad_k, K / kMxScaleGroupSize);
+                    set_flag(PIPE_MTE2, PIPE_MTE1, cnt + 4); wait_flag(PIPE_MTE2, PIPE_MTE1, cnt + 4);
+                    l1_l0a_mx((__cbuf__ void *)scale_scratch, a0[cnt], act_m, mad_k, mad_k, 0);
+                } else {
+                    l1_l0a_mx(a1_scale_addr, a0[cnt], act_m, mad_k, aic_kbs, ki2 * mad_k);
+                }
+                set_flag(PIPE_MTE1, PIPE_M, cnt); wait_flag(PIPE_MTE1, PIPE_M, cnt);
+                __cc__ void *c0_addr = c0[id_c];
+                const bool clear_accumulator = ki == 0 && ki2 == 0;
+                this->mmad(c0_addr, a0[cnt], b0[cnt], tile.rows, mad_k, tile_n, clear_accumulator);
+                set_flag(PIPE_M, PIPE_MTE1, cnt);
+                const bool final_reduction = ki + 1 == kb && ki2 + 1 == mad_kb;
+                if (final_reduction) {
+                    set_flag(PIPE_M, PIPE_FIX, cnt); wait_flag(PIPE_M, PIPE_FIX, cnt);
+                    __gm__ bfloat16_t *output_tile = group_c + tile.offset * N + n_tile_id * tile_n;
+                    l0c_gm(output_tile, c0_addr, tile.rows, act_m, tile_n, N);
+                }
+            }
+            if (ki + 1 == kb) set_flag(PIPE_FIX, PIPE_M, id_c);
+            set_intra_block(PIPE_MTE1, id * 2);
+            set_intra_block(PIPE_MTE1, id * 2 + 16);
+            set_flag(PIPE_MTE1, PIPE_MTE2, id);
+            ++cnt_k;
+        }
+        ++cnt_c;
+    }
+public:
+    __aicore__ inline void Init(uint64_t g, uint64_t k, uint64_t n, __gm__ void *group_list,
+        __gm__ void *a, __gm__ void *a_scale, __gm__ void *b, __gm__ void *table, __gm__ void *c, __gm__ void *tiling) {
+        G = g; K = k; N = n;
+        group_list_gm = group_list; a_gm = a; a_scale_gm = a_scale; b_gm = b; table_gm = table; c_gm = c;
+        __gm__ MatFP4TilingData *tiling_data = (__gm__ MatFP4TilingData *)tiling;
+        narrow_nbs = tiling_data->narrow_nbs; wide_nbs = tiling_data->wide_nbs;
+        small_m_limit = tiling_data->small_m_limit; n_only_mode = tiling_data->n_only_mode;
+        small_aic_kbs = tiling_data->small_aic_kbs; small_mad_k = tiling_data->small_mad_k;
+        middle_aic_kbs = tiling_data->middle_aic_kbs; middle_mad_k = tiling_data->middle_mad_k;
+        coreid = get_block_idx(); InitBuffer();
+    }
+    __aicore__ inline void process() {
+        init_l0b_mx_scale_one();
+        set_intra_block(PIPE_MTE1, 0); set_intra_block(PIPE_MTE1, 2);
+        set_intra_block(PIPE_MTE1, 16); set_intra_block(PIPE_MTE1, 18);
+        set_flag(PIPE_MTE1, PIPE_MTE2, 0); set_flag(PIPE_MTE1, PIPE_MTE2, 1);
+        set_flag(PIPE_M, PIPE_MTE1, 0); set_flag(PIPE_M, PIPE_MTE1, 1);
+        set_flag(PIPE_M, PIPE_MTE1, 4); set_flag(PIPE_M, PIPE_MTE1, 5);
+        for (uint64_t event_id = 0; event_id < 8; ++event_id) set_flag(PIPE_FIX, PIPE_M, event_id);
+        __gm__ int64_t *group_list = (__gm__ int64_t *)group_list_gm;
+        __gm__ uint8_t *a_base = (__gm__ uint8_t *)a_gm;
+        __gm__ uint8_t *a_scale_base = (__gm__ uint8_t *)a_scale_gm;
+        __gm__ bfloat16_t *c_base = (__gm__ bfloat16_t *)c_gm;
+        uint64_t row_begin = 0;
+        bool has_previous_mode = false, previous_single_l0c = false;
+        for (uint64_t group_id = 0; group_id < G; ++group_id) {
+            const int64_t signed_group_m = group_list[group_id];
+            if (signed_group_m <= 0) continue;
+            const uint64_t group_m = static_cast<uint64_t>(signed_group_m);
+            const bool wide_group = n_only_mode == 0 && group_m >= kMatFP4WideMThreshold;
+            const bool single_l0c_group = wide_group || (n_only_mode != 0 && group_m > small_m_limit);
+            if (has_previous_mode && previous_single_l0c != single_l0c_group) sync_l0c_mode();
+            has_previous_mode = true; previous_single_l0c = single_l0c_group;
+            uint64_t cnt_c = 0, cnt_k = 0;
+            __gm__ uint8_t *group_a = a_base + row_begin * K;
+            __gm__ uint8_t *group_a_scale = a_scale_base + row_begin * (K / kMxScaleGroupSize);
+            __gm__ bfloat16_t *group_c = c_base + row_begin * N;
+            if (n_only_mode != 0) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NOnlyTileCount(group_m);
+                for (uint64_t ni = static_cast<uint64_t>(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount)
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi)
+                        process_tile(group_a, group_a_scale, group_c, ni,
+                                     MatFP4GetNOnlyTile(group_m, mi, small_m_limit), cnt_c, cnt_k);
+            } else if (!wide_group) {
+                const uint64_t nb = N / narrow_nbs;
+                const uint64_t m_tile_count = MatFP4NarrowTileCount(group_m);
+                for (uint64_t ni = static_cast<uint64_t>(coreid); ni < nb; ni += kMatFP4NarrowNCoreCount)
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi)
+                        process_tile(group_a, group_a_scale, group_c, ni,
+                                     MatFP4GetNarrowTile(group_m, mi, small_m_limit), cnt_c, cnt_k);
+            } else {
+                const uint64_t m_lane = static_cast<uint64_t>(coreid) / kMatFP4WideNCoreCount;
+                const uint64_t n_lane = static_cast<uint64_t>(coreid) % kMatFP4WideNCoreCount;
+                const uint64_t first_local_m = MatFP4SplitNearHalf16(group_m);
+                const uint64_t local_begin = m_lane == 0 ? 0 : first_local_m;
+                const uint64_t local_m = m_lane == 0 ? first_local_m : group_m - first_local_m;
+                const uint64_t nb = N / wide_nbs;
+                const uint64_t m_tile_count = MatFP4WideTileCount(local_m);
+                for (uint64_t ni = n_lane; ni < nb; ni += kMatFP4WideNCoreCount) {
+                    for (uint64_t mi = 0; mi < m_tile_count; ++mi) {
+                        MatFP4TileDesc tile = MatFP4GetWideTile(local_m, mi);
+                        tile.offset += local_begin;
+                        process_tile(group_a, group_a_scale, group_c, ni, tile, cnt_c, cnt_k);
+                    }
+                }
+            }
+            row_begin += group_m;
+        }
+    }
+public:
+    uint64_t G = 0, K = 0, N = 0;
+    uint64_t narrow_nbs = 0, wide_nbs = 0, small_m_limit = 0, n_only_mode = 0;
+    uint64_t small_aic_kbs = 0, small_mad_k = 0, middle_aic_kbs = 0, middle_mad_k = 0;
+    int32_t coreid = 0;
+    __gm__ void *group_list_gm = nullptr;
+    __gm__ void *a_gm = nullptr;
+    __gm__ void *a_scale_gm = nullptr;
+    __gm__ void *b_gm = nullptr;
+    __gm__ void *table_gm = nullptr;
+    __gm__ void *c_gm = nullptr;
+    __cbuf__ void *l1_base = nullptr;
+    __ca__ void *a0[2] {};
+    __cb__ void *b0[2] {};
+    __cc__ void *c0[2] {};
+};
+extern "C" __global__ __aicore__ void mat_fp4_mix_aic(uint64_t g, uint64_t k, uint64_t n,
+    __gm__ void *group_list, __gm__ void *a, __gm__ void *a_scale, __gm__ void *b,
+    __gm__ void *table, __gm__ void *c, __gm__ void *tiling) {
+    MatFP4 mat;
+    mat.Init(g, k, n, group_list, a, a_scale, b, table, c, tiling);
+    mat.process();
+}
+#endif

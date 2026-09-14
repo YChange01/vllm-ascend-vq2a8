@@ -615,7 +615,11 @@ def vllm_version_is(target_vllm_version: str):
 
         vllm_version = vllm.__version__
     try:
-        return Version(vllm_version) == Version(target_vllm_version)
+        # Local build labels (e.g. +empty.vq2a8text1) do not change the API
+        # release. Keep pre/dev/post releases distinct when selecting patches.
+        current = Version(vllm_version)
+        target = Version(target_vllm_version)
+        return Version(current.public) == Version(target.public)
     except InvalidVersion:
         raise ValueError(
             f"Invalid vllm version {vllm_version} found. A dev version of vllm "
