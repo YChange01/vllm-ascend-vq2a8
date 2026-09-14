@@ -165,6 +165,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_root_mode = validate_offline_config(vllm_config).get("root_linear_mode", "bf16")
         self._offline_root_verified = False
         self._v3_serving = options.get("v3_serving", False)
+        self._startup_trace_mode = options.get("v3_startup_trace", "off")
 
     def set_moe_parameters(self):
         # No FusedMoE allocation, expert extraction or EPLB. The TP2 runtime
@@ -192,6 +193,10 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._v3_serving:
             self._configure_v3_serving()
         print("MODEL_LOAD_RESULT " + json.dumps(report), flush=True)
+        if self._startup_trace_mode != "off":
+            from vllm_ascend.quantization.vq2a8_startup_trace import install_startup_trace
+
+            self._vq2a8_startup_trace = install_startup_trace(self, mode=self._startup_trace_mode)
         return loaded
 
     def _configure_v3_serving(self):

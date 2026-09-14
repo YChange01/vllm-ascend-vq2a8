@@ -64,6 +64,9 @@ python -u tools/diagnose_vq2a8_tp1_startup.py --physical-npu 1 --cases hc_pre_m1
 HC/准备阶段只验形状、类型和有限值等基础契约；V3 投影另验合成 FP8 oracle 的逐位一致性。
 定位时请提供 `summary.json` 和首个失败/超时项的完整 `.log`，无需再次加载所有权重。
 
+若这些组件全部通过，但整模仍卡住，可改用[完整权重启动定位](vq2a8_full_startup_trace.md)，
+在一次真实加载后记录逐层阶段及定时 Python 栈。
+
 ## 本次开发验证边界
 
 本地 Windows / CPU 验证了参数、日志、真实合成张量准备、错误路径、超时和设备隔离契约；

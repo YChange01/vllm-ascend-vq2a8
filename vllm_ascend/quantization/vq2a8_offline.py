@@ -173,6 +173,7 @@ def validate_offline_config(config) -> dict:
         "v3_preparation",
         "v3_decode_graph",
         "v3_serving",
+        "v3_startup_trace",
         "verbose_experts",
     }
     if set(options) - allowed or not isinstance(options.get("artifact"), str):
@@ -287,6 +288,16 @@ def validate_offline_config(config) -> dict:
         "v3_serving" in options and options.get("execution_policy") != "ascendc_v3"
     ):
         raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
+    trace_mode = options.get("v3_startup_trace", "off")
+    if trace_mode not in ("off", "async", "sync"):
+        raise ValueError("v3_startup_trace must be off, async or sync.")
+    if trace_mode != "off" and (
+        tp_size != 1
+        or options.get("execution_policy") != "ascendc_v3"
+        or options.get("v3_serving") is not True
+        or options.get("v3_decode_graph", "none") != "none"
+    ):
+        raise ValueError("v3_startup_trace requires TP1 V3 serving with decode_graph=none.")
     if options.get("root_linear_mode", "bf16") not in ("bf16", "online_fp8_sm90"):
         raise ValueError("root_linear_mode must be bf16 or online_fp8_sm90.")
     if type(options.get("verbose_experts", False)) is not bool:

@@ -35,6 +35,12 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--preparation", choices=("eager", "fused"), default="eager")
     parser.add_argument("--decode-graph", choices=("none", "moe"), default="none")
+    parser.add_argument(
+        "--startup-trace",
+        choices=("off", "async", "sync"),
+        default="off",
+        help="TP1 diagnostic logs/stacks after loading; sync adds device fences, async only logs",
+    )
     parser.add_argument("--memory-fraction", type=float, default=1.0)
     parser.add_argument("--engine-memory-fraction", type=float, default=0.98)
     parser.add_argument("--reserve-gib", type=float, default=3.0)
@@ -57,6 +63,8 @@ def parse_args(argv=None):
             parser.error("TP2 requires --decode-graph none")
     elif args.physical_npus is not None:
         parser.error("--physical-npus requires --tensor-parallel-size 2")
+    if args.startup_trace != "off" and (args.tensor_parallel_size != 1 or args.decode_graph != "none"):
+        parser.error("--startup-trace requires TP1 and --decode-graph none")
     if args.physical_npu is None:
         args.physical_npu = 0
     if any(not math.isfinite(v) or not 0 < v <= 1 for v in (args.memory_fraction, args.engine_memory_fraction)):
@@ -97,6 +105,8 @@ def build_command(args):
             "v3_serving": True,
         },
     }
+    if args.startup_trace != "off":
+        additional["vq2a8_offline"]["v3_startup_trace"] = args.startup_trace
     overrides = {
         "architectures": [f"VQ2A8TP{args.tensor_parallel_size}OfflineForCausalLM"],
         "quantization_config": None,
