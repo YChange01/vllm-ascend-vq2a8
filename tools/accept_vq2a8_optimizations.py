@@ -20,6 +20,7 @@ import argparse
 import datetime
 import json
 import platform
+import re
 import traceback
 from pathlib import Path
 
@@ -28,6 +29,93 @@ from tools.vq2a8_perf_report import validate_cases
 
 PRESETS = ("fast", "batched", "fwht", "pipeline", "prepare_graph")
 REPO = Path(__file__).resolve().parents[1]
+ENVIRONMENT_PREFIX = "VQ2A8_V023_ENVIRONMENT "
+MAX_FAILURE_LOG_BYTES = 256 * 1024
+MAX_FAILURE_LINE_BYTES = 64 * 1024
+MAX_FAILURE_LINES = 200
+MAX_FAILURE_CAUSES = 6
+MAX_FAILURE_CAUSE_CHARS = 300
+
+
+def _redact_cause(value):
+    """Bound selected diagnostic text; never forward arbitrary log records."""
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = " ".join(value.split())
+    # Suppress whole URLs, including userinfo, proxy addresses and query keys.
+    value = re.sub(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s<>\"']+", "[REDACTED_URL]", value)
+    value = re.sub(r"(?i)\b(?:Bearer|Basic)\s+[\w.~+/=-]+", "[REDACTED_AUTH]", value)
+    sensitive = (
+        r"[\w-]*(?:proxy|password|passwd|pwd|token|secret|api[_-]?key|access[_-]?key|authorization|credential)[\w-]*"
+    )
+    value = re.sub(
+        rf"(?i)(\b{sensitive}[\"']?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+        r"\1[REDACTED]",
+        value,
+    )
+    value = re.sub(rf"(?i)(--{sensitive}\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)", r"\1[REDACTED]", value)
+    value = re.sub(
+        r"\b(?:sk-[A-Za-z0-9_-]{6,}|hf_[A-Za-z0-9]{6,}|gh[pousr]_[A-Za-z0-9]{6,}|github_pat_[A-Za-z0-9_]{6,})\b",
+        "[REDACTED_TOKEN]",
+        value,
+    )
+    value = "".join(char for char in value if char.isprintable())
+    if len(value) > MAX_FAILURE_CAUSE_CHARS:
+        value = value[: MAX_FAILURE_CAUSE_CHARS - 3] + "..."
+    return value
+
+
+def failure_causes(log, *, timed_out=False):
+    """Read a bounded tail and select environment errors, never dump raw logs.
+
+    Unknown or malformed logs produce a fixed message. Only the environment
+    tool's errors and unsuccessful pip-check output are candidates for display;
+    package/environment dictionaries and successful subprocess output are not.
+    """
+    causes = []
+    if timed_out:
+        causes.append("Child exceeded its stage timeout.")
+    try:
+        with Path(log).open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            offset = max(0, size - MAX_FAILURE_LOG_BYTES)
+            source.seek(offset)
+            raw = source.read(MAX_FAILURE_LOG_BYTES)
+        if offset:
+            raw = raw.partition(b"\n")[2]
+        for line in reversed(raw.splitlines()[-MAX_FAILURE_LINES:]):
+            if len(line) > MAX_FAILURE_LINE_BYTES:
+                continue
+            text = line.decode("utf-8", errors="replace")
+            if not text.startswith(ENVIRONMENT_PREFIX):
+                continue
+            try:
+                report = json.loads(text[len(ENVIRONMENT_PREFIX) :])
+            except (ValueError, RecursionError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            errors = report.get("errors")
+            if isinstance(errors, list):
+                causes.extend(_redact_cause(error) for error in errors[:MAX_FAILURE_CAUSES] if isinstance(error, str))
+            pip_check = report.get("pip_check")
+            if (
+                isinstance(pip_check, dict)
+                and type(pip_check.get("exit")) is int
+                and pip_check["exit"] != 0
+                and isinstance(pip_check.get("output"), str)
+            ):
+                causes.extend(
+                    _redact_cause("pip check: " + line)
+                    for line in pip_check["output"].splitlines()[:MAX_FAILURE_CAUSES]
+                    if line.strip()
+                )
+            break
+    except (OSError, ValueError):
+        causes.append("Child log is unavailable; no diagnostic text was read.")
+    causes = list(dict.fromkeys(cause for cause in causes if cause))
+    return causes[:MAX_FAILURE_CAUSES] or [
+        "No recognized environment cause in the bounded log tail; inspect the full log."
+    ]
 
 
 def commands(args, output):
@@ -145,10 +233,14 @@ def main():
         for name, command in steps:
             print(f"OPTIMIZATION_STAGE={name} REPORT={output}", flush=True)
             result = supervise(command, output / f"{name}.log", env, args.timeout)
+            failed = result["exit"] != 0 or result["timeout"]
+            if failed:
+                result["failure_causes"] = failure_causes(result["log"], timed_out=result["timeout"])
             report["stages"].append(dict(name=name, **result))
             write_json(output / "run.json", report)
-            if result["exit"] != 0 or result["timeout"]:
-                raise RuntimeError(f"{name} failed; full traceback/log: {result['log']}")
+            if failed:
+                cause = " | ".join(result["failure_causes"])
+                raise RuntimeError(f"{name} failed: {cause}; full traceback/log: {result['log']}")
         result = json.loads((output / "result/summary.json").read_text())
         report.update(
             status=result["status"], device_execution_verified=result.get("performance_measurement_verified", False)

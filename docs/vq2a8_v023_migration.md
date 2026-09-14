@@ -39,7 +39,7 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 | --- | --- |
 | 操作系统 / Python | Linux；Python `>=3.10,<3.13`，官方 A5 镜像使用 3.12 |
 | vLLM | `==0.23.0`，从官方 tag 安装 `empty` 后端；允许本地版本后缀 |
-| vLLM Ascend | 本迁移分支；安装标识 `0.23.0+vq2a8.v023` |
+| vLLM Ascend | 本迁移分支；`0.23.0+vq2a8.v023` 或来源验证通过的 editable SCM 开发版本 |
 | torch / torch-npu | `2.10.0` / `2.10.0.post4` |
 | torchvision / torchaudio | `0.25.0` / `2.10.0` |
 | Transformers | `5.5.4` |
@@ -118,9 +118,23 @@ CPU wheel 索引用于获取与 torch-npu 配套的 PyTorch，不等于 `VLLM_TA
 不要直接照抄官方镜像的 `ascend950dt_9582` 或其他机器的后缀。
 
 `setup.py` 使用 `setuptools_scm.get_version()`。迁移分支在 release tag 后增加提交时，
-自动推导的开发版本可能不满足 `==0.23.0` 门禁；因此仅在本分支的安装命令上显式设置
-`SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0+vq2a8.v023`，重复 editable 安装时也保留该设置。
-这不是允许把 0.26 源码伪装成 0.23；必须同时核对 checkout 基线和实际导入路径。
+可自动生成 `0.23.1.dev5+g32c3714e4` 一类版本号，**不代表装成了另一个框架分支**。
+旧检查只看版本字符串，会误拒绝这种正确源码安装；现允许一个严格限定的 editable SCM 例外：
+
+- 仅接受 `0.23.1.devN+gHASH`（可带 `.dYYYYMMDD`）；不泛化为任意 `0.23.*`。
+- pip 的 `direct_url.json` 必须指向当前 checkout，且 Python 实际解析的 `vllm_ascend` 也来自这里。
+- Git 历史必须包含本次迁移提交 `4817b8a019380c300051f7caec25b83638a8eba3`。
+- 当前 scheduler、structured-output patch、model-runner 必须匹配已核对的官方 v0.23 文件指纹，
+  防止只保留迁移祖先、却混入其他框架版本。修改这些文件须先复核兼容性再更新指纹。
+
+验证结果记录在 `ascend_source` 中，`packages` 保留真实安装版本。editable 安装后正常 `git pull`
+可使元数据的提交 hash 落后，因此不强制它等于 HEAD。缺失 Git 历史、非 editable 安装、导入其他
+checkout 或源码指纹不符时仍拒绝，并显示原因；分支名称或环境变量不能替代来源验证。
+原有 `0.23.0` 正式版/本地后缀的检查方式保持不变。
+
+上面的首次安装命令仍用显式 `SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0+vq2a8.v023` 生成固定标识；
+已经正确 editable 安装并编译的用户不必仅为开发版本号再重编译或重装。
+这不允许把 0.26 源码伪装成 0.23；也不放宽上游 `vllm ==0.23.0`、其他依赖或真实运行时检查。
 
 ```bash
 python -c 'import sys, vllm, vllm_ascend; print(sys.executable); print(vllm.__file__); print(vllm_ascend.__file__)'
@@ -128,7 +142,7 @@ python tools/validate_vq2a8_v023_environment.py --metadata-only
 ```
 
 三个路径应分别落在新 venv、新 `.upstream-vllm-v023` 和新 Ascend checkout 中。
-`--metadata-only` 仅检查发行包信息；默认模式还执行 `pip check`、真实导入和调度接口检查，
+`--metadata-only` 仅检查发行包信息及必要的源码来源；默认模式还执行 `pip check`、真实导入和调度接口检查，
 但不会加载模型权重或验证设备算子。
 
 ## CPU 回归与原生库重建

@@ -72,6 +72,26 @@ python -u tools/build_vq2a8_ascendc.py \
 `--library build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so`，即可跳过构建。
 不要把 V1 库传给 `serve_vq2a8_v3.py`；该入口固定使用 V3。
 
+## 编译完成后仍停在 environment
+
+环境检查先于 `.so` 预检；重新编译算子不能修复 Python 版本/依赖检查失败。
+旧检查会误拒绝本分支自动生成的 `vllm-ascend 0.23.1.devN+gHASH` 版本号。
+更新后会核对 editable 安装路径、实际导入路径、迁移祖先及官方 0.23 框架文件指纹，
+通过后才接受该开发版本；具体边界见[环境说明](vq2a8_v023_migration.md)。
+
+已经完成本机编译和 editable 安装时，更新脚本并复用现有 V1 库即可，不需要为本次工具修复重编译：
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+git pull --ff-only origin vllm-ascend-vq2a8-v023
+python -u tools/accept_vq2a8_optimizations.py --model /home/g00872988/vq2a8 --library build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so --physical-npu 1 --presets batched --cases 10:4 --warmups 2 --repeats 5
+```
+
+如果仍失败，`OPTIMIZATION_ERROR` 会直接显示有限长度、常见凭据脱敏后的环境错误和失败的
+`pip check` 原因，不再只给日志路径；`run.json` 也记录 `failure_causes`。
+无法识别的日志仍给出完整日志路径，不盲目回显原始日志。依赖冲突、真实导入失败和预检错误仍会停止，
+不会跳过环境检查直接加载模型。环境通过不等于 NPU 推理或 TPOT 通过。
+
 ## 0.3 秒的来源与结果
 
 历史用户回传报告 `reports/vq2a8-opt3-20260908T235516715328Z/result/summary.txt` 的
@@ -88,7 +108,12 @@ python -u tools/build_vq2a8_ascendc.py \
 
 本地 Windows 无 Ascend NPU；文档命令的计划检查和 CPU 回归不等于本次硬件复现完成。
 
-本次仅更新文档：`--plan-only` 和相关 317 项 CPU 回归通过。完整 CPU 套件为
+V1 复现文档首次加入时：`--plan-only` 和相关 317 项 CPU 回归通过。完整 CPU 套件为
 2417 passed、257 skipped、3 failed；其中 2 项为已有 FP8/FMA 舍入测试失败，
 另 1 项为 Windows loopback 连接中止，单独复跑通过，未修改测试或放宽断言。
 `bash format.sh ci` 因本地缺少 `pre-commit` 未能运行；`git diff --check` 通过。
+
+环境检查修复验证（2026-09-14）：新增 89 项 CPU 用例，相关 484 项回归通过；完整 CPU 套件为
+2507 passed、257 skipped、2 failed、4 subtests passed。两项失败仍是上述已知 FP8/FMA 用例，
+未放宽数值要求。四个改动/新增 Python 文件 Ruff check/format 与 `git diff --check` 通过；
+`bash format.sh ci` 仍因缺少 `pre-commit` 未运行完整 hooks。本次未在 NPU 上重编译或执行模型。

@@ -16,14 +16,19 @@ if not __package__:
     )
 
 import argparse
+import hashlib
 import inspect
 import json
 import platform
+import re
 import subprocess
 import sys
-from importlib.metadata import PackageNotFoundError, version
+from importlib.metadata import PackageNotFoundError, distribution, version
+from importlib.util import find_spec
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import InvalidVersion, Version
@@ -37,8 +42,89 @@ V023_REQUIREMENTS = {
     "fastapi": ">=0.115.0,<0.124.0",
 }
 
+# setuptools-scm advances v0.23.0 to 0.23.1.devN after migration commits.
+# This is not permission to run an arbitrary 0.23.1/0.26 framework. These
+# upstream files are also pinned by test_vq2a8_v023.py; intentional framework
+# changes need a compatibility review before updating this provenance fence.
+V023_MIGRATION_COMMIT = "4817b8a019380c300051f7caec25b83638a8eba3"
+V023_FRAMEWORK_BLOBS = {
+    "vllm_ascend/core/recompute_scheduler.py": "85b2590e98b248700baeb5d4cc5e9954a54f486f",
+    "vllm_ascend/patch/platform/patch_structured_output.py": "d69af3f620028751816a7c5e8a96913a982cd739",
+    "vllm_ascend/worker/model_runner_v1.py": "70ef1d79a8d52d79b9d808f16257d39951a3d48b",
+}
+REPO = Path(__file__).resolve().parents[1]
 
-def stack_errors(packages, python_version, system):
+
+def _is_v023_scm_version(value):
+    return bool(re.fullmatch(r"0\.23\.1\.dev\d+\+g[0-9a-f]{7,40}(?:\.d\d{8})?", value or ""))
+
+
+def ascend_source_provenance(installed_version, repo=REPO):
+    """Verify the narrow editable-SCM exception without importing NPU code.
+
+    Editable metadata can predate a git pull, so its SCM hash need not equal
+    HEAD. Check the source actually resolved by Python and the current tree.
+    Never infer provenance from a directory/branch name or a version override.
+    """
+    proof = {"version": installed_version, "verified": False, "checks": [], "errors": []}
+    if not _is_v023_scm_version(installed_version):
+        proof["errors"].append("Not a supported v023 SCM development version.")
+        return proof
+    repo = Path(repo).resolve()
+    try:
+        direct = json.loads(distribution("vllm-ascend").read_text("direct_url.json") or "null")
+        if not isinstance(direct, dict) or direct.get("dir_info", {}).get("editable") is not True:
+            raise ValueError("not editable")
+        url = urlsplit(direct["url"])
+        if url.scheme != "file" or url.netloc not in ("", "localhost") or url.query or url.fragment:
+            raise ValueError("not a local directory")
+        source = Path(url2pathname(url.path))
+        if not source.is_absolute() or source.resolve() != repo:
+            raise ValueError("different checkout")
+        proof["checks"].append("editable_distribution_matches_checkout")
+    except (PackageNotFoundError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        # Do not echo arbitrary direct_url content (may contain credentials).
+        proof["errors"].append("vllm-ascend must be editable-installed from this checkout with this Python.")
+        return proof
+    try:
+        spec = find_spec("vllm_ascend")  # Top-level lookup does not execute __init__.
+        if spec is None or not spec.origin or Path(spec.origin).resolve() != repo / "vllm_ascend/__init__.py":
+            raise ValueError("different import source")
+        proof["checks"].append("python_import_matches_checkout")
+    except (ImportError, OSError, ValueError, TypeError):
+        proof["errors"].append("Python resolves vllm_ascend outside this checkout; check the active Python/PYTHONPATH.")
+        return proof
+    try:
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", V023_MIGRATION_COMMIT, "HEAD"],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        if ancestry.returncode:
+            proof["errors"].append(
+                "Cannot verify v023 migration ancestry; check the checkout and available Git history."
+            )
+            return proof
+        proof["checks"].append("v023_migration_ancestor")
+    except (OSError, subprocess.TimeoutExpired):
+        proof["errors"].append("Cannot inspect v023 migration ancestry; Git is unavailable or timed out.")
+        return proof
+    for relative, expected in V023_FRAMEWORK_BLOBS.items():
+        try:
+            contents = (repo / relative).read_bytes().replace(b"\r\n", b"\n")
+            blob = hashlib.sha1(f"blob {len(contents)}\0".encode() + contents, usedforsecurity=False).hexdigest()
+        except OSError:
+            blob = None
+        if blob != expected:
+            proof["errors"].append(f"Source differs from the verified v0.23 framework: {relative}.")
+    if not proof["errors"]:
+        proof["checks"].append("v023_framework_fingerprints")
+        proof["verified"] = True
+    return proof
+
+
+def stack_errors(packages, python_version, system, *, ascend_source=None):
     errors = []
     if system != "Linux":
         errors.append("NPU execution requires Linux; PC repacking is a separate CPU workflow.")
@@ -53,8 +139,16 @@ def stack_errors(packages, python_version, system):
             errors.append(f"{name}{spec} required, found {packages.get(name)!r}.")
     try:
         ascend = Version(packages.get("vllm-ascend") or "missing")
-        if ascend.release != (0, 23, 0) or ascend < Version("0.23.0"):
-            errors.append(f"Use the VQ2A8 0.23 migration branch, found vllm-ascend {ascend}.")
+        verified_scm = (
+            _is_v023_scm_version(str(ascend))
+            and ascend_source is not None
+            and ascend_source.get("verified") is True
+            and ascend_source.get("version") == str(ascend)
+        )
+        if (ascend.release != (0, 23, 0) or ascend < Version("0.23.0")) and not verified_scm:
+            errors.append(f"vllm-ascend 0.23.0 or a verified v023 editable SCM build required, found {ascend}.")
+            if ascend_source:
+                errors.extend(ascend_source.get("errors", []))
     except InvalidVersion:
         errors.append("vllm-ascend 0.23 migration package is missing or has no usable version.")
     return errors
@@ -67,12 +161,16 @@ def environment_report():
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
+    ascend_source = None
+    if _is_v023_scm_version(packages["vllm-ascend"]):
+        ascend_source = ascend_source_provenance(packages["vllm-ascend"])
     return {
         "python": sys.executable,
         "python_version": platform.python_version(),
         "system": platform.system(),
         "packages": packages,
-        "errors": stack_errors(packages, sys.version_info, platform.system()),
+        "ascend_source": ascend_source,
+        "errors": stack_errors(packages, sys.version_info, platform.system(), ascend_source=ascend_source),
         "scope": "python_environment_only",
         "device_execution_verified": False,
         "model_integration_verified": False,
@@ -158,7 +256,11 @@ def check_runtime_imports():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--metadata-only", action="store_true", help="Do not import NPU/vLLM or run pip check.")
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Check metadata/source only; do not import NPU/vLLM or run pip check.",
+    )
     args = parser.parse_args()
     report = environment_report()
     if not report["errors"] and not args.metadata_only:
