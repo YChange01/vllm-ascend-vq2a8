@@ -35,6 +35,18 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=MAX_CONTEXT,
+        help="Total input plus output token limit, in [1,128]; also bounds startup profile tokens",
+    )
+    parser.add_argument(
+        "--kv-cache-mib",
+        type=int,
+        default=KV_BYTES // 1024**2,
+        help="Explicit KV cache budget in MiB (positive integer; default: 1024)",
+    )
     parser.add_argument("--memory-fraction", type=float, default=0.9, help="Expert residency budget fraction")
     parser.add_argument("--engine-memory-fraction", type=float, default=0.9)
     parser.add_argument("--reserve-gib", type=float, default=8.0)
@@ -46,13 +58,18 @@ def parse_args(argv=None):
         parser.error("Require a nonnegative physical NPU and port in [1,65535].")
     if not args.host or any(character.isspace() for character in args.host):
         parser.error("Require a nonempty host without whitespace.")
+    if not 1 <= args.max_model_len <= MAX_CONTEXT:
+        parser.error(f"--max-model-len must be in [1,{MAX_CONTEXT}].")
+    if args.kv_cache_mib <= 0:
+        parser.error("--kv-cache-mib must be a positive integer.")
     if any(
         not math.isfinite(value) or not 0 < value <= 1 for value in (args.memory_fraction, args.engine_memory_fraction)
     ):
         parser.error("Memory fractions must be finite and in (0,1].")
-    if not math.isfinite(args.reserve_gib) or args.reserve_gib < KV_BYTES / 1024**3:
+    if not math.isfinite(args.reserve_gib) or args.reserve_gib < max(1.0, args.kv_cache_mib / 1024):
         parser.error(
-            "Reserve must be finite and include at least the 1 GiB KV cache; it is never reduced automatically."
+            "Reserve must be finite, at least 1 GiB and no smaller than the requested KV cache; "
+            "it is never reduced automatically."
         )
     return args
 
@@ -117,13 +134,13 @@ def build_command(args):
         "--max-num-seqs",
         "1",
         "--max-model-len",
-        str(MAX_CONTEXT),
+        str(args.max_model_len),
         "--max-num-batched-tokens",
-        str(MAX_CONTEXT),
+        str(args.max_model_len),
         "--block-size",
         "128",
         "--kv-cache-memory-bytes",
-        str(KV_BYTES),
+        str(args.kv_cache_mib * 1024**2),
         "--gpu-memory-utilization",
         str(args.engine_memory_fraction),
         "--stream-interval",

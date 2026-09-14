@@ -41,6 +41,61 @@ curl -N http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json'
 首次请求包括一次性切换和常量准备开销，不用它声称稳定 TPOT。
 HTTP 返回成功并不等同于通过下面的数值验收或性能测试。
 
+### 小显存短文本试跑：物理卡 2，输入 10 / 输出 4 token
+
+这是显式收紧配置的试跑方式，不改变上述默认值。先确认物理卡 2 当前仍健康、空闲；
+只使用卡 2，不使用或停止卡 1 的进程。已有 V1 `.so` 不需要重编，拉取 Python 脚本更新即可。
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+git pull --ff-only origin vllm-ascend-vq2a8-v023
+python -u tools/serve_vq2a8_v4.py --model /home/g00872988/vq2a8 --library build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so --physical-npu 2 --max-model-len 16 --kv-cache-mib 256 --memory-fraction 1.0 --engine-memory-fraction 0.9 --reserve-gib 3 --port 8000
+```
+
+`--max-model-len 16` 同时把 `max_num_batched_tokens` 设为 16，缩小启动 profile 的输入；
+并不跳过 profile。`--kv-cache-mib 256` 将固定 KV 预算从 1 GiB 降为 256 MiB，节省 768 MiB。
+block size 仍为后端要求的 128，不需要随上下文改为 16。总输入加输出最多 16 token，保持单并发。
+
+`--memory-fraction 1.0` 只放宽专家常驻预算的比例上限，不改变 engine 的 0.9，
+也不会把所有剩余显存填满或自动挤掉其他任务。保留 3 GiB 供 KV、激活、临时空间等使用；
+这是预算余量，不是预先分配的张量。全专家必须完整放下，仍不允许缺专家或缓存回退。
+
+以先前失败日志的同一份快照计算：已分配 roots 等约 14.78 GiB，全部专家约 61.54 GiB，
+二者合计约 76.32 GiB，并不是整个模型只占 61.54 GiB。
+原 0.9 / 8 GiB 配置只给专家约 49.36 GiB；改成 1.0 / 3 GiB 后理论预算约 61.67 GiB，
+仅比专家计划多约 128 MiB。卡 2 实际余量须以新启动的 `MODEL_CACHE_BUDGET` 为准，
+不能把旧卡快照当成保证。缩短文本不会减少权重大小；通过此预算仍可能在 profile 或请求期间 OOM。
+若仍失败，保留第一条错误和预算日志，不移除检查或自动继续减小 reserve。
+
+服务 ready 后，同一容器的另一终端可用以下请求验证精确的 10 个输入 token、4 个输出 token。
+这里用模型自身 tokenizer 生成 token ID，不以字符数代替 token 数；`ignore_eos` 用于固定输出长度。
+请求字段参考 [vLLM completions 协议](https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/completion/protocol/)。
+
+```bash
+python - <<'PY'
+import json
+from urllib.request import Request, urlopen
+from tokenizers import Tokenizer
+
+tokenizer = Tokenizer.from_file('/home/g00872988/vq2a8/tokenizer.json')
+ids = tokenizer.encode('Explain why the sky is blue. ' * 4, add_special_tokens=False).ids[:10]
+assert len(ids) == 10
+payload = {'model': 'vq2a8', 'prompt': ids, 'max_tokens': 4,
+           'temperature': 0, 'ignore_eos': True, 'add_special_tokens': False}
+request = Request('http://127.0.0.1:8000/v1/completions',
+                  data=json.dumps(payload).encode(),
+                  headers={'Content-Type': 'application/json'})
+with urlopen(request, timeout=300) as response:
+    result = json.load(response)
+print(result['choices'][0]['text'])
+print('USAGE:', result['usage'])
+assert result['usage']['prompt_tokens'] == 10
+assert result['usage']['completion_tokens'] == 4
+PY
+```
+
+此请求只检查服务和 token 数，不测稳定 TPOT；不能据此宣称 0.3 s/token。
+
 ## 默认验收：只加载一次 V4
 
 先结束自己在目标卡上的旧服务并确认目标卡空闲，不停止其他人的任务。
@@ -135,3 +190,7 @@ HTTP 入口补充验证：新增 58 项 CPU 测试，最终相关回归 493 项�
 2885 passed、257 skipped、2 failed，之后补充的三个 CLI/配置用例已包含在最终相关回归中；
 两个失败仍是上述原有 FP8/FMA 用例。服务 Python 改动通过 Ruff 检查和格式检查，
 完整 hooks 仍受本地缺少 pre-commit 限制；尚未在 NPU 上启动或通过 HTTP 请求实测。
+
+短文本 CLI 补充：参数测试 49 项通过；全量 CPU 回归为 2907 passed、257 skipped、2 failed，
+仍为上述两个原有 FP8/FMA 用例。Ruff 通过，完整 hooks 仍因缺少 pre-commit 未能完成。
+16 token / 256 MiB 配置仅完成静态与 CPU 检查，未在物理卡 2 实测显存峰值或启动成功。

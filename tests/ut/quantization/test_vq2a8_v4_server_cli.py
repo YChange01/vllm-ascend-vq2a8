@@ -31,6 +31,7 @@ def test_v4_server_defaults_are_single_card_small_eager_and_v1_library():
     assert args.physical_npu == 1 and args.host == "127.0.0.1" and args.port == 8000
     assert args.memory_fraction == args.engine_memory_fraction == 0.9
     assert args.reserve_gib == 8.0
+    assert args.max_model_len == 128 and args.kv_cache_mib == 1024
     assert args.library.parent.name == "vq2a8-ascendc-v023-v1"
     assert args.library.name == "libvq2a8_ascendc.so"
 
@@ -104,6 +105,15 @@ def test_v4_server_uses_standard_cli_and_exact_tp1_contract_without_preflights(t
         ["--engine-memory-fraction", "-1"],
         ["--reserve-gib", "nan"],
         ["--reserve-gib", "0.9"],
+        ["--max-model-len", "0"],
+        ["--max-model-len", "129"],
+        ["--max-model-len", "16.5"],
+        ["--kv-cache-mib", "0"],
+        ["--kv-cache-mib", "-1"],
+        ["--kv-cache-mib", "256.5"],
+        ["--kv-cache-mib", "nan"],
+        ["--kv-cache-mib", "2048", "--reserve-gib", "1.99"],
+        ["--kv-cache-mib", "256", "--reserve-gib", "0.99"],
         ["--tensor-parallel-size", "2"],
         ["--physical-npus", "0,1"],
         ["--artifact", "/other/artifact"],
@@ -141,6 +151,72 @@ def test_v4_server_explicit_budget_and_network_options_are_forwarded(tmp_path):
     assert value(command, "--host") == "0.0.0.0" and value(command, "--port") == "8123"
     assert value(command, "--gpu-memory-utilization") == "0.95"
     assert options["cache_memory_fraction"] == 1 and options["cache_reserve_gib"] == 9
+
+
+def test_v4_short_text_context_and_kv_budget_do_not_change_execution_contract(tmp_path):
+    argv, _, _ = assets(tmp_path)
+    args = server.parse_args(
+        [
+            *argv,
+            "--physical-npu",
+            "2",
+            "--max-model-len",
+            "16",
+            "--kv-cache-mib",
+            "256",
+            "--memory-fraction",
+            "1",
+            "--engine-memory-fraction",
+            "0.9",
+            "--reserve-gib",
+            "3",
+        ]
+    )
+    command = server.build_command(args)
+    assert value(command, "--max-model-len") == value(command, "--max-num-batched-tokens") == "16"
+    assert value(command, "--kv-cache-memory-bytes") == str(256 * 1024**2)
+    assert value(command, "--gpu-memory-utilization") == "0.9"
+    assert value(command, "--block-size") == "128"
+    assert value(command, "--tensor-parallel-size") == value(command, "--max-num-seqs") == "1"
+    assert value(command, "--dtype") == "bfloat16"
+    assert all(
+        flag in command
+        for flag in (
+            "--enforce-eager",
+            "--no-async-scheduling",
+            "--no-enable-prefix-caching",
+            "--no-enable-chunked-prefill",
+        )
+    )
+    options = json.loads(value(command, "--additional-config"))["vq2a8_offline"]
+    assert options["cache_memory_fraction"] == 1 and options["cache_reserve_gib"] == 3
+    assert options["v4_serving"] is True and options["execution_policy"] == "ascendc_v4"
+    assert server.server_environment(args, {})["ASCEND_RT_VISIBLE_DEVICES"] == "2"
+
+
+@pytest.mark.parametrize("length", [1, 128])
+@pytest.mark.parametrize("kv_mib,reserve", [(1, 1), (256, 1), (1024, 1), (2048, 2)])
+def test_v4_server_context_and_reserve_boundaries(length, kv_mib, reserve):
+    args = server.parse_args(
+        [
+            "--max-model-len",
+            str(length),
+            "--kv-cache-mib",
+            str(kv_mib),
+            "--reserve-gib",
+            str(reserve),
+        ]
+    )
+    assert args.max_model_len == length and args.kv_cache_mib == kv_mib and args.reserve_gib == reserve
+
+
+def test_v4_server_help_explains_new_context_and_kv_options(capsys):
+    with pytest.raises(SystemExit) as exc:
+        server.parse_args(["--help"])
+    assert exc.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--max-model-len" in help_text and "--kv-cache-mib" in help_text
+    assert "Total input plus output" in help_text and "MiB" in help_text
 
 
 def test_v4_server_environment_is_separate_single_device_standard_engine():
