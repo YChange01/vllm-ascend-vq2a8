@@ -26,8 +26,10 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 迁移代码、CPU 测试或环境检查均不等于新的 NPU 执行、模型质量、通信或性能 PASS。
 本说明不宣称已在 0.23 环境完成原生编译、全模型推理或取得 TPOT 结果。
 
-TP1 权重加载后卡住时，先用[无模型权重启动诊断](vq2a8_tp1_startup_diagnose.md)
-逐项测试 HC、激活准备和 V3 投影，不必再次加载全部专家。
+需要先回到原 V1 路径时，使用[V1 编译与复测命令](vq2a8_v1_reproduce.md)：
+读取旧 direct 权重、按预算懒加载专家，并复测历史 `batched` 短请求 TPOT。
+这不回滚 v0.23 框架或删除现有 zN repack 产物。
+若继续排查 V3，保留[无模型权重启动诊断](vq2a8_tp1_startup_diagnose.md)入口。
 
 ## 配套环境
 
