@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 import regex as re
@@ -28,7 +29,7 @@ from vllm_ascend.quantization.vq2a8_zn_contract import VQ2_TP1_ZN_FORMAT
 OFFLINE_CONTEXT_LIMIT = 32
 OFFLINE_NEW_TOKENS = 4
 OFFLINE_RUNS = 2
-CACHE_EXECUTION_POLICIES = ("cached", "ascendc", "ascendc_v2", "ascendc_v3")
+CACHE_EXECUTION_POLICIES = ("cached", "ascendc", "ascendc_v2", "ascendc_v3", "ascendc_v4")
 
 
 def _validate_cache_memory_fraction(value, policy):
@@ -60,8 +61,12 @@ def offline_engine_options(
     tensor_parallel_size=1,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
-    if execution_policy != "ascendc" and (ascendc_library is not None or ascendc_sha256 is not None):
-        raise ValueError("AscendC library options require execution_policy=ascendc.")
+    if execution_policy not in ("ascendc", "ascendc_v4") and (
+        ascendc_library is not None or ascendc_sha256 is not None
+    ):
+        raise ValueError("V1 AscendC library options require execution_policy=ascendc or ascendc_v4.")
+    if execution_policy == "ascendc_v4" and root_linear_mode != "bf16":
+        raise ValueError("VQ2A8 v4 requires unchanged BF16 roots.")
     if execution_policy != "ascendc_v2" and (ascendc_v2_library is not None or ascendc_v2_sha256 is not None):
         raise ValueError("V2 library options require execution_policy=ascendc_v2.")
     if execution_policy != "ascendc_v3" and (ascendc_v3_library is not None or ascendc_v3_sha256 is not None):
@@ -102,9 +107,7 @@ def offline_engine_options(
         "max_model_len": OFFLINE_CONTEXT_LIMIT,
         "max_num_batched_tokens": OFFLINE_CONTEXT_LIMIT,
         "block_size": 128,
-        "gpu_memory_utilization": 0.9
-        if execution_policy in ("cached", "ascendc", "ascendc_v2", "ascendc_v3")
-        else 0.35,
+        "gpu_memory_utilization": 0.9 if execution_policy in CACHE_EXECUTION_POLICIES else 0.35,
         "kv_cache_memory_bytes": 1024**3,
         "seed": 0,
         "disable_log_stats": True,
@@ -122,7 +125,7 @@ def offline_engine_options(
                     else {}
                 ),
                 **({"v3_serving": True} if v3_serving else {}),
-                "cache_experts": 256 if execution_policy in ("cached", "ascendc", "ascendc_v2", "ascendc_v3") else 2,
+                "cache_experts": 256 if execution_policy in CACHE_EXECUTION_POLICIES else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
                 "cache_reserve_gib": cache_reserve_gib,
@@ -131,7 +134,7 @@ def offline_engine_options(
                 "verbose_experts": verbose_experts,
                 **(
                     {"ascendc_library": str(ascendc_library), "ascendc_sha256": ascendc_sha256}
-                    if execution_policy == "ascendc"
+                    if execution_policy in ("ascendc", "ascendc_v4")
                     else {}
                 ),
                 **(
@@ -239,21 +242,26 @@ def validate_offline_config(config) -> dict:
         raise ValueError("Generic offload/sleep cannot manage standalone packed-cache ownership.")
     if config.load_config.load_format != "safetensors":
         raise ValueError("Offline adapter requires the canonical safetensors loader; dummy loading is forbidden.")
-    if options.get("execution_policy", "baseline") not in ("baseline", "cached", "ascendc", "ascendc_v2", "ascendc_v3"):
-        raise ValueError("execution_policy must be baseline, cached, ascendc, ascendc_v2 or ascendc_v3.")
+    if options.get("execution_policy", "baseline") not in ("baseline", *CACHE_EXECUTION_POLICIES):
+        raise ValueError("execution_policy must be baseline, cached, ascendc, ascendc_v2, ascendc_v3 or ascendc_v4.")
     if "cache_memory_fraction" in options:
         _validate_cache_memory_fraction(options["cache_memory_fraction"], options.get("execution_policy", "baseline"))
         kv_bytes = getattr(config.cache_config, "kv_cache_memory_bytes", None)
         if type(kv_bytes) is not int or kv_bytes <= 0:
             raise ValueError("cache_memory_fraction requires explicit positive integer kv_cache_memory_bytes.")
-    if options.get("execution_policy") == "ascendc":
+    if options.get("execution_policy") in ("ascendc", "ascendc_v4"):
         path, sha = options.get("ascendc_library"), options.get("ascendc_sha256")
         if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
             raise ValueError("AscendC requires an absolute native .so library path.")
         if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
             raise ValueError("AscendC requires the regression-tested library SHA256.")
     elif "ascendc_library" in options or "ascendc_sha256" in options:
-        raise ValueError("Native library options require explicit execution_policy=ascendc.")
+        raise ValueError("Native library options require explicit execution_policy=ascendc or ascendc_v4.")
+    if options.get("execution_policy") == "ascendc_v4":
+        if options.get("root_linear_mode", "bf16") != "bf16":
+            raise ValueError("VQ2A8 v4 requires unchanged BF16 roots.")
+        if options.get("cache_experts", 256) != 256:
+            raise ValueError("VQ2A8 v4 requires full residency, not an eviction cache.")
     if options.get("execution_policy") == "ascendc_v2":
         path, sha = options.get("ascendc_v2_library"), options.get("ascendc_v2_sha256")
         if not isinstance(path, str) or not Path(path).is_absolute() or Path(path).suffix != ".so":
@@ -365,7 +373,7 @@ def _validate_tp2_root_geometry(config):
 
 
 class OfflineMoEOwner:
-    """One rank-bound artifact index; legacy caches or V3 banks share a byte budget."""
+    """One rank-bound artifact index; cached or resident experts share a byte budget."""
 
     def __init__(self, model_root: Path, options: dict, device: torch.device, *, tp_size=1, tp_group=None):
         if type(tp_size) is not int or tp_size not in (1, 2):
@@ -387,7 +395,7 @@ class OfflineMoEOwner:
             self.root_config = json.loads((model_root / "config.json").read_text(encoding="utf-8"))
             _validate_tp2_root_geometry(self.root_config)
         self.native_library = None
-        if options.get("execution_policy") == "ascendc":
+        if options.get("execution_policy") in ("ascendc", "ascendc_v4"):
             from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
 
             if device.type != "npu":
@@ -462,6 +470,10 @@ class OfflineMoEOwner:
                 from vllm_ascend.quantization.vq2a8_ascendc_v2 import AscendCV2VQ2TP1MoE
 
                 runtime_classes["ascendc_v2"] = AscendCV2VQ2TP1MoE
+            if self.options.get("execution_policy") == "ascendc_v4":
+                from vllm_ascend.quantization.vq2a8_execution_v4 import AscendCV4VQ2TP1MoE
+
+                runtime_classes["ascendc_v4"] = AscendCV4VQ2TP1MoE
             if self.options.get("execution_policy") == "ascendc_v3":
                 if getattr(self, "tp_size", 1) == 2:
                     from vllm_ascend.quantization.vq2a8_execution_tp2 import AscendCV3VQ2TP2MoE
@@ -575,6 +587,9 @@ class OfflineMoEOwner:
         if self.options.get("execution_policy") == "ascendc_v3":
             self._configure_v3_residency(budget)
             return
+        if policy == "ascendc_v4":
+            self._configure_v4_residency(budget)
+            return
         planner = packed_cache_plan
         if self.options.get("execution_policy") == "ascendc_v2":
             from vllm_ascend.quantization.vq2a8_ascendc_v2 import ascendc_v2_cache_plan
@@ -589,6 +604,54 @@ class OfflineMoEOwner:
             layer.cache_experts = plan["layer_limits"][index]
         self.cache_plan = {**budget, **plan}
         print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
+
+    def _configure_v4_residency(self, budget):
+        """Preload V1 packed experts after all roots and before worker profiling.
+
+        V4 changes only expert residency. Keep the V1 startup token chunk,
+        preparation and native ABI; batched benchmarking is enabled later by
+        its normal between-request performance-probe control.
+        """
+        from vllm_ascend.quantization.vq2a8_execution_v4 import packed_resident_plan
+
+        if not self.layers or set(self.layers) != set(self.artifact.layers):
+            raise ValueError("V4 requires all artifact layers before full-residency planning.")
+        plan = packed_resident_plan([layer.layer for layer in self.layers.values()], budget["budget_bytes"])
+        self.cache_plan = {**budget, **plan, "preload_complete": False}
+        print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
+        started = time.perf_counter()
+        try:
+            for index, layer in self.layers.items():
+                print(f"MODEL layer={index} stage=v4_resident_load_start", flush=True)
+                layer.initialize_resident(budget_bytes=plan["layer_plans"][index]["planned_bytes"])
+                print(f"MODEL layer={index} stage=v4_resident_load_done", flush=True)
+            for layer in self.layers.values():
+                layer.check_resident_integrity()
+        except BaseException:
+            # Never execute a partially resident model. Each layer owns the
+            # completion fence needed before its allocations can be released.
+            for layer in self.layers.values():
+                try:
+                    layer.abort_residency()
+                except Exception as error:
+                    print(f"MODEL_V4_CLEANUP_ERROR {error}", flush=True)
+            raise
+        self.cache_plan["preload_complete"] = True
+        self.cache_plan["preload_elapsed_s"] = time.perf_counter() - started
+        print(
+            "MODEL_V4_RESIDENT_READY "
+            + json.dumps(
+                {
+                    "layers": len(self.layers),
+                    "experts": sum(len(layer.layer.expert_ids) for layer in self.layers.values()),
+                    "planned_bytes": plan["planned_bytes"],
+                    "preload_elapsed_s": self.cache_plan["preload_elapsed_s"],
+                    "expert_payload_runtime_loading": False,
+                    "native_abi": "v1",
+                }
+            ),
+            flush=True,
+        )
 
     def _configure_v3_residency(self, budget):
         """Plan ALL layers before admitting the first immutable expert bank.
@@ -724,6 +787,14 @@ class OfflineMoEOwner:
             "hits": sum(item["hits"] for item in stats),
             "evictions": sum(item.get("evictions", 0) for item in stats),
             "plan": self.cache_plan,
+            **({"v4": self.v4_report()} if self.options.get("execution_policy") == "ascendc_v4" else {}),
+        }
+
+    def v4_report(self) -> dict:
+        return {
+            str(index): layer.v4_report()
+            for index, layer in self.layers.items()
+            if getattr(layer, "execution_policy", None) == "ascendc_v4"
         }
 
     def reset_backend_trace(self):
@@ -742,6 +813,100 @@ class OfflineMoEOwner:
                 if isinstance(layer, AscendCVQ2TP1MoE)
             ],
         }
+
+
+def validate_v4_residency_evidence(cache: dict, reports: dict, layers: int) -> dict:
+    """Check NPU residency evidence outside timed work, not package versions.
+
+    The plan describes rounded allocations; payload counts describe logical
+    tensor bytes. Neither includes roots, KV, temporary tensors or headroom.
+    This checks reported real execution, not an independent weight oracle.
+    """
+    if type(layers) is not int or layers < 1 or not isinstance(cache, dict) or not isinstance(reports, dict):
+        raise ValueError("V4 residency requires a complete layer report.")
+    plan = cache.get("plan")
+    if (
+        not isinstance(plan, dict)
+        or plan.get("preload_complete") is not True
+        or plan.get("all_experts_fit") is not True
+        or plan.get("allocation") != "eager_packed_only"
+        or plan.get("layout") != "v1_packed"
+    ):
+        raise ValueError("V4 full-residency preload was not completed.")
+    layer_plans = plan.get("layer_plans")
+    if not isinstance(layer_plans, dict):
+        raise ValueError("V4 requires a full per-layer residency plan.")
+    expected_keys = {str(index) for index in range(layers)}
+    records = {str(index): record for index, record in reports.items()}
+    planned = {str(index): record for index, record in layer_plans.items()}
+    if (
+        len(records) != len(reports)
+        or len(planned) != len(layer_plans)
+        or set(records) != expected_keys
+        or set(planned) != expected_keys
+    ):
+        raise ValueError("V4 residency layer coverage is incomplete or duplicated.")
+    experts = payload_bytes = allocation_bytes = 0
+    for key in sorted(expected_keys, key=int):
+        record, entry = records[key], planned[key]
+        if not isinstance(record, dict) or not isinstance(entry, dict):
+            raise ValueError(f"Invalid V4 layer {key} residency record.")
+        if (
+            record.get("ready") is not True
+            or record.get("failed") is not False
+            or record.get("fallback_enabled") is not False
+            or record.get("execution_policy") != "ascendc_v4"
+            or record.get("layout") != "v1_packed"
+            or type(record.get("layer_index")) is not int
+            or record["layer_index"] != int(key)
+        ):
+            raise ValueError(f"V4 layer {key} is not a ready, no-fallback V1-packed runtime.")
+        for name in ("experts", "payload_bytes", "planned_bytes"):
+            if type(entry.get(name)) is not int or entry[name] <= 0:
+                raise ValueError(f"Invalid V4 layer {key} planned {name}.")
+        if entry["payload_bytes"] > entry["planned_bytes"]:
+            raise ValueError(f"V4 layer {key} payload exceeds its allocation plan.")
+        expected = {
+            "expected_experts": entry["experts"],
+            "resident_experts": entry["experts"],
+            "preload_loads": entry["experts"],
+            "payload_bytes": entry["payload_bytes"],
+            "planned_bytes": entry["planned_bytes"],
+            "preload_h2d_bytes": entry["payload_bytes"],
+            "preload_evictions": 0,
+            "post_init_loads": 0,
+            "post_init_h2d_bytes": 0,
+            "post_init_evictions": 0,
+        }
+        if any(type(record.get(name)) is not int or record[name] != value for name, value in expected.items()):
+            raise ValueError(f"V4 layer {key} residency changed or expert payload was loaded/evicted at runtime.")
+        experts += entry["experts"]
+        payload_bytes += entry["payload_bytes"]
+        allocation_bytes += entry["planned_bytes"]
+    expected_cache = {
+        "resident_experts": experts,
+        "loads": experts,
+        "evictions": 0,
+        "resident_packed_bytes": payload_bytes,
+    }
+    if (
+        any(type(cache.get(name)) is not int or cache[name] != value for name, value in expected_cache.items())
+        or type(plan.get("planned_bytes")) is not int
+        or plan["planned_bytes"] != allocation_bytes
+        or type(plan.get("budget_bytes")) is not int
+        or allocation_bytes > plan["budget_bytes"]
+    ):
+        raise ValueError("V4 aggregate residency counters or byte budget do not match its complete plan.")
+    return {
+        "layers": layers,
+        "experts": experts,
+        "payload_bytes": payload_bytes,
+        "planned_bytes": allocation_bytes,
+        "preload_complete": True,
+        "runtime_expert_payload_h2d_bytes": 0,
+        "runtime_expert_evictions": 0,
+        "scope": "expert_payload_residency_only_not_all_device_transfers_or_latency",
+    }
 
 
 def validate_offline_evidence(
@@ -768,11 +933,12 @@ def validate_offline_evidence(
     backend = evidence.get("expert_backend", {})
     if execution_policy is not None and backend.get("policy") != execution_policy:
         raise ValueError("Requested expert backend did not execute on the model.")
-    if execution_policy in ("ascendc", "ascendc_v2", "ascendc_v3"):
+    if execution_policy in ("ascendc", "ascendc_v2", "ascendc_v3", "ascendc_v4"):
         expected_sha256 = {
             "ascendc": ascendc_sha256,
             "ascendc_v2": ascendc_v2_sha256,
             "ascendc_v3": ascendc_v3_sha256,
+            "ascendc_v4": ascendc_sha256,
         }[execution_policy]
         records = backend.get("layers", [])
         if (
@@ -814,6 +980,8 @@ def validate_offline_evidence(
     plan = evidence["cache"].get("plan")
     if plan and evidence["cache"]["resident_packed_bytes"] > plan["planned_bytes"]:
         raise ValueError("Packed expert cache exceeded its planned byte budget.")
+    if execution_policy == "ascendc_v4":
+        validate_v4_residency_evidence(evidence["cache"], evidence.get("v4", {}), layers)
     logits = evidence["logits"]
     if logits.shape != (len(generated), vocab) or not bool(torch.isfinite(logits).all()):
         raise ValueError("Invalid shape or non-finite generation logits.")

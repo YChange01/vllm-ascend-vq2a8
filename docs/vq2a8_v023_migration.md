@@ -29,6 +29,8 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 需要先回到原 V1 路径时，使用[V1 编译与复测命令](vq2a8_v1_reproduce.md)：
 读取旧 direct 权重、按预算懒加载专家，并复测历史 `batched` 短请求 TPOT。
 这不回滚 v0.23 框架或删除现有 zN repack 产物。
+同一分支另有 [V4 全专家常驻入口](vq2a8_v4_reproduce.md)：保留 V1 计算与 native ABI，
+仅将专家生命周期从按需缓存改为启动全量预载；实际 TPOT 必须在目标 NPU 重新测量。
 若继续排查 V3，保留[无模型权重启动诊断](vq2a8_tp1_startup_diagnose.md)入口。
 
 ## 配套环境

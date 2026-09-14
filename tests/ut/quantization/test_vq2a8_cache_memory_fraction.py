@@ -13,9 +13,10 @@ from vllm_ascend.quantization import vq2a8_offline as offline
 
 
 def options(tmp_path, policy="cached", **kwargs):
-    if policy in ("ascendc", "ascendc_v2", "ascendc_v3"):
-        kwargs[f"{policy}_library"] = tmp_path / f"lib{policy}.so"
-        kwargs[f"{policy}_sha256"] = "a" * 64
+    library_policy = "ascendc" if policy == "ascendc_v4" else policy
+    if library_policy in ("ascendc", "ascendc_v2", "ascendc_v3"):
+        kwargs[f"{library_policy}_library"] = tmp_path / f"lib{library_policy}.so"
+        kwargs[f"{library_policy}_sha256"] = "a" * 64
     return offline.offline_engine_options(tmp_path / "model", tmp_path / "artifact", execution_policy=policy, **kwargs)
 
 
@@ -50,7 +51,7 @@ def budget_log(capsys):
     return json.loads(next(line.split(" ", 1)[1] for line in lines if line.startswith("MODEL_CACHE_BUDGET ")))
 
 
-@pytest.mark.parametrize("policy", ["baseline", "cached", "ascendc", "ascendc_v2", "ascendc_v3"])
+@pytest.mark.parametrize("policy", ["baseline", *offline.CACHE_EXECUTION_POLICIES])
 def test_cache_fraction_none_is_omitted_and_preserves_old_engine_defaults(tmp_path, policy):
     original = options(tmp_path, policy)
     explicit_none = options(tmp_path, policy, cache_memory_fraction=None)
@@ -136,6 +137,7 @@ def test_cache_fraction_owner_selects_override_for_each_cached_backend(monkeypat
     monkeypatch.setattr(offline, "packed_cache_plan", fake_plan)
     monkeypatch.setattr(v2, "ascendc_v2_cache_plan", fake_plan)
     value._configure_v3_residency = lambda budget: setattr(value, "cache_plan", budget)
+    value._configure_v4_residency = lambda budget: setattr(value, "cache_plan", budget)
     value.configure_cache(0.25)
     assert len(calls) == 1 and calls[0]["memory_fraction"] == 0.95
     assert calls[0]["budget_gib"] == 0.0

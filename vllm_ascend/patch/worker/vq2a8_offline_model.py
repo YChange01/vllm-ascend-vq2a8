@@ -257,6 +257,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         )
         if v3 and optimization not in (None, "batched", "v3"):
             raise ValueError("V3 preserves the fixed resident arithmetic path; other presets require separate gates.")
+        v4 = any(getattr(layer, "execution_policy", None) == "ascendc_v4" for layer in owner.layers.values())
+        if v4 and optimization not in (None, "batched"):
+            raise ValueError("V4 preserves V1 arithmetic; only the original or batched preset is supported.")
         if optimization is not None and not v3:
             OptimizationOptions.preset(optimization)
         if not owner.layers or not all(isinstance(layer, AscendCVQ2TP1MoE) for layer in owner.layers.values()):
@@ -271,6 +274,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._measurement_valid = None
         self._measurement_forwards = 0
         for layer in owner.layers.values():
+            if getattr(layer, "execution_policy", None) == "ascendc_v4":
+                layer.check_resident_integrity()
             layer.measurement_mode = measurement
             layer.trace_native = False
             layer.native_steps = []
@@ -301,6 +306,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         valid = self._measurement_valid
         optimization = {}
         for index, layer in owner.layers.items():
+            if getattr(layer, "execution_policy", None) == "ascendc_v4":
+                layer.check_resident_integrity()
             if getattr(layer, "execution_policy", None) == "ascendc_v3":
                 layer.check_resident_integrity()
                 v3_valid = layer.v3_validity()
@@ -321,6 +328,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 str(index): layer.v3_report()
                 for index, layer in owner.layers.items()
                 if getattr(layer, "execution_policy", None) == "ascendc_v3"
+            },
+            "v4": {
+                str(index): layer.v4_report()
+                for index, layer in owner.layers.items()
+                if getattr(layer, "execution_policy", None) == "ascendc_v4"
             },
             "forwards": getattr(self, "_measurement_forwards", 0),
             "cache": owner.cache_report(),
@@ -437,6 +449,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         # Consume them outside inference timing, including the v2 bring-up:
         # finite final logits alone cannot certify valid intermediate inputs.
         for index, layer in self.model.offline_owner.layers.items():
+            if getattr(layer, "execution_policy", None) == "ascendc_v4":
+                layer.check_resident_integrity()
             if getattr(layer, "execution_policy", None) == "ascendc_v3":
                 layer.check_resident_integrity()
                 valid = layer.v3_validity()
@@ -458,6 +472,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 str(index): layer.v3_report()
                 for index, layer in self.model.offline_owner.layers.items()
                 if getattr(layer, "execution_policy", None) == "ascendc_v3"
+            },
+            "v4": {
+                str(index): layer.v4_report()
+                for index, layer in self.model.offline_owner.layers.items()
+                if getattr(layer, "execution_policy", None) == "ascendc_v4"
             },
         }
 
