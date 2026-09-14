@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Start standard vLLM HTTP serving with V4 TP1 full-resident V1-packed experts.
+
+No build, repack, version audit, acceptance receipt or numerical preflight.
+Confirm the selected NPU is available before starting this persistent server.
+"""
+
+from __future__ import annotations
+
+# ruff: noqa: E402
+import os
+import sys
+
+if not __package__:
+    sys.path[0] = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+import argparse
+import hashlib
+import json
+import math
+import shlex
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+MAX_CONTEXT = 128
+KV_BYTES = 1024**3
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, default=Path("/home/g00872988/vq2a8"))
+    parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so")
+    parser.add_argument("--physical-npu", type=int, default=1)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--memory-fraction", type=float, default=0.9, help="Expert residency budget fraction")
+    parser.add_argument("--engine-memory-fraction", type=float, default=0.9)
+    parser.add_argument("--reserve-gib", type=float, default=8.0)
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the command without importing or running vLLM/NPU"
+    )
+    args = parser.parse_args(argv)
+    if args.physical_npu < 0 or not 1 <= args.port <= 65535:
+        parser.error("Require a nonnegative physical NPU and port in [1,65535].")
+    if not args.host or any(character.isspace() for character in args.host):
+        parser.error("Require a nonempty host without whitespace.")
+    if any(
+        not math.isfinite(value) or not 0 < value <= 1 for value in (args.memory_fraction, args.engine_memory_fraction)
+    ):
+        parser.error("Memory fractions must be finite and in (0,1].")
+    if not math.isfinite(args.reserve_gib) or args.reserve_gib < KV_BYTES / 1024**3:
+        parser.error(
+            "Reserve must be finite and include at least the 1 GiB KV cache; it is never reduced automatically."
+        )
+    return args
+
+
+def build_command(args):
+    model, library = args.model.resolve(strict=True), args.library.resolve(strict=True)
+    artifact = (model / "experts_vq_ascend_v2").resolve(strict=True)
+    if not model.is_dir() or not artifact.is_dir():
+        raise ValueError("Model and its standard experts_vq_ascend_v2 direct TP1 artifact must be directories.")
+    if library.suffix != ".so" or not library.is_file():
+        raise ValueError("--library must be the existing V1 libvq2a8_ascendc .so, not a V3 library.")
+    # Pin the file used by the runtime, without requiring a build manifest or
+    # an acceptance receipt. Actual ABI/weight/device checks remain in loader.
+    sha256 = hashlib.sha256(library.read_bytes()).hexdigest()
+    additional = {
+        "enable_flashcomm1": False,
+        "mix_placement": False,
+        "multistream_dsv4_dsa_overlap": False,
+        "vq2a8_offline": {
+            "enabled": True,
+            "artifact": str(artifact),
+            "execution_policy": "ascendc_v4",
+            "ascendc_library": str(library),
+            "ascendc_sha256": sha256,
+            "cache_experts": 256,
+            "token_chunk": 2,
+            "cache_memory_fraction": args.memory_fraction,
+            "cache_reserve_gib": args.reserve_gib,
+            "root_linear_mode": "bf16",
+            "v4_serving": True,
+        },
+    }
+    overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
+    return [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        str(model),
+        "--served-model-name",
+        "vq2a8",
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--dtype",
+        "bfloat16",
+        "--load-format",
+        "safetensors",
+        "--tensor-parallel-size",
+        "1",
+        "--pipeline-parallel-size",
+        "1",
+        "--distributed-executor-backend",
+        "uni",
+        "--enforce-eager",
+        "--compilation-config",
+        json.dumps({"mode": 0, "cudagraph_mode": "NONE"}),
+        "--no-async-scheduling",
+        "--no-enable-prefix-caching",
+        "--no-enable-chunked-prefill",
+        "--max-num-seqs",
+        "1",
+        "--max-model-len",
+        str(MAX_CONTEXT),
+        "--max-num-batched-tokens",
+        str(MAX_CONTEXT),
+        "--block-size",
+        "128",
+        "--kv-cache-memory-bytes",
+        str(KV_BYTES),
+        "--gpu-memory-utilization",
+        str(args.engine_memory_fraction),
+        "--stream-interval",
+        "1",
+        "--seed",
+        "0",
+        "--disable-log-stats",
+        "--generation-config",
+        "vllm",
+        "--hf-overrides",
+        json.dumps(overrides),
+        "--additional-config",
+        json.dumps(additional),
+    ]
+
+
+def server_environment(args, environ=None):
+    environment = dict(os.environ if environ is None else environ)
+    for key in (
+        "ASCEND_VISIBLE_DEVICES",
+        "NPU_VISIBLE_DEVICES",
+        "ASCEND_DEVICE_ID",
+        "DEVICE_ID",
+        "RANK_ID",
+        "LOCAL_RANK",
+        "RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+    ):
+        environment.pop(key, None)
+    environment["ASCEND_RT_VISIBLE_DEVICES"] = str(args.physical_npu)
+    environment["ASCEND_LAUNCH_BLOCKING"] = "0"
+    # Standard AsyncLLM owns an engine-core child; do not inherit the offline
+    # benchmark's in-process worker setting.
+    environment["VLLM_ENABLE_V1_MULTIPROCESSING"] = "1"
+    environment["VLLM_USE_V2_MODEL_RUNNER"] = "0"
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONPATH"] = str(REPO) + (
+        os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+    )
+    return environment
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        command = build_command(args)
+        if args.dry_run:
+            print(f"V4_SERVER_DRY_RUN physical_npu={args.physical_npu} no_device_execution=True", flush=True)
+            print(shlex.join(command), flush=True)
+        else:
+            print(
+                f"Starting vllm serve at http://{args.host}:{args.port} "
+                f"(V4 TP1, physical NPU {args.physical_npu}, V1 batched arithmetic, full residency). "
+                "Confirm this card is available; no other jobs are stopped.",
+                flush=True,
+            )
+            os.execvpe(command[0], command, server_environment(args))
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"V4 server: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

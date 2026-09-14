@@ -8,6 +8,39 @@ V4 是独立的 `execution_policy=ascendc_v4`。它复用 V1 的 native `.so`、
 预算不足、加载不完整、运行中缺少专家都报错；不会退回懒加载或自动降低 reserve。
 首次 worker dummy/profile 保留 V1 的原始几何；`LLM` 初始化返回后才按 V1 的时点配置 batched。
 
+## 直接启动 vLLM HTTP 服务
+
+这是独立于下面验收脚本的快捷入口：不编译、不跑验收矩阵、不检查包版本或全局依赖，
+直接启动标准 `vllm serve`，模型和全部专家只加载一次，服务保持运行。
+先确认物理卡 1 空闲；已有 V1 `.so` 可直接复用，无需重新编译或 repack。
+
+终端 1（容器内）：
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+git pull --ff-only origin vllm-ascend-vq2a8-v023
+python -u tools/serve_vq2a8_v4.py --model /home/g00872988/vq2a8 --library build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so --physical-npu 1 --reserve-gib 8 --port 8000
+```
+
+等到 `Application startup complete`，在同一容器的终端 2 请求（不要同时运行验收脚本）：
+
+```bash
+curl http://127.0.0.1:8000/v1/models
+curl -N http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json' -d '{"model":"vq2a8","prompt":"请用一句话介绍你自己。","max_tokens":32,"temperature":0,"stream":true}'
+```
+
+这里使用 `/v1/completions`，不依赖尚未确认的 chat template。输入和输出 token 总数不超过 128，
+单并发、TP1、BF16、eager；不是长上下文或生产并发配置。默认仅监听 `127.0.0.1`。
+其他容器或远程机器不能直接使用这个 loopback 地址；跨主机开放监听前需自行配置认证和访问控制。
+`--dry-run` 仅打印命令，不初始化 NPU。正常停止服务在终端 1 按 Ctrl+C。
+
+服务模式在严格权重加载、V4 全专家常驻完成后关闭离线逐层诊断同步/日志。
+启动 profile 仍保留 V1 原始 `token_chunk=2`；首个带真实 attention metadata 的 forward
+先同步一次、确认常驻完整，再启用 V1 `batched`，终端打印 `MODEL_V4_SERVING_READY`。
+后续请求不重复切换、不扫描全部专家元数据、不清空缓存，也不积累离线 logits/trace。
+首次请求包括一次性切换和常量准备开销，不用它声称稳定 TPOT。
+HTTP 返回成功并不等同于通过下面的数值验收或性能测试。
+
 ## 默认验收：只加载一次 V4
 
 先结束自己在目标卡上的旧服务并确认目标卡空闲，不停止其他人的任务。
@@ -97,3 +130,8 @@ V1 热缓存本来就可能无专家搬运，因此 V4 不保证固定速度提�
 `test_vq2a8_root_fp8.py` 的 FP8 midpoint / CPU FMA 数值用例，本次没有修改该实现。
 改动的 Python 文件通过 Ruff 检查与格式检查；`format.sh ci` 因本地缺少 pre-commit 未能完成。
 尚未进行 NPU 实测，不能据此认定 V4 已达到 0.3 s TPOT，也不能认定已解决此前 V3 的阻塞。
+
+HTTP 入口补充验证：新增 58 项 CPU 测试，最终相关回归 493 项通过。全量复跑时为
+2885 passed、257 skipped、2 failed，之后补充的三个 CLI/配置用例已包含在最终相关回归中；
+两个失败仍是上述原有 FP8/FMA 用例。服务 Python 改动通过 Ruff 检查和格式检查，
+完整 hooks 仍受本地缺少 pre-commit 限制；尚未在 NPU 上启动或通过 HTTP 请求实测。

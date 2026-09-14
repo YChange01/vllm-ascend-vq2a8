@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Opt-in inheritance adapter. Importing this module does not monkey-patch vLLM.
 
-The offline tools and explicit V3 server select this architecture. Attention/HC/cache execution
+The offline tools and explicit V3/V4 servers select this architecture. Attention/HC/cache execution
 is inherited; MoE allocation, token routing and root loading are explicit.
 """
 
@@ -165,6 +165,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_root_mode = validate_offline_config(vllm_config).get("root_linear_mode", "bf16")
         self._offline_root_verified = False
         self._v3_serving = options.get("v3_serving", False)
+        self._v4_serving = options.get("v4_serving", False)
+        self._v4_serving_batched_ready = False
         self._startup_trace_mode = options.get("v3_startup_trace", "off")
 
     def set_moe_parameters(self):
@@ -192,6 +194,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_loaded = True
         if self._v3_serving:
             self._configure_v3_serving()
+        if getattr(self, "_v4_serving", False):
+            self._configure_v4_serving()
         print("MODEL_LOAD_RESULT " + json.dumps(report), flush=True)
         if self._startup_trace_mode != "off":
             from vllm_ascend.quantization.vq2a8_startup_trace import install_startup_trace
@@ -212,6 +216,45 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         for layer in owner.layers.values():
             layer.measurement_mode = True
             layer.trace_native = False
+
+    def _configure_v4_serving(self):
+        """Keep the loaded model quiet, but retain V1 startup profile geometry.
+
+        Do not use the offline probe controller: a persistent server must not
+        reset resident state or add per-request full-weight metadata scans.
+        """
+        owner = self.model.offline_owner
+        if not self._offline_loaded or self._offline_root_mode != "bf16":
+            raise ValueError("V4 serving requires strictly loaded BF16 roots.")
+        if not owner.layers or any(
+            getattr(layer, "execution_policy", None) != "ascendc_v4" for layer in owner.layers.values()
+        ):
+            raise ValueError("V4 serving requires resident V4 execution on every layer.")
+        for layer in owner.layers.values():
+            layer.check_resident_integrity()
+        owner.measurement_mode = True
+        self._measurement_valid = None
+        self._measurement_forwards = 0
+        for layer in owner.layers.values():
+            layer.measurement_mode = True
+            layer.trace_native = False
+
+    def _enable_v4_serving_batched(self):
+        """One-time switch at the first real request, after dummy/profile work."""
+        if self._v4_serving_batched_ready:
+            return
+        from vllm_ascend.quantization.vq2a8_optimization import configure_runtime
+
+        # V1 profile may still have device work queued. Preserve preparation
+        # owners until it has completed, as the offline benchmark does.
+        torch.npu.synchronize()
+        layers = self.model.offline_owner.layers.values()
+        for layer in layers:
+            layer.check_resident_integrity()
+        for layer in layers:
+            configure_runtime(layer, "batched", profile=False)
+        self._v4_serving_batched_ready = True
+        print("MODEL_V4_SERVING_READY preset=batched expert_payload_runtime_loading=False", flush=True)
 
     def reset_offline_trace(self):
         if getattr(self.model.offline_owner, "measurement_mode", False):
@@ -384,8 +427,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
         if getattr(self.model.offline_owner, "measurement_mode", False):
             real_attention = bool(get_forward_context().attn_metadata)
-            if not real_attention and not getattr(self, "_v3_serving", False):
+            v4_serving = getattr(self, "_v4_serving", False)
+            if not real_attention and not (getattr(self, "_v3_serving", False) or v4_serving):
                 raise ValueError("Performance probes require real attention metadata.")
+            if real_attention and v4_serving and not self._v4_serving_batched_ready:
+                self._enable_v4_serving_batched()
             result = super().forward(input_ids, positions, intermediate_tensors, inputs_embeds)
             if real_attention:
                 self._retain_finite_flag(result)

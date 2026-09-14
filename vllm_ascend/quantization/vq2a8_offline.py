@@ -57,6 +57,7 @@ def offline_engine_options(
     v3_preparation="eager",
     v3_decode_graph="none",
     v3_serving=False,
+    v4_serving=False,
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
@@ -77,6 +78,8 @@ def offline_engine_options(
         raise ValueError("V3 preparation/graph options require execution_policy=ascendc_v3.")
     if type(v3_serving) is not bool or (v3_serving and execution_policy != "ascendc_v3"):
         raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
+    if type(v4_serving) is not bool or (v4_serving and execution_policy != "ascendc_v4"):
+        raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
@@ -125,6 +128,7 @@ def offline_engine_options(
                     else {}
                 ),
                 **({"v3_serving": True} if v3_serving else {}),
+                **({"v4_serving": True} if v4_serving else {}),
                 "cache_experts": 256 if execution_policy in CACHE_EXECUTION_POLICIES else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
@@ -176,6 +180,7 @@ def validate_offline_config(config) -> dict:
         "v3_preparation",
         "v3_decode_graph",
         "v3_serving",
+        "v4_serving",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -296,6 +301,10 @@ def validate_offline_config(config) -> dict:
         "v3_serving" in options and options.get("execution_policy") != "ascendc_v3"
     ):
         raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
+    if type(options.get("v4_serving", False)) is not bool or (
+        "v4_serving" in options and options.get("execution_policy") != "ascendc_v4"
+    ):
+        raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
     trace_mode = options.get("v3_startup_trace", "off")
     if trace_mode not in ("off", "async", "sync"):
         raise ValueError("v3_startup_trace must be off, async or sync.")
