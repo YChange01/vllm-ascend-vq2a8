@@ -407,3 +407,88 @@ def test_nonserving_offline_measurement_still_rejects_dummy_attention(device_fen
         model.forward(*tokens())
     assert not model.forward_calls and not model._v4_serving_batched_ready
     device_fence.assert_not_called()
+
+
+def test_device_route_serving_is_explicit_and_switches_once(monkeypatch, device_fence, capsys):
+    from vllm_ascend.quantization import vq2a8_optimization
+
+    model, owner, _, _ = isolated_model()
+    model._v4_device_route_decode = True
+    selected = []
+    monkeypatch.setattr(vq2a8_optimization, "configure_runtime", lambda layer, preset, **kw: selected.append(preset))
+    model.load_weights(iter(()))
+    model.forward(*tokens())
+    model.forward(*tokens())
+    assert selected == ["device_route_decode"] * len(owner.layers)
+    assert "MODEL_V4_SERVING_READY preset=device_route_decode" in capsys.readouterr().out
+    device_fence.assert_called_once_with()
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_device_route_validation_is_one_model_boundary_read_not_one_per_layer(monkeypatch, device_fence, valid):
+    model, owner, _, _ = isolated_model()
+    model.load_weights(iter(()))
+    model._v4_device_route_decode = True
+    for index, layer in owner.layers.items():
+        layer._optimization = NS(valid=torch.tensor(valid if index == 1 else True))
+    reads = []
+    original_bool = torch.Tensor.__bool__
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "__bool__", lambda tensor: reads.append(tensor) or original_bool(tensor))
+        if valid:
+            assert model.compute_logits(torch.ones(1, 2)) is model.logits_result
+        else:
+            with pytest.raises(ValueError, match="no output tokens are accepted"):
+                model.compute_logits(torch.ones(1, 2))
+            assert len(model.logits_calls) == 1
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("source", ["final_hidden", "logits"])
+def test_device_route_boundary_rejects_nonfinite_final_output(monkeypatch, device_fence, source):
+    model, owner, _, _ = isolated_model()
+    model.load_weights(iter(()))
+    model._v4_device_route_decode = True
+    for layer in owner.layers.values():
+        layer._optimization = NS(valid=torch.tensor(True))
+    if source == "final_hidden":
+        model._retain_finite_flag(torch.tensor([float("nan")]))
+    else:
+        model.logits_result = torch.tensor([[float("inf"), 0.0]])
+    reads = []
+    original_bool = torch.Tensor.__bool__
+    monkeypatch.setattr(torch.Tensor, "__bool__", lambda tensor: reads.append(tensor) or original_bool(tensor))
+    with pytest.raises(ValueError, match="no output tokens are accepted"):
+        model.compute_logits(torch.ones(1, 2))
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("flag", [True, False])
+def test_device_route_option_round_trip(flag):
+    plan = offline.offline_engine_options(
+        REPO / "model",
+        REPO / "artifact",
+        execution_policy="ascendc_v4",
+        ascendc_library=REPO / "native.so",
+        ascendc_sha256="a" * 64,
+        v4_device_route_decode=flag,
+    )
+    cfg = config()
+    cfg.additional_config = plan["additional_config"]
+    assert offline.validate_offline_config(cfg).get("v4_device_route_decode", False) is flag
+    assert ("v4_device_route_decode" in cfg.additional_config["vq2a8_offline"]) is flag
+
+
+@pytest.mark.parametrize("flag", [None, 0, 1, "true"])
+def test_device_route_option_rejects_nonbooleans(flag):
+    cfg = config()
+    cfg.additional_config["vq2a8_offline"]["v4_device_route_decode"] = flag
+    with pytest.raises(ValueError, match="v4_device_route_decode"):
+        offline.validate_offline_config(cfg)
+
+
+def test_device_route_cannot_be_enabled_on_v1():
+    with pytest.raises(ValueError, match="v4_device_route_decode"):
+        offline.offline_engine_options(
+            REPO / "model", REPO / "artifact", execution_policy="cached", v4_device_route_decode=True
+        )

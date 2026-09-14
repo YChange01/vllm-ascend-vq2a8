@@ -31,10 +31,81 @@ def test_default_plan_loads_only_v4_and_reuses_v1_kernel(tmp_path):
     assert args.library.name == "libvq2a8_ascendc.so"
     assert args.library.parent.name == "vq2a8-ascendc-v023-v1"
     assert args.artifact == args.model / "experts_vq_ascend_v2"
+    assert args.device_route_decode is False
+    assert args.max_model_len == 128 and args.kv_cache_mib == 1024
+    assert args.memory_fraction is None and args.engine_memory_fraction == 0.9
+    assert "--memory-fraction" not in steps[-1][1]
     assert sum("benchmark_vq2a8_v4.py" in " ".join(command) for _, command in steps) == 1
     assert "--reference-only" not in steps[-1][1]
     assert all("--audit-consistency" not in command for _, command in steps)
     assert not any("v3" in item or "build_vq2" in item for _, command in steps for item in command)
+
+
+def test_short_context_budget_reaches_both_workers_without_changing_preflight(tmp_path):
+    args = arguments(
+        tmp_path,
+        "--device-route-decode",
+        "--compare-v1",
+        "--max-model-len",
+        "16",
+        "--kv-cache-mib",
+        "256",
+        "--memory-fraction",
+        "1",
+        "--engine-memory-fraction",
+        "0.9",
+        "--cache-reserve-gib",
+        "3",
+    )
+    steps = dict(accept.commands(args, tmp_path / "report"))
+    for mode in ("v1_reference", "v4"):
+        command = steps[mode]
+        values = {
+            flag: command[command.index(flag) + 1]
+            for flag in (
+                "--max-model-len",
+                "--kv-cache-mib",
+                "--memory-fraction",
+                "--engine-memory-fraction",
+                "--cache-reserve-gib",
+            )
+        }
+        assert values == {
+            "--max-model-len": "16",
+            "--kv-cache-mib": "256",
+            "--memory-fraction": "1.0",
+            "--engine-memory-fraction": "0.9",
+            "--cache-reserve-gib": "3.0",
+        }
+        parsed = benchmark.parse_args(command[3:])
+        assert parsed.cases == [(10, 4)] and parsed.max_model_len == 16
+    for mode in ("preflight", "device_route_preflight"):
+        assert "--memory-fraction" not in steps[mode] and "--max-model-len" not in steps[mode]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--max-model-len", "13"],
+        ["--max-model-len", "129"],
+        ["--max-model-len", "0"],
+        ["--max-model-len", "16", "--cases", "10:4,14:4"],
+        ["--kv-cache-mib", "0"],
+        ["--kv-cache-mib", "-1"],
+        ["--kv-cache-mib", "4096", "--cache-reserve-gib", "3"],
+        ["--memory-fraction", "0"],
+        ["--memory-fraction", "1.1"],
+        ["--memory-fraction", "nan"],
+        ["--engine-memory-fraction", "inf"],
+        ["--engine-memory-fraction", "-1"],
+    ],
+)
+@pytest.mark.parametrize("worker", [False, True])
+def test_context_and_budget_rejected_on_host_before_import_or_launch(tmp_path, extra, worker):
+    argv = ["--library", "fake.so", "--preflight", "preflight.json", "--output-dir", str(tmp_path / "worker")]
+    with pytest.raises(SystemExit) as error:
+        benchmark.parse_args([*argv, *extra]) if worker else arguments(tmp_path, *extra)
+    assert error.value.code == 2
 
 
 def test_comparison_plan_uses_distinct_sequential_reference_worker(tmp_path):
@@ -43,6 +114,132 @@ def test_comparison_plan_uses_distinct_sequential_reference_worker(tmp_path):
     assert "--reference-only" in steps[2][1] and "--reference-only" not in steps[3][1]
     assert "--reference-report" in steps[3][1]
     assert steps[3][1][-1] == str(tmp_path / "report/v1_reference/summary.json")
+
+
+@pytest.mark.parametrize("compare_v1", [False, True])
+def test_device_route_flag_only_reaches_v4_worker(tmp_path, compare_v1):
+    extra = ["--device-route-decode", *(["--compare-v1"] if compare_v1 else [])]
+    steps = accept.commands(arguments(tmp_path, *extra), tmp_path / "report")
+    workers = [(name, command) for name, command in steps if "benchmark_vq2a8_v4.py" in " ".join(command)]
+    assert len(workers) == 1 + compare_v1
+    for name, command in workers:
+        assert ("--device-route-decode" in command) == (name == "v4")
+    preflight = dict(steps)["device_route_preflight"]
+    assert "validate_vq2a8_v4_device_route.py" in " ".join(preflight)
+    assert "--report-dir" in preflight and "--allow-busy" not in preflight
+    assert [name for name, _ in steps].index("device_route_preflight") < [name for name, _ in steps].index("v4")
+
+
+def test_reference_worker_rejects_device_route_before_execution(tmp_path):
+    required = ["--library", "old.so", "--preflight", "preflight.json", "--output-dir", str(tmp_path)]
+    assert not benchmark.parse_args(required).device_route_decode
+    assert benchmark.parse_args([*required, "--device-route-decode"]).device_route_decode
+    with pytest.raises(SystemExit):
+        benchmark.parse_args([*required, "--reference-only", "--device-route-decode"])
+
+
+def test_default_request_schedule_is_unchanged_batched_only():
+    schedule = list(benchmark.request_schedule(2, 5))
+    assert schedule == [
+        (kind, index, "batched") for kind, count in (("warmup", 2), ("measured", 5)) for index in range(count)
+    ]
+
+
+def test_device_route_schedule_warms_both_then_alternates_ab_ba_without_extra_loads():
+    schedule = list(benchmark.request_schedule(2, 5, device_route_decode=True))
+    assert len(schedule) == 14
+    assert [row[0] for row in schedule] == ["warmup"] * 4 + ["measured"] * 10
+    assert schedule[:4] == [
+        ("warmup", 0, "batched"),
+        ("warmup", 0, "device_route_decode"),
+        ("warmup", 1, "device_route_decode"),
+        ("warmup", 1, "batched"),
+    ]
+    assert schedule[4:8] == [
+        ("measured", 0, "batched"),
+        ("measured", 0, "device_route_decode"),
+        ("measured", 1, "device_route_decode"),
+        ("measured", 1, "batched"),
+    ]
+    for mode in ("batched", "device_route_decode"):
+        assert sum(kind == "measured" and actual == mode for kind, _, actual in schedule) == 5
+
+
+def test_measured_metrics_never_pool_baseline_candidate_warmup_or_other_case():
+    keys = ("ttft_s", "tpot_s", "e2e_s", "output_tokens_per_s", "device_span_ms")
+    samples = [
+        dict(case=case, kind=kind, optimization=mode, **dict.fromkeys(keys, value))
+        for case, kind, mode, value in (
+            ("p10-o4", "measured", "batched", 2),
+            ("p10-o4", "measured", "device_route_decode", 1),
+            ("p10-o4", "warmup", "device_route_decode", 99),
+            ("p32-o4", "measured", "device_route_decode", 99),
+        )
+    ]
+    assert benchmark.measured_metrics(samples, "p10-o4", "device_route_decode")["tpot_s"]["median"] == 1
+    assert benchmark.measured_metrics(samples, "p10-o4", "batched")["tpot_s"]["median"] == 2
+
+
+def device_route_activity(prompt=10, count=4):
+    previous = {
+        "preset": "device_route_decode",
+        "singleton_forwards": 15,
+        "batched_prefill_forwards": 5,
+        "route_host_reads": 5,
+        "device_select_calls": 30,
+        "singleton_route_host_reads": 0,
+        "singleton_descriptor_h2d_bytes": 0,
+    }
+    before = {str(layer): dict(previous) for layer in range(benchmark.LAYERS)}
+    after = copy.deepcopy(before)
+    for record in after.values():
+        record["singleton_forwards"] += count - 1 + int(prompt == 1)
+        record["device_select_calls"] += 2 * (count - 1 + int(prompt == 1))
+        record["batched_prefill_forwards"] += int(prompt > 1)
+        record["route_host_reads"] += int(prompt > 1)
+    return before, after
+
+
+@pytest.mark.parametrize("prompt", [1, 10])
+def test_device_route_activity_requires_new_singleton_and_preserves_prefill(prompt):
+    before, after = device_route_activity(prompt)
+    report = benchmark.check_device_route_activity(before, after, prompt, 4)
+    assert report["layers"] == 43
+    assert report["per_layer_request_delta"]["singleton_forwards"] == 3 + int(prompt == 1)
+    assert report["per_layer_request_delta"]["route_host_reads"] == int(prompt > 1)
+    assert "not_profiler" in report["transfer_scope"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("singleton_forwards", 15),
+        ("device_select_calls", 30),
+        ("batched_prefill_forwards", 5),
+        ("route_host_reads", 7),
+        ("singleton_route_host_reads", 1),
+        ("singleton_descriptor_h2d_bytes", 576),
+        ("preset", "batched"),
+        ("singleton_forwards", True),
+        ("device_select_calls", None),
+    ],
+)
+def test_device_route_activity_rejects_stale_partial_fallback_or_host_transfer(field, value):
+    before, after = device_route_activity()
+    after["42"][field] = value
+    with pytest.raises(ValueError):
+        benchmark.check_device_route_activity(before, after, 10, 4)
+
+
+def test_device_route_activity_rejects_missing_layer_and_persistent_host_transfer():
+    before, after = device_route_activity()
+    del after["0"]
+    with pytest.raises(ValueError):
+        benchmark.check_device_route_activity(before, after, 10, 4)
+    before, after = device_route_activity()
+    before["0"]["singleton_descriptor_h2d_bytes"] = after["0"]["singleton_descriptor_h2d_bytes"] = 1
+    with pytest.raises(ValueError):
+        benchmark.check_device_route_activity(before, after, 10, 4)
 
 
 @pytest.mark.parametrize(
@@ -275,6 +472,76 @@ def test_supervisor_prints_actual_case_medians_and_transfer_evidence(monkeypatch
     assert accept.run(arguments(tmp_path)) == 0
     output = capsys.readouterr().out
     assert '"tpot_median_s": 0.25' in output and '"expert_payload_h2d_bytes_per_request": 0' in output
+
+
+@pytest.mark.parametrize("failure", [None, "global", "exact", "baseline", "candidate", "transfer"])
+def test_device_route_receipt_keeps_baseline_and_candidate_separate(monkeypatch, tmp_path, capsys, failure):
+    monkeypatch.setattr(accept.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(accept, "require_idle_device", lambda *a: {"state": "idle"})
+    receipt = {
+        "status": "PASS",
+        "execution_policy": "ascendc_v4",
+        "optimization": "device_route_decode",
+        "performance_measurement_verified": True,
+        "device_route_comparison": "PASS",
+        "v1_comparison": "NOT_RUN",
+        "cases": {
+            "p10-o4": {
+                "metrics": {key: {"median": value} for key, value in [("ttft_s", 1), ("tpot_s", 0.2), ("e2e_s", 1.6)]},
+                "baseline_metrics": {"tpot_s": {"median": 0.4}},
+                "tpot_ratio_vs_same_engine_batched": 0.5,
+                "device_route_comparison": {"accepted": True},
+            }
+        },
+        "samples": [
+            dict(case="p10-o4", kind="measured", optimization=mode, expert_payload_h2d_bytes=0)
+            for mode in ("batched", "device_route_decode")
+            for _ in range(5)
+        ],
+    }
+    if failure == "global":
+        receipt["device_route_comparison"] = "NOT_RUN"
+    elif failure == "exact":
+        receipt["cases"]["p10-o4"]["device_route_comparison"]["accepted"] = False
+    elif failure in ("baseline", "candidate"):
+        receipt["samples"].pop(0 if failure == "baseline" else -1)
+    elif failure == "transfer":
+        receipt["samples"][0]["expert_payload_h2d_bytes"] = 64
+
+    def supervise(command, log, env, seconds):
+        if log.stem == "v4":
+            directory = log.parent / "v4"
+            directory.mkdir()
+            (directory / "summary.json").write_text(json.dumps(receipt), encoding="utf-8")
+        return {"exit": 0, "timeout": False, "log": str(log)}
+
+    monkeypatch.setattr(accept, "supervise", supervise)
+    assert accept.run(arguments(tmp_path, "--device-route-decode")) == int(failure is not None)
+    output = capsys.readouterr().out
+    report = json.loads((tmp_path / "report/run.json").read_text(encoding="utf-8"))
+    if failure is None:
+        assert report["performance_measurement_verified"] is True
+        assert '"tpot_median_s": 0.2' in output
+        assert '"same_engine_batched_tpot_median_s": 0.4' in output
+        assert '"tpot_ratio_vs_same_engine_batched": 0.5' in output
+    else:
+        assert report["status"] == "FAIL" and not report["performance_measurement_verified"]
+        assert "V4_RESULT " not in output
+
+
+def test_failed_device_route_preflight_does_not_load_full_model(monkeypatch, tmp_path):
+    monkeypatch.setattr(accept.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(accept, "require_idle_device", lambda *a: {"state": "idle"})
+    calls = []
+
+    def supervise(command, log, env, seconds):
+        calls.append(log.stem)
+        log.write_text("ERROR=synthetic native projection failed\n", encoding="utf-8")
+        return {"exit": int(log.stem == "device_route_preflight"), "timeout": False, "log": str(log)}
+
+    monkeypatch.setattr(accept, "supervise", supervise)
+    assert accept.run(arguments(tmp_path, "--device-route-decode", "--compare-v1")) == 1
+    assert calls == ["environment", "preflight", "device_route_preflight"]
 
 
 def snapshots():

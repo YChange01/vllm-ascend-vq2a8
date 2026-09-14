@@ -4,6 +4,7 @@
 #include "launch.h"
 #define VQ2A8_LAYOUT_FN __aicore__ inline
 #include "layout.h"
+#include "resident_layout.h"
 
 // CANN's 1:1 TSCM compatibility mode can implement UB->L1 through GM.
 // Reject that route instead of silently changing the on-chip contract.
@@ -147,6 +148,55 @@ class ProjectionKernel {
     }
   }
 
+  __aicore__ inline void ProcessResident(GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias,
+                                         GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes, uint32_t n,
+                                         uint32_t k, uint32_t cores) {
+    GlobalTensor<uint64_t> records;
+    GlobalTensor<int64_t> selected;
+    records.SetGlobalBuffer(reinterpret_cast<__gm__ uint64_t*>(bank));
+    selected.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(routeIds));
+    uint32_t core = GetBlockIdx();
+    if ASCEND_IS_AIV {
+      core /= 2;
+    }
+    const uint32_t groups = n / kN;
+    for (uint32_t work = core; work < routes * groups; work += cores) {
+      const uint32_t route = work / groups;
+      const uint32_t group = work % groups;
+      const int64_t expert = selected.GetValue(route);
+      const bool inRange = ValidResidentSlot(expert, experts);
+      // Every AIC and its two AIVs make the same bounds decision before any
+      // indirect read. Invalid jobs skip BOTH sides of all cross-core flags.
+      if ASCEND_IS_AIV {
+        if (GetSubBlockIdx() == 0 && group == 0) {
+          WriteResidentStatus(valid, route, inRange);
+        }
+      }
+      if (!inRange) {
+        if ASCEND_IS_AIV {
+          if (GetSubBlockIdx() == 0) {
+            WriteResidentInvalid(output, route, group, n);
+          }
+        }
+        continue;
+      }
+      const uint32_t base = static_cast<uint32_t>(expert) * kBankWords;
+      Bind(x + uint64_t(route) * k, scale + uint64_t(route) * sizeof(float), bias + uint64_t(route) * sizeof(float),
+           reinterpret_cast<GM_ADDR>(records.GetValue(base + kBankPacked)),
+           reinterpret_cast<GM_ADDR>(records.GetValue(base + kBankBook)),
+           reinterpret_cast<GM_ADDR>(records.GetValue(base + kBankTileIds)), nullptr,
+           output + uint64_t(route) * n * sizeof(bfloat16_t), 1, n, k, records.GetValue(base + kBankTiles));
+      // Reuse the unmodified V1 numerical pipeline with M=1 for each route.
+      // Duplicate IDs intentionally compute duplicate output slots, so slot
+      // weights and the original ordered FP32 sum remain Python-owned.
+      if ASCEND_IS_AIC {
+        Cube();
+      } else {
+        Vector<2>(group);
+      }
+    }
+  }
+
   template <uint32_t Mode>
   __aicore__ inline void Process(uint32_t cores) {
     uint32_t core;
@@ -167,6 +217,25 @@ class ProjectionKernel {
   }
 
  private:
+  __aicore__ inline void WriteResidentStatus(GM_ADDR valid, uint32_t route, bool inRange) {
+    GlobalTensor<int32_t> status;
+    status.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(valid));
+    scaleUb_.Get<int32_t>().SetValue(0, inRange ? 1 : 0);
+    Fence<HardEvent::S_MTE3>();
+    DataCopyExtParams scalarCopy{1, sizeof(int32_t), 0, 0, 0};
+    DataCopyPad(status[route], scaleUb_.Get<int32_t>(), scalarCopy);
+    Fence<HardEvent::MTE3_S>();
+  }
+
+  __aicore__ inline void WriteResidentInvalid(GM_ADDR output, uint32_t route, uint32_t group, uint32_t n) {
+    GlobalTensor<bfloat16_t> result;
+    result.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(output));
+    Duplicate(outUb_.Get<uint16_t>(), kInvalidBf16, kN);
+    Fence<HardEvent::V_MTE3>();
+    DataCopy(result[uint64_t(route) * n + group * kN], outUb_.Get<bfloat16_t>(), kN);
+    Fence<HardEvent::MTE3_S>();
+  }
+
   // Transfer/pad a 16-row ND tile, then reorder WORDS in UB. All source
   // transfers cover real rows only; M=1 does not read a padded GM row.
   __aicore__ inline void LoadNd(GlobalTensor<uint8_t>& src, uint64_t offset, uint32_t rows, LocalTensor<uint8_t> dst,
@@ -405,7 +474,24 @@ extern "C" __global__ __aicore__ void vq2a8_ascendc_grouped_pipeline(GM_ADDR des
   op.ProcessGrouped(descriptors, jobs, groups, cores);
 }
 
+extern "C" __global__ __aicore__ void vq2a8_ascendc_resident(GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale,
+                                                             GM_ADDR bias, GM_ADDR output, GM_ADDR valid,
+                                                             uint32_t experts, uint32_t routes, uint32_t n, uint32_t k,
+                                                             uint32_t cores) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  vq2a8_ascendc::ProjectionKernel<> op;
+  op.InitBuffers();
+  op.ProcessResident(bank, routeIds, x, scale, bias, output, valid, experts, routes, n, k, cores);
+}
+
 namespace vq2a8_ascendc {
+void LaunchResident(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x, void* scale, void* bias,
+                    void* output, void* valid, uint32_t experts, uint32_t routes, uint32_t n, uint32_t k) {
+  vq2a8_ascendc_resident<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds),
+                                                      static_cast<GM_ADDR>(x), static_cast<GM_ADDR>(scale),
+                                                      static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(output),
+                                                      static_cast<GM_ADDR>(valid), experts, routes, n, k, blocks);
+}
 void LaunchGroupedPipeline(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t groups) {
   vq2a8_ascendc_grouped_pipeline<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs, groups, blocks);
 }

@@ -36,6 +36,7 @@ SCOPE = "TP1_B1_EAGER_CONTEXT_LE_128_V1_BATCHED_ARITHMETIC"
 SOURCE_NAMES = (
     "vllm_ascend/quantization/vq2a8_execution.py",
     "vllm_ascend/quantization/vq2a8_execution_v4.py",
+    "vllm_ascend/quantization/vq2a8_v4_device_route.py",
     "vllm_ascend/quantization/vq2a8_optimization.py",
     "vllm_ascend/quantization/vq2a8_activation.py",
     "vllm_ascend/quantization/vq2a8_moe.py",
@@ -54,11 +55,20 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--cache-reserve-gib", type=float, default=8.0)
     parser.add_argument("--cache-budget-gib", type=float, default=0.0)
+    parser.add_argument("--max-model-len", type=int, default=MAX_CONTEXT)
+    parser.add_argument("--kv-cache-mib", type=int, default=1024)
+    parser.add_argument("--memory-fraction", type=float, default=None, help="Independent expert budget fraction")
+    parser.add_argument("--engine-memory-fraction", type=float, default=0.9)
     parser.add_argument("--cases", default="10:4")
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--reference-report", type=Path)
     parser.add_argument("--reference-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--device-route-decode",
+        action="store_true",
+        help="Compare batched baseline and device-route decode in one V4 resident engine (requires rebuilt library)",
+    )
     args = parser.parse_args(argv)
     try:
         args.cases = validate_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
@@ -66,17 +76,82 @@ def parse_args(argv=None):
         parser.error(str(exc))
     if args.physical_npu < 0 or args.warmups < 2 or args.repeats < 5:
         parser.error("Require one nonnegative physical NPU, >=2 warmups and >=5 measured requests.")
+    if not 1 <= args.max_model_len <= MAX_CONTEXT or any(sum(case) > args.max_model_len for case in args.cases):
+        parser.error("Each case must fit --max-model-len, which must be in [1,128].")
+    if args.kv_cache_mib <= 0:
+        parser.error("--kv-cache-mib must be a positive integer.")
+    if any(
+        not math.isfinite(value) or not 0 < value <= 1
+        for value in (args.memory_fraction, args.engine_memory_fraction)
+        if value is not None
+    ):
+        parser.error("Memory fractions must be finite and in (0,1].")
     if (
         not math.isfinite(args.cache_reserve_gib)
-        or args.cache_reserve_gib < 1
+        or args.cache_reserve_gib < max(1.0, args.kv_cache_mib / 1024)
         or not math.isfinite(args.cache_budget_gib)
         or args.cache_budget_gib < 0
     ):
-        parser.error("Require finite reserve >=1 GiB and budget >=0 GiB; no automatic reserve reduction.")
+        parser.error("Require finite reserve >=1 GiB covering KV, and budget >=0 GiB; no automatic reserve reduction.")
     if args.reference_only and args.reference_report:
         parser.error("A reference worker cannot consume another reference report.")
+    if args.reference_only and args.device_route_decode:
+        parser.error("Device-route decode is V4-only; the V1 reference must keep batched execution.")
     args.artifact = args.model / "experts_vq_ascend_v2"
     return args
+
+
+def request_schedule(warmups, repeats, *, device_route_decode=False):
+    """Warm both paths before alternating AB/BA; never rebuild/reload the engine."""
+    modes = ("batched", "device_route_decode") if device_route_decode else ("batched",)
+    for kind, count in (("warmup", warmups), ("measured", repeats)):
+        for index in range(count):
+            order = modes if index % 2 == 0 else tuple(reversed(modes))
+            for optimization in order:
+                yield kind, index, optimization
+
+
+def measured_metrics(samples, case, optimization):
+    measured = [
+        sample
+        for sample in samples
+        if sample["case"] == case and sample["kind"] == "measured" and sample["optimization"] == optimization
+    ]
+    return {
+        key: distribution([sample[key] for sample in measured])
+        for key in ("ttft_s", "tpot_s", "e2e_s", "output_tokens_per_s", "device_span_ms")
+    }
+
+
+def check_device_route_activity(before, after, prompt_tokens, output_tokens):
+    """Verify per-request counter deltas, not stale activity from a warmup."""
+    expected_singletons = output_tokens - 1 + int(prompt_tokens == 1)
+    expected_prefills = int(prompt_tokens > 1)
+    if set(before) != {str(index) for index in range(LAYERS)} or set(after) != set(before):
+        raise ValueError("Missing per-layer device-route activity evidence.")
+    expected = {
+        "singleton_forwards": expected_singletons,
+        "batched_prefill_forwards": expected_prefills,
+        "route_host_reads": expected_prefills,
+        "device_select_calls": 2 * expected_singletons,
+        "singleton_route_host_reads": 0,
+        "singleton_descriptor_h2d_bytes": 0,
+    }
+    for layer, current in after.items():
+        previous = before[layer]
+        if current.get("preset") != "device_route_decode" or previous.get("preset") != "device_route_decode":
+            raise ValueError("Device-route sample executed a different optimization preset.")
+        for key, wanted in expected.items():
+            left, right = previous.get(key), current.get(key)
+            if any(type(value) is not int or value < 0 for value in (left, right)) or right - left != wanted:
+                raise ValueError(f"Layer {layer} device-route counter {key} did not match this request.")
+            if key.startswith("singleton_") and key != "singleton_forwards" and (left or right):
+                raise ValueError(f"Layer {layer} device-route decode recorded a host transfer.")
+    return {
+        "layers": LAYERS,
+        "per_layer_request_delta": expected,
+        "transfer_scope": "runtime_path_counters_not_profiler_measured_DMA",
+    }
 
 
 def require_idle_device(physical_npu, log):
@@ -141,7 +216,7 @@ def validate_sample(sample, tokens, count, *, resident):
                 raise ValueError("V4 measured request loaded, evicted or transferred an expert payload.")
 
 
-def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256):
+def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256, optimization="batched"):
     import torch
     from safetensors.torch import save_file
     from vllm import SamplingParams
@@ -149,7 +224,7 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256):
     from tools.benchmark_vq2a8_offline import configure, snapshot
     from tools.validate_vq2a8_tp1_offline import capture_worker_trace, reset_worker_trace, single_worker_result
 
-    configure(llm, measurement=False, compact=True, optimization="batched")
+    configure(llm, measurement=False, compact=True, optimization=optimization)
     before = snapshot(llm)
     if policy == V4_POLICY:
         check_residency(before)
@@ -164,6 +239,9 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256):
     if policy == V4_POLICY:
         check_residency(after)
         check_no_payload_transfer(before, after)
+    route_activity = None
+    if optimization == "device_route_decode":
+        route_activity = check_device_route_activity(before["optimization"], after["optimization"], len(prompt), count)
     if len(result) != 1 or not result[0].finished or len(result[0].outputs) != 1:
         raise ValueError("Incomplete or multiplexed diagnostic request.")
     tokens = list(result[0].outputs[0].token_ids)
@@ -216,6 +294,8 @@ def diagnostic(llm, prompt, count, target, *, policy, vocab, library_sha256):
                 raise ValueError("Incomplete native gate/up/down execution.")
     save_file({"logits": logits.contiguous()}, str(target))
     record = {"tokens": tokens, "evidence": evidence, "logits_sha256": digest(target), "logits_file": target.name}
+    if route_activity is not None:
+        record["device_route_activity"] = route_activity
     write_json(target.with_suffix(".json"), record)
     return record, logits
 
@@ -249,10 +329,11 @@ def run(args):
     output.mkdir(parents=True, exist_ok=False)
     path = output / "summary.json"
     policy = "ascendc" if args.reference_only else V4_POLICY
+    optimization = "device_route_decode" if args.device_route_decode else "batched"
     report = dict(
         status="RUNNING",
         execution_policy=policy,
-        optimization="batched",
+        optimization=optimization,
         scope=SCOPE,
         performance_measurement_verified=False,
         numerical_scope="repeatability_not_independent_model_accuracy",
@@ -265,6 +346,7 @@ def run(args):
         quality_verified=False,
         full_model_graph_verified=False,
         performance_target_met=None,
+        device_route_comparison="NOT_RUN",
     )
     write_json(path, report)
     try:
@@ -326,8 +408,15 @@ def run(args):
             cache_reserve_gib=args.cache_reserve_gib,
             ascendc_library=library["path"],
             ascendc_sha256=library["sha256"],
+            **({"v4_device_route_decode": True} if args.device_route_decode else {}),
+            **({"cache_memory_fraction": args.memory_fraction} if args.memory_fraction is not None else {}),
         )
-        options.update(max_model_len=MAX_CONTEXT, max_num_batched_tokens=MAX_CONTEXT)
+        options.update(
+            max_model_len=args.max_model_len,
+            max_num_batched_tokens=args.max_model_len,
+            kv_cache_memory_bytes=args.kv_cache_mib * 1024**2,
+            gpu_memory_utilization=args.engine_memory_fraction,
+        )
         report["engine_options"] = options
         write_json(path, report)
         started = time.perf_counter()
@@ -356,6 +445,19 @@ def run(args):
             case, prompt = f"p{length}-o{count}", prompts[length]
             entry = {"status": "RUNNING", "v1_comparison": "NOT_RUN", "prompt": prompt}
             report["cases"][case] = entry
+            baseline_record = baseline_logits = None
+            if args.device_route_decode:
+                baseline_record, baseline_logits = diagnostic(
+                    llm,
+                    prompt,
+                    count,
+                    output / f"{case}-batched.safetensors",
+                    policy=policy,
+                    vocab=config["vocab_size"],
+                    library_sha256=library["sha256"],
+                    optimization="batched",
+                )
+                entry["baseline_diagnostic"] = baseline_record
             record, logits = diagnostic(
                 llm,
                 prompt,
@@ -364,8 +466,17 @@ def run(args):
                 policy=policy,
                 vocab=config["vocab_size"],
                 library_sha256=library["sha256"],
+                optimization=optimization,
             )
             entry["diagnostic"] = record
+            if args.device_route_decode:
+                entry["device_route_comparison"] = numerical_gate(
+                    baseline_record["tokens"], baseline_logits, record["tokens"], logits
+                )
+                if not entry["device_route_comparison"]["accepted"]:
+                    raise ValueError(
+                        "Device-route decode differs from same-engine batched logits/tokens; timing stopped."
+                    )
             repeated, repeat_logits = diagnostic(
                 llm,
                 prompt,
@@ -374,6 +485,7 @@ def run(args):
                 policy=policy,
                 vocab=config["vocab_size"],
                 library_sha256=library["sha256"],
+                optimization=optimization,
             )
             entry["repeat"] = numerical_gate(record["tokens"], logits, repeated["tokens"], repeat_logits)
             if not entry["repeat"]["accepted"]:
@@ -392,48 +504,55 @@ def run(args):
                 if not entry["v1_comparison"]["accepted"]:
                     raise ValueError("V4 differs from measured V1 batched logits/tokens; timing stopped.")
             write_json(path, report)
-            for kind, repeats in (("warmup", args.warmups), ("measured", args.repeats)):
-                for index in range(repeats):
-                    configure(llm, measurement=True, compact=True, optimization="batched")
-                    before = snapshot(llm)
-                    if policy == V4_POLICY:
-                        check_residency(before)
-                    sample = timed_request(llm, prompt, count, f"{policy}-{case}-{kind}-{index}")
-                    sample.update(case=case, kind=kind, repeat=index, execution_policy=policy)
-                    report["samples"].append(sample)
-                    write_json(path, report)
-                    after = snapshot(llm)
-                    if policy == V4_POLICY:
-                        check_residency(after)
-                        check_no_payload_transfer(before, after)
-                    validate_sample(sample, record["tokens"], count, resident=policy == V4_POLICY)
-                    print(
-                        "V4_SAMPLE "
-                        + json.dumps(
-                            {
-                                key: sample[key]
-                                for key in (
-                                    "case",
-                                    "kind",
-                                    "repeat",
-                                    "execution_policy",
-                                    "ttft_s",
-                                    "tpot_s",
-                                    "e2e_s",
-                                    "cache_delta",
-                                    "expert_payload_h2d_bytes",
-                                )
-                            }
-                        ),
-                        flush=True,
+            for kind, index, sample_optimization in request_schedule(
+                args.warmups, args.repeats, device_route_decode=args.device_route_decode
+            ):
+                configure(llm, measurement=True, compact=True, optimization=sample_optimization)
+                before = snapshot(llm)
+                if policy == V4_POLICY:
+                    check_residency(before)
+                sample = timed_request(llm, prompt, count, f"{policy}-{case}-{sample_optimization}-{kind}-{index}")
+                sample.update(
+                    case=case, kind=kind, repeat=index, execution_policy=policy, optimization=sample_optimization
+                )
+                report["samples"].append(sample)
+                write_json(path, report)
+                after = snapshot(llm)
+                if policy == V4_POLICY:
+                    check_residency(after)
+                    check_no_payload_transfer(before, after)
+                validate_sample(sample, record["tokens"], count, resident=policy == V4_POLICY)
+                if sample_optimization == "device_route_decode":
+                    sample["device_route_activity"] = check_device_route_activity(
+                        sample["optimization_before"], sample["optimization_after"], len(prompt), count
                     )
-            measured = [
-                sample for sample in report["samples"] if sample["case"] == case and sample["kind"] == "measured"
-            ]
-            entry["metrics"] = {
-                key: distribution([sample[key] for sample in measured])
-                for key in ("ttft_s", "tpot_s", "e2e_s", "output_tokens_per_s", "device_span_ms")
-            }
+                print(
+                    "V4_SAMPLE "
+                    + json.dumps(
+                        {
+                            key: sample[key]
+                            for key in (
+                                "case",
+                                "kind",
+                                "repeat",
+                                "execution_policy",
+                                "optimization",
+                                "ttft_s",
+                                "tpot_s",
+                                "e2e_s",
+                                "cache_delta",
+                                "expert_payload_h2d_bytes",
+                            )
+                        }
+                    ),
+                    flush=True,
+                )
+            entry["metrics"] = measured_metrics(report["samples"], case, optimization)
+            if args.device_route_decode:
+                entry["baseline_metrics"] = measured_metrics(report["samples"], case, "batched")
+                entry["tpot_ratio_vs_same_engine_batched"] = (
+                    entry["metrics"]["tpot_s"]["median"] / entry["baseline_metrics"]["tpot_s"]["median"]
+                )
             entry["status"] = "PASS"
             write_json(path, report)
         if (
@@ -446,6 +565,7 @@ def run(args):
             status="PASS",
             performance_measurement_verified=True,
             v1_comparison="PASS" if reference is not None else "NOT_RUN",
+            device_route_comparison="PASS" if args.device_route_decode else "NOT_RUN",
         )
         return 0
     except KeyboardInterrupt:

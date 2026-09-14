@@ -215,9 +215,15 @@ def configure_runtime(runtime, preset, *, profile=False):
         runtime._optimization = None
         runtime._row_preparation = runtime._baseline_preparation
         return
-    options = OptimizationOptions.preset(preset)
+    device_route = preset == "device_route_decode"
+    options = OptimizationOptions.preset("batched" if device_route else preset)
     if preset not in runtime._optimization_states:
-        state = FastMoEState(runtime, options, profile=profile)
+        if device_route:
+            from vllm_ascend.quantization.vq2a8_v4_device_route import DeviceRouteDecodeState
+
+            state = DeviceRouteDecodeState(runtime, profile=profile)
+        else:
+            state = FastMoEState(runtime, options, profile=profile)
         if options.preparation == "fwht":
             preparation = BatchedFWHTPreparation(validity=state.retain)
             if options.prepare_graph:

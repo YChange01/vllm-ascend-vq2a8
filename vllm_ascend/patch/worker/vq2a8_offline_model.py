@@ -166,6 +166,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_root_verified = False
         self._v3_serving = options.get("v3_serving", False)
         self._v4_serving = options.get("v4_serving", False)
+        self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._startup_trace_mode = options.get("v3_startup_trace", "off")
 
@@ -251,10 +252,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         layers = self.model.offline_owner.layers.values()
         for layer in layers:
             layer.check_resident_integrity()
+        preset = "device_route_decode" if getattr(self, "_v4_device_route_decode", False) else "batched"
         for layer in layers:
-            configure_runtime(layer, "batched", profile=False)
+            configure_runtime(layer, preset, profile=False)
         self._v4_serving_batched_ready = True
-        print("MODEL_V4_SERVING_READY preset=batched expert_payload_runtime_loading=False", flush=True)
+        print(f"MODEL_V4_SERVING_READY preset={preset} expert_payload_runtime_loading=False", flush=True)
 
     def reset_offline_trace(self):
         if getattr(self.model.offline_owner, "measurement_mode", False):
@@ -301,9 +303,14 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if v3 and optimization not in (None, "batched", "v3"):
             raise ValueError("V3 preserves the fixed resident arithmetic path; other presets require separate gates.")
         v4 = any(getattr(layer, "execution_policy", None) == "ascendc_v4" for layer in owner.layers.values())
-        if v4 and optimization not in (None, "batched"):
-            raise ValueError("V4 preserves V1 arithmetic; only the original or batched preset is supported.")
-        if optimization is not None and not v3:
+        device_route = optimization == "device_route_decode"
+        if device_route and (not v4 or not getattr(self, "_v4_device_route_decode", False)):
+            raise ValueError("device_route_decode requires V4 with v4_device_route_decode explicitly enabled.")
+        if v4 and optimization not in (None, "batched", "device_route_decode"):
+            raise ValueError(
+                "V4 preserves V1 arithmetic; only original/batched or opt-in device_route_decode is supported."
+            )
+        if optimization is not None and not v3 and not device_route:
             OptimizationOptions.preset(optimization)
         if not owner.layers or not all(isinstance(layer, AscendCVQ2TP1MoE) for layer in owner.layers.values()):
             raise ValueError("Performance probe requires the explicit AscendC backend on every layer.")
@@ -467,12 +474,31 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         return result
 
     def compute_logits(self, hidden_states):
+        device_route = getattr(self, "_v4_device_route_decode", False)
+        flags = []
+        if device_route:
+            # One validity decision for the complete forward, not a CPU read
+            # at each MoE layer. Do not expose tokens after invalid hash IDs,
+            # missing resident slots, or failed native bounds checks.
+            flags = [
+                state.valid
+                for layer in self.model.offline_owner.layers.values()
+                if (state := getattr(layer, "_optimization", None)) is not None and state.valid is not None
+            ]
         if getattr(self.model.offline_owner, "measurement_mode", False):
             logits = super().compute_logits(hidden_states)
             if logits is None:
                 raise ValueError("Missing model logits.")
             self._retain_finite_flag(logits)
+            if device_route:
+                # Include final decoder hidden states and LM-head logits as
+                # well as MoE validity, before the sampler can accept tokens.
+                flags.append(self._measurement_valid)
+                if not bool(torch.stack(flags).all()):
+                    raise ValueError("V4 device-route forward failed validity checks; no output tokens are accepted.")
             return logits
+        if flags and not bool(torch.stack(flags).all()):
+            raise ValueError("V4 device-route forward failed validity checks; no output tokens are accepted.")
         print(f"MODEL stage=logits_start rows={hidden_states.shape[0]}", flush=True)
         started = time.perf_counter()
         logits = super().compute_logits(hidden_states)

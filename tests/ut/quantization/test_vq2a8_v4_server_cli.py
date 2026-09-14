@@ -34,6 +34,7 @@ def test_v4_server_defaults_are_single_card_small_eager_and_v1_library():
     assert args.max_model_len == 128 and args.kv_cache_mib == 1024
     assert args.library.parent.name == "vq2a8-ascendc-v023-v1"
     assert args.library.name == "libvq2a8_ascendc.so"
+    assert args.device_route_decode is False
 
 
 def test_v4_server_uses_standard_cli_and_exact_tp1_contract_without_preflights(tmp_path):
@@ -88,6 +89,19 @@ def test_v4_server_uses_standard_cli_and_exact_tp1_contract_without_preflights(t
         "v4_serving": True,
     }
     assert not any("v3" in item or "accept_vq2a8" in item or "preflight" in item for item in command)
+
+
+def test_device_route_is_explicit_v4_only_and_preserves_prefill_and_server_contract(tmp_path):
+    argv, _, _ = assets(tmp_path)
+    baseline = server.build_command(server.parse_args(argv))
+    candidate = server.build_command(server.parse_args([*argv, "--device-route-decode"]))
+    original = json.loads(value(baseline, "--additional-config"))
+    changed = json.loads(value(candidate, "--additional-config"))
+    assert "v4_device_route_decode" not in original["vq2a8_offline"]
+    assert changed["vq2a8_offline"].pop("v4_device_route_decode") is True
+    assert changed == original
+    index = candidate.index("--additional-config") + 1
+    assert candidate[:index] == baseline[:index] and candidate[index + 1 :] == baseline[index + 1 :]
 
 
 @pytest.mark.parametrize(

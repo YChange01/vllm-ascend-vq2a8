@@ -58,6 +58,7 @@ def offline_engine_options(
     v3_decode_graph="none",
     v3_serving=False,
     v4_serving=False,
+    v4_device_route_decode=False,
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
@@ -80,6 +81,8 @@ def offline_engine_options(
         raise ValueError("v3_serving must be boolean and requires execution_policy=ascendc_v3.")
     if type(v4_serving) is not bool or (v4_serving and execution_policy != "ascendc_v4"):
         raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
+    if type(v4_device_route_decode) is not bool or (v4_device_route_decode and execution_policy != "ascendc_v4"):
+        raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
@@ -129,6 +132,7 @@ def offline_engine_options(
                 ),
                 **({"v3_serving": True} if v3_serving else {}),
                 **({"v4_serving": True} if v4_serving else {}),
+                **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
                 "cache_experts": 256 if execution_policy in CACHE_EXECUTION_POLICIES else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
@@ -181,6 +185,7 @@ def validate_offline_config(config) -> dict:
         "v3_decode_graph",
         "v3_serving",
         "v4_serving",
+        "v4_device_route_decode",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -305,6 +310,10 @@ def validate_offline_config(config) -> dict:
         "v4_serving" in options and options.get("execution_policy") != "ascendc_v4"
     ):
         raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
+    if type(options.get("v4_device_route_decode", False)) is not bool or (
+        "v4_device_route_decode" in options and options.get("execution_policy") != "ascendc_v4"
+    ):
+        raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
     trace_mode = options.get("v3_startup_trace", "off")
     if trace_mode not in ("off", "async", "sync"):
         raise ValueError("v3_startup_trace must be off, async or sync.")
@@ -410,6 +419,10 @@ class OfflineMoEOwner:
             if device.type != "npu":
                 raise ValueError("AscendC offline execution requires an NPU, without fallback.")
             self.native_library = load_pinned_library(options["ascendc_library"], options["ascendc_sha256"])
+            if options.get("v4_device_route_decode", False):
+                from vllm_ascend.quantization.vq2a8_v4_device_route import require_device_route_library
+
+                require_device_route_library()
         elif options.get("execution_policy") == "ascendc_v2":
             from vllm_ascend.quantization.vq2a8_ascendc_v2 import load_pinned_library
 
@@ -636,6 +649,26 @@ class OfflineMoEOwner:
                 print(f"MODEL layer={index} stage=v4_resident_load_done", flush=True)
             for layer in self.layers.values():
                 layer.check_resident_integrity()
+            if self.options.get("v4_device_route_decode", False):
+                from vllm_ascend.quantization.vq2a8_v4_device_route import initialize_device_route_banks
+
+                for layer in self.layers.values():
+                    initialize_device_route_banks(layer)
+                print(
+                    "MODEL_V4_DEVICE_ROUTE_READY "
+                    + json.dumps(
+                        {
+                            "layers": len(self.layers),
+                            "metadata_bytes": sum(
+                                layer._device_route_banks["metadata_bytes"] for layer in self.layers.values()
+                            ),
+                            "weight_payload_copied": False,
+                            "singleton_host_route_reads": 0,
+                            "multi_token_prefill": "batched",
+                        }
+                    ),
+                    flush=True,
+                )
         except BaseException:
             # Never execute a partially resident model. Each layer owns the
             # completion fence needed before its allocations can be released.

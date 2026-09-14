@@ -135,6 +135,21 @@ def test_v4_owner_loads_pinned_v1_library_and_only_direct_tp1_artifact(monkeypat
     assert owner.layers == {} and owner.cache_plan is None
 
 
+def test_device_route_missing_native_abi_fails_before_artifact_or_weight_load(monkeypatch, tmp_path):
+    from vllm_ascend.quantization import vq2a8_v4_device_route
+
+    options = engine_options(tmp_path, v4_device_route_decode=True)["additional_config"]["vq2a8_offline"]
+    monkeypatch.setattr(native_v1, "load_pinned_library", lambda *args: {})
+    monkeypatch.setattr(offline, "artifact_format", lambda *args: pytest.fail("weights must not be visited"))
+
+    def missing():
+        raise RuntimeError("Rebuild ResidentBank")
+
+    monkeypatch.setattr(vq2a8_v4_device_route, "require_device_route_library", missing)
+    with pytest.raises(RuntimeError, match="ResidentBank"):
+        offline.OfflineMoEOwner(tmp_path / "model", options, NS(type="npu"))
+
+
 @pytest.mark.parametrize("format_name", [offline.VQ2_TP1_ZN_FORMAT, "vq2a8_tp2_zn", "unknown"])
 def test_v4_owner_rejects_zn_or_unknown_artifact_without_format_fallback(monkeypatch, tmp_path, format_name):
     options = engine_options(tmp_path)["additional_config"]["vq2a8_offline"]
@@ -187,6 +202,7 @@ def test_v4_configure_cache_requires_fresh_runtime_before_any_loading(monkeypatc
 
 def resident_owner(calls):
     owner = offline.OfflineMoEOwner.__new__(offline.OfflineMoEOwner)
+    owner.options = {"execution_policy": "ascendc_v4"}
     owner.artifact = NS(layers={0: object(), 1: object()})
     owner.layers = {
         index: NS(

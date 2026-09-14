@@ -98,6 +98,7 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         self._preload_evictions = 0
         self._preload_elapsed_s = 0.0
         self._resident_cleanup_error = None
+        self._device_route_banks = None
 
     def _require_ready(self):
         if not self._resident_ready or self._resident_failed:
@@ -212,6 +213,11 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         except BaseException as error:
             self._resident_cleanup_error = str(error)
             raise
+        # The optional native banks strongly own the same payload storage.
+        # Release them only after the fence above, never while queued work runs.
+        self._device_route_banks = None
+        self._optimization_states = {}
+        self._optimization = None
         CachedVQ2TP1MoE.clear_cache(self)
         self._resident_fingerprints.clear()
         self._resident_cleanup_error = None

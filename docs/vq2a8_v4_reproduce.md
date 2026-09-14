@@ -3,6 +3,7 @@
 V4 是独立的 `execution_policy=ascendc_v4`。它复用 V1 的 native `.so`、
 `vq2a8_direct_tp1_v1` 权重格式、rowwise activation preparation，以及 batched 路由和归约。
 不调用 V3 kernel/packed-zN/graph，也不修改原 V1 benchmark 矩阵。
+默认行为不变；新增可选 `--device-route-decode` 的构建、预检和对照流程见下文。
 
 完整根权重严格加载成功后，V4 先核对全部专家预算，再预加载全部专家。
 预算不足、加载不完整、运行中缺少专家都报错；不会退回懒加载或自动降低 reserve。
@@ -41,10 +42,12 @@ curl -N http://127.0.0.1:8000/v1/completions -H 'Content-Type: application/json'
 首次请求包括一次性切换和常量准备开销，不用它声称稳定 TPOT。
 HTTP 返回成功并不等同于通过下面的数值验收或性能测试。
 
-### 小显存短文本试跑：物理卡 2，输入 10 / 输出 4 token
+### 小显存短文本试跑：设备选择值 2，输入 10 / 输出 4 token
 
-这是显式收紧配置的试跑方式，不改变上述默认值。先确认物理卡 2 当前仍健康、空闲；
-只使用卡 2，不使用或停止卡 1 的进程。已有 V1 `.so` 不需要重编，拉取 Python 脚本更新即可。
+这是显式收紧配置的试跑方式，不改变上述默认值。`--physical-npu` 是沿用的参数名，
+其值原样传给 `ASCEND_RT_VISIBLE_DEVICES`；容器 runtime 设备编号不一定等于 `npu-smi` 的 NPU ID。
+先用 `npu-smi info -m` 核对映射并确认实际目标卡健康、空闲；不要使用或停止别人的卡和进程。
+下面以已经确认的选择值 `2` 为例。未启用 device-route 时，已有 V1 `.so` 不需要重编。
 
 ```bash
 cd /home/g00872988/vllm-ascend-vq2a8-v023
@@ -96,12 +99,91 @@ PY
 
 此请求只检查服务和 token 数，不测稳定 TPOT；不能据此宣称 0.3 s/token。
 
+## 可选优化：单 token device-route decode
+
+这个开关只影响 V4 的单 token 路径：路由 ID 留在设备上，由 native kernel 选择常驻专家及准备描述符，
+不做原来的逐层 `ids.cpu().tolist()` 或 singleton 描述符上传。多 token prefill 仍走原来的 batched 路径；
+单 token prefill 也可使用 singleton 路径。rowwise RHT/量化舍入、V1 packed 权重、投影和 slot 混合顺序保持不变。
+这不表示整个模型无 CPU 同步或所有 DMA 为零：采样、有效性检查和其余模型工作仍存在。
+
+默认不打开这个开关，旧库仍可运行原 V4。启用它需要含 `ResidentBank` ABI 的新库，
+缺符号会明确失败；不会静默退回 CPU 路由。直接权重 artifact 不变，不需要 repack。
+先停止自己在目标卡上的服务，再在独立构建目录编译；保留旧库用于回退。
+以下使用本机日志中的 `Ascend950DT_9582`；换机器时必须核对当前目标设备的准确 SoC，不能混用另一台机器的值。
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+python -u tools/build_vq2a8_ascendc.py \
+  --soc Ascend950DT_9582 --cann /usr/local/Ascend/cann-9.1.0 \
+  --build-dir build/vq2a8-ascendc-v4-device-route --jobs 4
+python -u tools/validate_vq2a8_v4_device_route.py \
+  --library build/vq2a8-ascendc-v4-device-route/libvq2a8_ascendc.so \
+  --physical-npu 2 --report-dir reports/v4-device-route-preflight
+```
+
+预检目录必须是尚不存在的新目录；重复运行时换一个目录名。它只运行小型合成数据，
+不加载完整模型或专家文件。必须看到 `summary.json` 中 `status=PASS` 和
+`device_execution_verified=true`；这只验证合成 native 路径，不代表全模型数值或速度通过。
+
+先做同一常驻模型内的数值和计时对照（此时不要同时启动 HTTP 服务）：
+
+```bash
+python -u tools/accept_vq2a8_v4.py \
+  --model /home/g00872988/vq2a8 \
+  --library build/vq2a8-ascendc-v4-device-route/libvq2a8_ascendc.so \
+  --physical-npu 2 --device-route-decode --cases 10:4 \
+  --max-model-len 16 --kv-cache-mib 256 \
+  --memory-fraction 1.0 --engine-memory-fraction 0.9 --cache-reserve-gib 3
+```
+
+不加 `--compare-v1`，所以只加载一次 V4 完整模型。先比较同引擎 batched 与 candidate 的 tokens/logits
+bit-exact，再检查 candidate 重复一致性；不一致就停止，不放宽容差。两条路径各预热 2 次后，
+按 AB/BA 交替各实测 5 次，切换模式不重载权重或清空常驻缓存。对照双方均保留相同的常驻 metadata banks。
+启用此开关的同引擎 A/B 双方在每次 model 输出前都执行一次合并有效性 `bool` 检查，其开销包含在各自计时中；
+不是只给 candidate 额外逐层同步。未启用开关的原服务路径不改变。
+`V4_RESULT` 的 `tpot_median_s` 是 candidate，`same_engine_batched_tpot_median_s` 是 baseline；
+`tpot_ratio_vs_same_engine_batched` 小于 1 才表示本轮 candidate 更快，不预设加速比例。
+`--max-model-len`、`--kv-cache-mib` 和两项 memory fraction 同样传给 benchmark worker；
+所有 `--cases` 必须在加载前满足输入加输出不超过上下文上限。旧默认值仍是 128 / 1024 MiB / engine 0.9。
+
+验收退出、目标卡资源释放后，终端 1 启动 candidate 服务：
+
+```bash
+python -u tools/serve_vq2a8_v4.py \
+  --model /home/g00872988/vq2a8 \
+  --library build/vq2a8-ascendc-v4-device-route/libvq2a8_ascendc.so \
+  --physical-npu 2 --device-route-decode \
+  --max-model-len 16 --kv-cache-mib 256 \
+  --memory-fraction 1.0 --engine-memory-fraction 0.9 --reserve-gib 3 --port 8000
+```
+
+服务就绪后，终端 2 用相同 10/4 长度和单并发测速（不要再启动另一份完整模型）：
+
+```bash
+python -m vllm.entrypoints.cli.main bench serve \
+  --backend openai --base-url http://127.0.0.1:8000 --endpoint /v1/completions \
+  --model vq2a8 --tokenizer /home/g00872988/vq2a8 --dataset-name random \
+  --random-input-len 10 --random-output-len 4 --random-range-ratio 1 \
+  --num-prompts 5 --num-warmups 2 --max-concurrency 1 --request-rate inf --ignore-eos
+```
+
+核对输出中的实际输入/输出 token 总数；目标是 5 个计时请求共 50 / 20 token。
+HTTP 的 TTFT/TPOT 包含客户端、服务调度、IPC 和输出处理，不能直接当作离线 engine-step 计时。
+未提供运行时 HTTP 热切换：回退服务时停止自己的进程，去掉 `--device-route-decode`，再按原配置启动。
+
+candidate 每个请求都用前后计数差值确认 43 层实际使用新路径，而不是用预热留下的累计值充当覆盖率。
+对于 10/4，每层本次应有 `singleton_forwards=3`、`batched_prefill_forwards=1`、`device_select_calls=6`，
+以及 singleton 路由 host reads、描述符 H2D 为零。这里是运行路径计数，报告明确
+`runtime_path_counters_not_profiler_measured_DMA`；仍需 profiler 才能声称实际总传输量或 kernel 耗时。
+新路径的 NPU 数值、显存峰值和性能尚需在目标机器上按上述步骤实测；CPU 测试不能替代这些结果。
+
 ## 默认验收：只加载一次 V4
 
 先结束自己在目标卡上的旧服务并确认目标卡空闲，不停止其他人的任务。
 在普通硬件 CANN 环境下运行，不能带 simulator 配置。这里复用已编译的 V1 库，不需要重新 repack。
 已有下列 V1 库及对应构建记录时无需重编；尚未构建时，按 [V1 编译指南](vq2a8_v1_reproduce.md)
-用当前卡的准确 `--soc` 构建到 `build/vq2a8-ascendc-v023-v1`。没有新的 V4 `.so`。
+用当前卡的准确 `--soc` 构建到 `build/vq2a8-ascendc-v023-v1`。默认路径没有单独的 V4 `.so`；
+启用上面的 device-route 才需要重建含新 ABI 的库。
 
 ```bash
 cd /home/g00872988/vllm-ascend-vq2a8-v023
@@ -171,7 +253,7 @@ python -u tools/accept_vq2a8_v4.py \
 每个 V4 请求必须保持 `cache_delta.loads=0`、`cache_delta.evictions=0`、
 `expert_payload_h2d_bytes=0`，并通过所有层常驻完整性校验。
 这些是“专家 payload 无请求期搬运”，不是所有 DMA/H2D 为零：路由索引上传、
-`ids.cpu().tolist()` 和其他模型工作仍存在。
+`ids.cpu().tolist()` 和其他模型工作在默认 batched 路径仍存在；device-route 的 singleton 差异见上节。
 
 计时复用 V1 的真实 engine step 与边界同步。NPU event interval 包含 host 提交空隙，
 phase timer 是 host submission/wait 时间，均不是纯 kernel 耗时。
@@ -194,3 +276,13 @@ HTTP 入口补充验证：新增 58 项 CPU 测试，最终相关回归 493 项�
 短文本 CLI 补充：参数测试 49 项通过；全量 CPU 回归为 2907 passed、257 skipped、2 failed，
 仍为上述两个原有 FP8/FMA 用例。Ruff 通过，完整 hooks 仍因缺少 pre-commit 未能完成。
 16 token / 256 MiB 配置仅完成静态与 CPU 检查，未在物理卡 2 实测显存峰值或启动成功。
+
+Device-route 补充：V4/router/optimization 定向 CPU 回归为 575 passed、1 skipped；
+全量为 3016 passed、258 skipped、2 failed（仍为上述既有 FP8 midpoint / CPU FMA 用例），另有 4 个 subtests 通过。
+新增原生边界测试因缺少主机 C++ 编译器而跳过；Python Ruff 检查、格式检查及新增 C++ 文件 clang-format 通过。
+完整 `format.sh ci` 仍因本地没有 pre-commit 未能执行。尚未完成 CANN 编译、NPU 精确数值或性能实测；
+不将源码检查和 CPU oracle 通过解释成设备通过，也不据此声称 TPOT 已下降。
+
+device-route 入口补充：V4 服务 CLI、验收编排、AB/BA 调度、计数差值和回执校验共 162 项 CPU 测试通过，
+对应 Python 文件 Ruff 检查与格式化通过。包含默认关闭、预算透传、上下文超限、缺少对照证据和短预检失败即停止等用例；
+该结果不包含 native 编译、目标 NPU 数值或加速验证。

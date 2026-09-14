@@ -93,6 +93,7 @@ def route_vq2a8(
     hash_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     validity=None,
+    device_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return unscaled FP32 weights and int64 expert IDs.
 
@@ -100,6 +101,8 @@ def route_vq2a8(
     select the lowest ID first, matching the pinned dsv4_topk kernel. The
     single routed-scale owner is mix_vq2a8_routes, not this function.
     """
+    if type(device_only) is not bool or (device_only and validity is None):
+        raise ValueError("Device-only routing requires a deferred validity consumer.")
     if (
         logits.ndim != 2
         or not logits.is_floating_point()
@@ -124,10 +127,25 @@ def route_vq2a8(
             or input_ids.dtype not in (torch.int32, torch.int64)
         ):
             raise ValueError("Hash routing requires integer input_ids with one ID per token.")
-        if bool(((input_ids < 0) | (input_ids >= hash_table.shape[0])).any()):
-            raise ValueError("Hash input token ID is out of range.")
-        ids = hash_table[input_ids.to(hash_table.device, dtype=torch.int64)].to(logits.device, dtype=torch.int64)
-        if bool(((ids < 0) | (ids >= logits.shape[1])).any()):
+        if hash_table.shape[0] == 0:
+            raise ValueError("Hash table must contain at least one token.")
+        invalid_tokens = (input_ids < 0) | (input_ids >= hash_table.shape[0])
+        if device_only:
+            if input_ids.device != logits.device or hash_table.device != logits.device:
+                raise ValueError("Device-only hash routing requires token IDs and table on the logits device.")
+            validity(~invalid_tokens.any())
+            # Safe gather even for malformed tokens; the model-boundary validity
+            # check must reject the request, rather than silently accept clipping.
+            token_indices = input_ids.clamp(0, hash_table.shape[0] - 1)
+        else:
+            if bool(invalid_tokens.any()):
+                raise ValueError("Hash input token ID is out of range.")
+            token_indices = input_ids
+        ids = hash_table[token_indices.to(hash_table.device, dtype=torch.int64)].to(logits.device, dtype=torch.int64)
+        invalid_experts = (ids < 0) | (ids >= logits.shape[1])
+        if device_only:
+            validity(~invalid_experts.any())
+        elif bool(invalid_experts.any()):
             raise ValueError("Hash expert ID is out of range.")
     else:
         choice = scores.clone()
@@ -145,7 +163,7 @@ def route_vq2a8(
             selected.append(index)
             choice.scatter_(1, index, -float("inf"))
         ids = torch.cat(selected, dim=1)
-    weights = scores.gather(1, ids)
+    weights = scores.gather(1, ids.clamp(0, logits.shape[1] - 1) if device_only else ids)
     if renormalize:
         denominator = weights.sum(dim=1, keepdim=True)
         if validity is None:

@@ -51,6 +51,11 @@ def parse_args(argv=None):
     parser.add_argument("--engine-memory-fraction", type=float, default=0.9)
     parser.add_argument("--reserve-gib", type=float, default=8.0)
     parser.add_argument(
+        "--device-route-decode",
+        action="store_true",
+        help="Opt in to V4 single-token device routing; requires the rebuilt native library (prefill stays batched)",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Print the command without importing or running vLLM/NPU"
     )
     args = parser.parse_args(argv)
@@ -102,6 +107,8 @@ def build_command(args):
             "v4_serving": True,
         },
     }
+    if args.device_route_decode:
+        additional["vq2a8_offline"]["v4_device_route_decode"] = True
     overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
     return [
         sys.executable,
@@ -196,7 +203,8 @@ def main(argv=None):
         else:
             print(
                 f"Starting vllm serve at http://{args.host}:{args.port} "
-                f"(V4 TP1, physical NPU {args.physical_npu}, V1 batched arithmetic, full residency). "
+                f"(V4 TP1, device selector {args.physical_npu}, "
+                f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, full residency). "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
             )
