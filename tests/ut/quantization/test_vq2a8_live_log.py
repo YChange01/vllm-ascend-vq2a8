@@ -60,7 +60,11 @@ def test_partial_utf8_and_large_output_are_drained_without_changing_disk(tmp_pat
     assert console.getvalue() == payload + "\n"
 
 
-def test_silent_child_heartbeat_has_last_stage_and_is_not_saved_as_child_output(tmp_path):
+@pytest.mark.parametrize(
+    "stage_line",
+    ["MODEL layer=3 stage=decoder_start", 'STARTUP_PROBE {"case":"hc_pre_m128","event":"BEGIN"}'],
+)
+def test_silent_child_heartbeat_has_last_stage_and_is_not_saved_as_child_output(tmp_path, stage_line):
     class Console(io.StringIO):
         def __init__(self):
             super().__init__()
@@ -74,11 +78,11 @@ def test_silent_child_heartbeat_has_last_stage_and_is_not_saved_as_child_output(
 
     path, console = tmp_path / "child.log", Console()
     with path.open("w") as log, LiveChildLog(path, "full_model", console=console, heartbeat=0.02, poll=0.005):
-        log.write("MODEL layer=3 stage=decoder_start\n")
+        log.write(stage_line + "\n")
         log.flush()
         assert console.waiting.wait(10)
     assert "PROBE_WAIT=full_model" in console.getvalue()
-    assert "last_stage=MODEL layer=3 stage=decoder_start" in console.getvalue()
+    assert "last_stage=" + stage_line in console.getvalue()
     assert "PROBE_WAIT=" not in path.read_text()
 
 

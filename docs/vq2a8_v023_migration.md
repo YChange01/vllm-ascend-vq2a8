@@ -26,6 +26,9 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 迁移代码、CPU 测试或环境检查均不等于新的 NPU 执行、模型质量、通信或性能 PASS。
 本说明不宣称已在 0.23 环境完成原生编译、全模型推理或取得 TPOT 结果。
 
+TP1 权重加载后卡住时，先用[无模型权重启动诊断](vq2a8_tp1_startup_diagnose.md)
+逐项测试 HC、激活准备和 V3 投影，不必再次加载全部专家。
+
 ## 配套环境
 
 以下是官方 Ascend 0.23 与 vLLM 0.23 依赖的交集，不沿用 0.26 的 Transformers/FastAPI 约束。
