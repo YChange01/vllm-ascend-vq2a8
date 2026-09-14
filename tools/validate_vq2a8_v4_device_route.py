@@ -38,6 +38,12 @@ OUTPUT_COLUMNS = 64
 REDUCTIONS = (512, 1024)
 PAYLOAD_FIELDS = ("packed_indices", "codebooks", "codebook_tile_ids", "weight_scale", "weight_bias", "rht_sign")
 VALID_ROUTES = ((0,), (3, 1), (0, 1, 2, 3, 1, 0), (3, 3, 3, 3, 3, 3), (2, 0, 3, 1, 2, 0))
+QUEUE_CAPACITY_REFERENCE = 4096
+QUEUE_CALLS_PER_ITERATION = 3  # select, project, ordinary matmul; excludes clones/checks.
+QUEUE_MIN_ITERATIONS = QUEUE_CAPACITY_REFERENCE // QUEUE_CALLS_PER_ITERATION + 1
+QUEUE_DEFAULT_ITERATIONS = 2049
+QUEUE_MAX_ITERATIONS = 8192
+QUEUE_PROGRESS_INTERVAL = 256
 
 
 def parse_args(argv=None):
@@ -47,6 +53,17 @@ def parse_args(argv=None):
     parser.add_argument("--timeout-s", type=int, default=180)
     parser.add_argument("--allow-busy", action="store_true", help="allow a known busy NPU; may affect other jobs")
     parser.add_argument("--launch-blocking", choices=("0", "1"), default="0")
+    parser.add_argument(
+        "--queue-lifetime",
+        action="store_true",
+        help="also stress asynchronous handler/input lifetime across task-queue slot reuse; no model loading",
+    )
+    parser.add_argument(
+        "--queue-iterations",
+        type=int,
+        default=QUEUE_DEFAULT_ITERATIONS,
+        help=f"queue-lifetime iterations ({QUEUE_MIN_ITERATIONS}..{QUEUE_MAX_ITERATIONS}; default %(default)s)",
+    )
     parser.add_argument("--report-dir", type=Path, help="new report directory; never overwrite an old result")
     parser.add_argument("--plan-only", action="store_true", help="print commands; do not import torch or use an NPU")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
@@ -55,11 +72,17 @@ def parse_args(argv=None):
         parser.error("Require --physical-npu >= 0 and --timeout-s > 0")
     if args.child and args.plan_only:
         parser.error("--child and --plan-only cannot be combined")
+    if not QUEUE_MIN_ITERATIONS <= args.queue_iterations <= QUEUE_MAX_ITERATIONS:
+        parser.error(f"--queue-iterations must be {QUEUE_MIN_ITERATIONS}..{QUEUE_MAX_ITERATIONS}")
+    if args.queue_lifetime and args.launch_blocking != "0":
+        parser.error("--queue-lifetime requires --launch-blocking 0")
+    if not args.queue_lifetime and args.queue_iterations != QUEUE_DEFAULT_ITERATIONS:
+        parser.error("--queue-iterations requires --queue-lifetime")
     return args
 
 
 def child_command(args):
-    return [
+    command = [
         sys.executable,
         "-u",
         str(Path(__file__).resolve()),
@@ -73,6 +96,25 @@ def child_command(args):
         "--launch-blocking",
         args.launch_blocking,
     ]
+    if args.queue_lifetime:
+        command.extend(["--queue-lifetime", "--queue-iterations", str(args.queue_iterations)])
+    return command
+
+
+def queue_lifetime_plan(args):
+    return {
+        "enabled": args.queue_lifetime,
+        "iterations": args.queue_iterations if args.queue_lifetime else 0,
+        "minimum_operator_calls": args.queue_iterations * QUEUE_CALLS_PER_ITERATION if args.queue_lifetime else 0,
+        "queue_capacity_reference": QUEUE_CAPACITY_REFERENCE,
+        "runtime_queue_enabled_or_slots_measured": False,
+        "requires_runtime_task_queue_enabled": True,
+        "explicit_per_iteration_synchronize": False,
+        "native_stream_check_may_drain_host_queue": True,
+        "retained_output_samples": 2,
+        "model_weights_loaded": False,
+        "performance_verified": False,
+    }
 
 
 def library_identity(path):
@@ -309,6 +351,113 @@ def run_native_contract_checks(device, *, bank_factory, projection, synchronize,
     return {"malformed_metadata_rejected": True, "other_stream_rejected": True, "owner_stream_reuse_exact": True}
 
 
+def _queue_lifetime_iteration(bank, template):
+    """Drop Python input references before the next ordinary operator is queued."""
+    import torch
+
+    ids = template["ids"].clone()
+    selected = bank.select(ids)
+    prepared = tuple(value.clone() for value in template["prepared"])
+    output, project_valid = bank.project(*prepared, ids)
+    # The native handler/allocator, not this Python loop, must keep these alive.
+    del prepared, ids
+    product = torch.matmul(template["left"].clone(), template["right"].clone())
+    valid = (project_valid == 1).all() & (selected[3] == 1).all()
+    valid = valid & torch.isfinite(output.float()).all()
+    valid = valid & (output.view(torch.uint8) == template["expected"].view(torch.uint8)).all()
+    valid = valid & (product == template["matmul_expected"]).all()
+    for actual, expected in zip(selected[:3], template["metadata"]):
+        valid = valid & (actual == expected).all()
+    return output, valid
+
+
+def run_queue_lifetime_checks(
+    device, *, bank_factory, projection, synchronize, iterations=QUEUE_DEFAULT_ITERATIONS, stage=None, progress=None
+):
+    """Bounded lifetime regression; CPU injection tests orchestration, not an NPU.
+
+    Only setup/end stages explicitly synchronize. ResidentBank's stream check
+    can drain the host task queue; this is NOT a claim of zero host waiting.
+    Counts are operator-call lower bounds, not measured queue-slot indices.
+    """
+    import torch
+
+    from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
+
+    if type(iterations) is not int or not QUEUE_MIN_ITERATIONS <= iterations <= QUEUE_MAX_ITERATIONS:
+        raise ValueError(f"Queue lifetime iterations must be {QUEUE_MIN_ITERATIONS}..{QUEUE_MAX_ITERATIONS}")
+    stage = stage or stage_recorder(CASE, synchronize)
+    progress = progress or (
+        lambda completed: emit(CASE, "QUEUE_PROGRESS", stage="queue_lifetime_wrap", iterations=completed)
+    )
+    with stage("queue_lifetime_setup"):
+        reduction = REDUCTIONS[0]
+        payloads = [
+            {name: value.to(device) for name, value in payload.items()} for payload in synthetic_experts(reduction)
+        ]
+        bank = bank_factory(*([payload[name] for payload in payloads] for name in PAYLOAD_FIELDS))
+        preparation = RowwiseVQ2A8Preparation(compact=True, validity=lambda _: None)
+        spec = SimpleNamespace(columns=reduction, rht_true_columns=reduction, rht_block_size=128)
+        templates = []
+        for expert, payload in enumerate(payloads):
+            with torch.device("cpu"):
+                hidden = ((torch.arange(reduction) * (expert + 3) % 31 - 15) / 16).bfloat16().reshape(1, -1)
+                left = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+                right = torch.eye(16, dtype=torch.float32)
+            prepared = tuple(value.contiguous() for value in preparation.many([(hidden.to(device), payload, spec)])[0])
+            templates.append(
+                {
+                    "ids": torch.tensor([expert], dtype=torch.int64, device=device),
+                    "prepared": prepared,
+                    "expected": projection(*prepared, *(payload[name] for name in PAYLOAD_FIELDS[:3])),
+                    "metadata": tuple(payload[name].unsqueeze(0) for name in PAYLOAD_FIELDS[3:]),
+                    "left": left.to(device),
+                    "right": right.to(device),
+                    "matmul_expected": left.to(device),
+                }
+            )
+        valid = torch.ones((), dtype=torch.bool, device=device)
+        preserved = []
+    with stage("queue_lifetime_wrap"):
+        for iteration in range(iterations):
+            template = templates[iteration % len(templates)]
+            output, current_valid = _queue_lifetime_iteration(bank, template)
+            valid = valid & current_valid
+            if iteration in (0, iterations - 1):
+                preserved.append((output, template["expected"]))
+            del output, current_valid
+            if (iteration + 1) % QUEUE_PROGRESS_INTERVAL == 0 or iteration + 1 == iterations:
+                progress(iteration + 1)  # Host counters only; no Tensor formatting/reads.
+    # All device checks were submitted in the loop; read one scalar after its
+    # end fence. Preserve only first/last outputs, never every input/handler.
+    if not bool(valid.cpu()):
+        raise AssertionError("Queue lifetime metadata/projection/matmul validity or bitwise projection check failed")
+    for output, expected in preserved:
+        exact_tensor(output, expected, "queue_lifetime_preserved_output")
+    return {
+        "scope": "synthetic_async_handler_lifetime_only",
+        "iterations": iterations,
+        "minimum_operator_calls": iterations * QUEUE_CALLS_PER_ITERATION,
+        "queue_capacity_reference": QUEUE_CAPACITY_REFERENCE,
+        "runtime_queue_enabled_or_slots_measured": False,
+        "requires_runtime_task_queue_enabled": True,
+        "k": reduction,
+        "n": OUTPUT_COLUMNS,
+        "experts": EXPERTS,
+        "routes": 1,
+        "explicit_synchronization_stages": ["queue_lifetime_setup", "queue_lifetime_wrap"],
+        "explicit_per_iteration_synchronize": False,
+        "native_stream_check_may_drain_host_queue": True,
+        "temporary_inputs_dropped_before_matmul": True,
+        "retained_output_samples": len(preserved),
+        "all_iteration_checks_passed": True,
+        "preserved_outputs_bitwise_exact": True,
+        "model_weights_loaded": False,
+        "full_model_verified": False,
+        "performance_verified": False,
+    }
+
+
 def run_case_child(args):
     if os.environ.get("ASCEND_RT_VISIBLE_DEVICES") != str(args.physical_npu):
         raise ValueError("Child device mapping differs from the selected physical NPU")
@@ -344,6 +493,19 @@ def run_case_child(args):
             native_contracts = run_native_contract_checks(
                 device, bank_factory=bank_factory, projection=vq2a8_ascendc, synchronize=sync, stage=stage
             )
+            queue_lifetime = {"enabled": False}
+            if args.queue_lifetime:
+                queue_lifetime = {
+                    "enabled": True,
+                    **run_queue_lifetime_checks(
+                        device,
+                        bank_factory=bank_factory,
+                        projection=vq2a8_ascendc,
+                        synchronize=sync,
+                        iterations=args.queue_iterations,
+                        stage=stage,
+                    ),
+                }
         with stage("final_sync"):
             pass
         emit(
@@ -352,6 +514,7 @@ def run_case_child(args):
             scope=SCOPE,
             checks=checks,
             native_contracts=native_contracts,
+            queue_lifetime=queue_lifetime,
             library=identity,
             device_execution_verified=True,
             model_weights_loaded=False,
@@ -378,6 +541,7 @@ def main(argv=None):
         "physical_npu": args.physical_npu,
         "command": child_command(args),
         "synthetic_geometry": {"experts": EXPERTS, "n": OUTPUT_COLUMNS, "k": list(REDUCTIONS), "max_routes": 6},
+        "queue_lifetime": queue_lifetime_plan(args),
         "model_weights_loaded": False,
         "full_model_verified": False,
         "graph_verified": False,

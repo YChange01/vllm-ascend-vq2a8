@@ -290,7 +290,7 @@ def test_resident_native_abi_owns_all_weights_and_has_no_per_call_host_staging()
     for name in ("Select", "Project"):
         body = cpp_function(source, f"Tensors {name}(")
         assert "const auto state = state_;" in body and "CheckIds(ids);" in body
-        assert "SetCustomHandler([state," in body
+        assert "[state," in body
         for forbidden in ("host.to(", "at::kCPU", ".cpu()", ".item", "synchronize(", "aclrtSynchronize"):
             assert forbidden not in body
     checker = cpp_function(source, "void CheckIds(")
@@ -299,6 +299,27 @@ def test_resident_native_abi_owns_all_weights_and_has_no_per_call_host_staging()
     cmake = (REPO / "csrc/vq2a8_ascendc/CMakeLists.txt").read_text()
     assert "STATIC kernel.cpp resident_select.cpp" in cmake
     assert "SHARED torch_binding.cpp resident_binding.cpp" in cmake
+
+
+@pytest.mark.parametrize(
+    ("method", "op_name", "captures"),
+    [
+        ("Select", "Vq2a8AscendCResidentSelect", "state, ids, scale, bias, sign, valid, routes, blocks"),
+        ("Project", "Vq2a8AscendCResidentProjection", "state, x, scale, bias, ids, output, valid, routes, blocks"),
+    ],
+)
+def test_resident_callback_uses_opapi_release_queue_without_dropping_tensor_owners(method, op_name, captures):
+    # Source contract only. The NPU queue-lifetime probe exercises slot reuse;
+    # a short, synchronized numeric test cannot reproduce this deadlock.
+    source = (REPO / "csrc/vq2a8_ascendc/resident_binding.cpp").read_text()
+    body = cpp_function(source, f"Tensors {method}(")
+    normalized = " ".join(body.split())
+    assert body.count("at_npu::native::OpCommand::RunOpApi(") == 1
+    assert f'"{op_name}", [{captures}]() -> int' in normalized
+    assert "}, false);" in normalized
+    assert "SetCustomHandler" not in body and "command.Run(" not in body
+    assert "RecordResidentInputs(" in body
+    assert "return 0;" in body
 
 
 def test_resident_stream_ownership_records_all_payloads_only_at_construction():

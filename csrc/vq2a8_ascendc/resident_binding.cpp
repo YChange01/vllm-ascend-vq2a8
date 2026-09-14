@@ -133,6 +133,12 @@ class ResidentBank : public torch::CustomClassHolder {
     state_ = std::move(state);
   }
 
+  // Use EXECUTE_OPAPI for Tensor-owning callbacks. The legacy
+  // SetCustomHandler/Run path can retain its handler in a queue slot until
+  // that slot is reused under the enqueue mutex. Destroying captured Tensors
+  // there may record an allocator event and recursively enqueue, deadlocking.
+  // RunOpApi transfers the handler to the release queue instead. Keep both
+  // strong owners and recordStream: submission is still asynchronous.
   Tensors Select(const at::Tensor& ids) {
     const auto state = state_;
     const c10_npu::OptionalNPUGuard guard(state->table.device());
@@ -145,16 +151,16 @@ class ResidentBank : public torch::CustomClassHolder {
     auto valid = at::empty({routes}, options.dtype(at::kInt));
     const uint32_t blocks = std::min(state->aiv_cores, static_cast<uint32_t>(routes) * state->k / kSelectColumns);
     RecordResidentInputs({ids}, c10_npu::getCurrentNPUStream());
-    at_npu::native::OpCommand command;
-    command.Name("Vq2a8AscendCResidentSelect");
-    command.SetCustomHandler([state, ids, scale, bias, sign, valid, routes, blocks]() -> int {
-      // Capture the complete bank, not just its table; every indirect GM
-      // pointer remains owned during asynchronous launch submission.
-      LaunchResidentSelect(state->stream, blocks, state->table.data_ptr(), ids.data_ptr(), scale.data_ptr(),
-                           bias.data_ptr(), sign.data_ptr(), valid.data_ptr(), state->experts, routes, state->k);
-      return 0;
-    });
-    command.Run();
+    at_npu::native::OpCommand::RunOpApi(
+        "Vq2a8AscendCResidentSelect",
+        [state, ids, scale, bias, sign, valid, routes, blocks]() -> int {
+          // Capture the complete bank, not just its table; every indirect GM
+          // pointer remains owned during asynchronous launch submission.
+          LaunchResidentSelect(state->stream, blocks, state->table.data_ptr(), ids.data_ptr(), scale.data_ptr(),
+                               bias.data_ptr(), sign.data_ptr(), valid.data_ptr(), state->experts, routes, state->k);
+          return 0;
+        },
+        false);
     return {scale, bias, sign, valid};
   }
 
@@ -172,14 +178,15 @@ class ResidentBank : public torch::CustomClassHolder {
     auto valid = at::empty({routes}, x.options().dtype(at::kInt));
     const uint32_t blocks = std::min(state->aic_cores, static_cast<uint32_t>(routes) * state->n / kN);
     RecordResidentInputs({x, scale, bias, ids}, c10_npu::getCurrentNPUStream());
-    at_npu::native::OpCommand command;
-    command.Name("Vq2a8AscendCResidentProjection");
-    command.SetCustomHandler([state, x, scale, bias, ids, output, valid, routes, blocks]() -> int {
-      LaunchResident(state->stream, blocks, state->table.data_ptr(), ids.data_ptr(), x.data_ptr(), scale.data_ptr(),
-                     bias.data_ptr(), output.data_ptr(), valid.data_ptr(), state->experts, routes, state->n, state->k);
-      return 0;
-    });
-    command.Run();
+    at_npu::native::OpCommand::RunOpApi(
+        "Vq2a8AscendCResidentProjection",
+        [state, x, scale, bias, ids, output, valid, routes, blocks]() -> int {
+          LaunchResident(state->stream, blocks, state->table.data_ptr(), ids.data_ptr(), x.data_ptr(), scale.data_ptr(),
+                         bias.data_ptr(), output.data_ptr(), valid.data_ptr(), state->experts, routes, state->n,
+                         state->k);
+          return 0;
+        },
+        false);
     return {output, valid};
   }
 

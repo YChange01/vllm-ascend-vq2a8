@@ -125,6 +125,44 @@ python -u tools/validate_vq2a8_v4_device_route.py \
 不加载完整模型或专家文件。必须看到 `summary.json` 中 `status=PASS` 和
 `device_execution_verified=true`；这只验证合成 native 路径，不代表全模型数值或速度通过。
 
+### 修复 device-route 回调释放时的队列锁重入
+
+若 native 栈出现 `ResidentBank::Project` 回调析构 → Tensor 释放 → `NPUEvent::record` →
+重复入队 → `pthread_mutex_lock`，应更新并重编本次修复的专用库。
+`ResidentBank::Select/Project` 改用 `OpCommand::RunOpApi(..., false)`，避免旧
+`SetCustomHandler/Run` 路径在队列槽复用的临界区析构 Tensor-owning handler。
+保留全部 Tensor/state 捕获、`recordStream`、同流限制及 V1 算术；不新增逐层同步，不切换图模式。
+回调转移行为可参照 [torch-npu OPAPI 释放实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/framework/OpParamMaker.cpp#L806)。
+这是针对现场链的修复，不代表已在所有 torch-npu dev wheel 上验证。
+
+先保留现场日志，停止自己原来的服务，确认目标卡空闲；不要停止其他任务或重置整卡。
+同步本次源码后在独立目录重编，只构建专用 `.so`，无需重新安装 vllm-ascend、编译全部 OPP 或 repack 权重。
+以下使用本次确认的卡 1；旧 V4 基线库保持不动。
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+python -u tools/build_vq2a8_ascendc.py \
+  --soc Ascend950DT_9582 --cann /usr/local/Ascend/cann-9.1.0 \
+  --build-dir build/vq2a8-ascendc-v4-device-route-fix --jobs 4
+python -u tools/validate_vq2a8_v4_device_route.py \
+  --library build/vq2a8-ascendc-v4-device-route-fix/libvq2a8_ascendc.so \
+  --physical-npu 1 --queue-lifetime --timeout-s 300
+```
+
+`--queue-lifetime` 是可选的小型合成回归，不读模型或专家文件；保留原短预检，并追加连续提交、
+临时 Tensor 丢引用、队列槽复用压力测试。保持 task queue 默认启用及 `--launch-blocking 0`；
+不要用关闭队列或同步启动的方式掩盖问题。循环不显式逐轮同步，仅在测试边界检查结果；
+原生同流检查仍可能等待 host 队列，因此这不是“无 CPU 等待”或性能测试，也不声称直接测得队列索引。
+默认自动创建新的 `/tmp/vq2-v4-device-route-*` 报告目录。超时/失败都不代表通过，不要继续压测。
+
+回归通过并释放设备后，用全新进程启动原服务命令，只将 `--library` 换成上述 `-fix` 目录的库，
+保留 `--device-route-decode`。已加载旧库的进程不能通过重编或再次 `load_library` 热修复。
+先确认一次 1/4 及 10/4 请求能够返回，再按原参数测 TTFT/TPOT；本修复不承诺固定加速比。
+
+### 同引擎对照与服务测速
+
+以下命令沿用原构建目录；若验证上述修复，将各处 `--library` 统一换为 `-fix` 目录的新库。
+
 先做同一常驻模型内的数值和计时对照（此时不要同时启动 HTTP 服务）：
 
 ```bash
@@ -286,3 +324,9 @@ Device-route 补充：V4/router/optimization 定向 CPU 回归为 575 passed、1
 device-route 入口补充：V4 服务 CLI、验收编排、AB/BA 调度、计数差值和回执校验共 162 项 CPU 测试通过，
 对应 Python 文件 Ruff 检查与格式化通过。包含默认关闭、预算透传、上下文超限、缺少对照证据和短预检失败即停止等用例；
 该结果不包含 native 编译、目标 NPU 数值或加速验证。
+
+回调释放锁重入修复：新增 2 项 native 源码契约回归（修复前失败、修复后通过）和 20 项小测试编排用例。
+V4/activation/optimization 定向 CPU 回归为 667 passed、1 skipped；最终全量为
+3038 passed、258 skipped、2 failed，另有 4 个 subtests 通过。两项失败仍为上述既有 FP8 midpoint / CPU FMA 用例。
+Ruff、clang-format 和 `git diff --check` 通过；`format.sh ci` 仍受本地缺少 pre-commit 限制。
+本地没有 CANN/NPU，尚未编译新 `.so` 或运行实机异步回归，不能据 CPU 测试宣称服务死锁已在设备上消除。
