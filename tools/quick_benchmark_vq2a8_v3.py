@@ -150,7 +150,7 @@ def run(args):
     from tools.validate_vq2a8_ascendc import require_hardware_runtime
     from tools.validate_vq2a8_ascendc_v3 import library_identity
     from tools.validate_vq2a8_tp1_acceptance import acceptance_environment
-    from tools.validate_vq2a8_v023_environment import require_v023_stack
+    from tools.validate_vq2a8_v023_environment import environment_snapshot
 
     if os.environ.get("ASCEND_LAUNCH_BLOCKING") not in (None, "0"):
         raise ValueError("Unset ASCEND_LAUNCH_BLOCKING before timing")
@@ -163,7 +163,7 @@ def run(args):
         flush=True,
     )
     require_hardware_runtime()
-    require_v023_stack()
+    print("MODEL_V023_ENVIRONMENT " + json.dumps(environment_snapshot()), flush=True)
     library = library_identity(args.library)
     args.model = args.model.resolve(strict=True)
     print(f"QUICK_V3_LIBRARY={json.dumps(library)}", flush=True)

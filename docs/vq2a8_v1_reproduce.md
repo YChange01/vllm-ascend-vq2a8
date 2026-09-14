@@ -54,7 +54,7 @@ python -u tools/accept_vq2a8_optimizations.py \
 构建使用 `ASCEND_HOME_PATH`，未设置时默认 `/usr/local/Ascend/cann-9.1.0`。
 主插件的 HC/attention 算子必须已完成安装；此命令只编译独立 V1 专家库，不能替代主插件编译。
 
-这个入口会依次检查环境、编译 V1、运行小算子预检，再加载一次全模型进行 baseline/batched
+这个入口会依次检查实际运行时导入/API、编译 V1、运行小算子预检，再加载一次全模型进行 baseline/batched
 数值比较和交替计时。使用预算内懒加载专家缓存，默认预留 16 GiB，不做 V3 全专家常驻；
 不启用 V3 startup trace、fused preparation、MoE graph 或其他候选。
 预检失败即停止，不加载全模型，也不引用旧机器 PASS 来跳过本次验证。
@@ -74,15 +74,13 @@ python -u tools/build_vq2a8_ascendc.py \
 
 ## 编译完成后仍停在 environment
 
-环境检查先于 `.so` 预检；重新编译算子不能修复 Python 版本/依赖检查失败。
-旧检查会误拒绝本分支自动生成的 `vllm-ascend 0.23.1.devN+gHASH` 版本号。
-更新后会核对 editable 安装路径、实际导入路径、迁移祖先及官方 0.23 框架文件指纹，
-通过后才接受该开发版本；具体边界见[环境说明](vq2a8_v023_migration.md)。
+按用户要求，已移除自动流程中的精确包版本、editable/Git 来源和全局 `pip check` 一致性门槛。
+不再因 torch-npu 开发后缀、Ascend SCM 版本或镜像中 `affinity-sched` / `ms-service-profiler`
+的全局依赖报告阻断复测；不需要补装这些包或添加跳过参数。
+版本只记录，不比较，报告标记 `consistency_checked=false` 和 `pip_check_run=false`。
 
-对当前镜像的 `torch-npu 2.10.0.post4.dev20260715`，现已按用户要求允许继续测试。
-元数据检查、子进程检查和 `pip check` 采用同一规则；原始版本及 pip 退出码不改写。
-终端的 `OPTIMIZATION_WARNING` 表示记录了已允许差异，**不是 NPU 测试已通过**。
-其他开发日期、缺包、其他依赖冲突和真实运行错误仍会阻断，不需要添加跳过检查的参数。
+`environment` 阶段现在仅检查实际导入/API，后续设备、算子库/SoC、权重和数值检查保留。
+真实运行需要的依赖若缺失，仍会在导入或执行时明确报错；这与全局一致性检查不同。
 
 已经完成本机编译和 editable 安装时，更新脚本并复用现有 V1 库即可，不需要为本次工具修复重编译：
 
@@ -92,10 +90,10 @@ git pull --ff-only origin vllm-ascend-vq2a8-v023
 python -u tools/accept_vq2a8_optimizations.py --model /home/g00872988/vq2a8 --library build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so --physical-npu 1 --presets batched --cases 10:4 --warmups 2 --repeats 5
 ```
 
-如果仍失败，`OPTIMIZATION_ERROR` 会直接显示有限长度、常见凭据脱敏后的环境错误和失败的
-`pip check` 的未接受阻塞项，不再只给日志路径；`run.json` 也记录 `failure_causes`。
-无法识别的日志仍给出完整日志路径，不盲目回显原始日志。未接受的依赖冲突、真实导入失败和预检错误仍会停止，
-不会跳过环境检查直接加载模型。环境通过不等于 NPU 推理或 TPOT 通过。
+如果仍失败，`OPTIMIZATION_ERROR` 会显示有限长度、常见凭据脱敏后的实际环境错误；
+`run.json` 也记录 `failure_causes`。无法识别的日志仍给出完整日志路径，不盲目回显原始日志。
+真实导入失败和预检错误仍会停止。环境通过不等于 NPU 推理或 TPOT 通过。
+严格一致性诊断只保留为手动工具，见[环境说明](vq2a8_v023_migration.md)，不再被自动复测调用。
 
 ## 0.3 秒的来源与结果
 
@@ -128,3 +126,10 @@ V1 复现文档首次加入时：`--plan-only` 和相关 317 项 CPU 回归通�
 覆盖同一规则下的元数据、子进程、逐行 pip 冲突分类、release 环境入口，以及成功警告和失败摘要。
 六个改动/新增 Python 文件的 Ruff check/format、原复测命令的 `--plan-only` 和 `git diff --check` 通过；
 `bash format.sh ci` 已尝试，因缺少 `pre-commit` 未完成。未改官方依赖安装 pins，未在 NPU 上执行或测量 TPOT。
+
+移除自动一致性门槛验证（2026-09-14）：原 CPU 套件复跑为 2602 passed、257 skipped、2 failed、
+4 subtests passed，失败仍是上述 FP8/FMA 用例。随后加入的 24 项默认 runtime-only 用例与相关回归共
+603 项通过，覆盖默认不执行 pip/版本/源码审计，以及真实导入、设备、库和 SoC 失败仍会阻断。
+12 个改动/新增 Python 文件 Ruff check/format 通过；`--metadata-only` 实际只记录，默认 CLI 在本机
+实际报告缺少 `torch_npu`，不再报告版本不匹配。原复测命令 `--plan-only`、`git diff --check` 通过。
+`bash format.sh ci` 仍因缺少 `pre-commit` 未完成；没有重编译或 NPU 实测。

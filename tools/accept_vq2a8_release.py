@@ -295,12 +295,12 @@ def worker(args):
     elif args.worker == "binary":
         collect_binary_evidence(library_evidence(args.library), args.output_dir)
     else:
-        from tools.validate_vq2a8_v023_environment import check_python_environment
+        from tools.validate_vq2a8_v023_environment import check_runtime_environment
 
-        environment = check_python_environment()
+        environment = check_runtime_environment()
         print("VQ2A8_V023_ENVIRONMENT " + json.dumps(environment), flush=True)
         if environment["errors"]:
-            raise RuntimeError("VQ2A8 0.23 environment mismatch: " + " ".join(environment["errors"]))
+            raise RuntimeError("VQ2A8 runtime environment check failed: " + " ".join(environment["errors"]))
         environment["runtime"] = environment["runtime_imports"]
         require_hardware_runtime()
         import torch

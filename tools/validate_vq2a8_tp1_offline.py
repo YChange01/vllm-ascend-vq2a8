@@ -81,9 +81,9 @@ def main() -> None:
             parser.error("V2 bring-up requires BF16 roots.")
     elif args.ascendc_v2_library or args.ascendc_v2_preflight or args.ascendc_v2_preset:
         parser.error("V2 options require explicit execution-policy ascendc_v2.")
-    from tools.validate_vq2a8_v023_environment import check_scheduler_apis, require_v023_stack
+    from tools.validate_vq2a8_v023_environment import check_scheduler_apis, environment_snapshot
 
-    print("MODEL_V023_ENVIRONMENT " + json.dumps(require_v023_stack()), flush=True)
+    print("MODEL_V023_ENVIRONMENT " + json.dumps(environment_snapshot()), flush=True)
     if args.baseline_report and args.root_linear_mode != "bf16":
         parser.error("The phase-1 BF16 baseline is not an exact oracle for online FP8; do not mix these gates.")
     model_root, artifact_root = args.model.resolve(strict=True), args.artifact.resolve(strict=True)

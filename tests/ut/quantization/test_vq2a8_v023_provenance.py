@@ -305,7 +305,7 @@ def test_exact_v023_release_build_does_not_require_editable_metadata(checkout, m
 @pytest.mark.parametrize("outcome", ["pass", "pip-fail", "runtime-fail"])
 def test_verified_scm_does_not_skip_pip_or_runtime_api_gates(checkout, monkeypatch, capsys, outcome):
     _use_checkout_report(monkeypatch, checkout)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency"])
     calls = []
 
     def run(command, **kwargs):
@@ -337,7 +337,7 @@ def test_verified_scm_does_not_skip_pip_or_runtime_api_gates(checkout, monkeypat
 
 def test_metadata_only_checks_provenance_without_pip_or_runtime_imports(checkout, monkeypatch, capsys):
     _use_checkout_report(monkeypatch, checkout)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--metadata-only"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency", "--metadata-only"])
 
     def unexpected_runtime():
         pytest.fail("metadata-only must not import torch_npu or the real vLLM runtime")

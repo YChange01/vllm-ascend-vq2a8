@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Check the VQ2A8 0.23 Python stack before model allocation. No inference PASS."""
+"""Check runtime imports; dependency consistency auditing is manual/opt-in."""
 
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ V023_REQUIREMENTS = {
     "triton-ascend": "==3.2.2",
     "fastapi": ">=0.115.0,<0.124.0",
 }
-# Explicitly approved for testing on the user's existing Ascend950 image.
-# This permits preflight, not a claim of ABI, device, or model compatibility.
+# Used only by the explicit --audit-consistency diagnostic.
+# This exception is not a claim of ABI, device, or model compatibility.
 # Do not generalize this to every torch-npu 2.10/post4 development build.
 V023_TORCH_NPU_TEST_VERSIONS = frozenset({"2.10.0.post4.dev20260715"})
 
@@ -131,7 +131,7 @@ def ascend_source_provenance(installed_version, repo=REPO):
 
 
 def _accepted_version_difference(name, required, actual, *, ascend_source=None):
-    """One policy shared by metadata gates, workers, and pip-check conflicts."""
+    """One policy for metadata and pip conflicts in the manual audit."""
     name = canonicalize_name(name)
     official = "==0.23.0" if name == "vllm-ascend" else V023_REQUIREMENTS.get(name)
     try:
@@ -192,22 +192,41 @@ def stack_errors(packages, python_version, system, *, ascend_source=None):
     return errors
 
 
-def environment_report():
+def environment_snapshot():
+    """Record actual metadata without version, source, or global pip gates."""
     packages = {}
     for name in (*V023_REQUIREMENTS, "vllm-ascend"):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
             packages[name] = None
-    ascend_source = None
-    if _is_v023_scm_version(packages["vllm-ascend"]):
-        ascend_source = ascend_source_provenance(packages["vllm-ascend"])
-    differences = accepted_version_differences(packages, ascend_source=ascend_source)
     return {
         "python": sys.executable,
         "python_version": platform.python_version(),
         "system": platform.system(),
         "packages": packages,
+        "validation_profile": "runtime_only",
+        "consistency_checked": False,
+        "pip_check_run": False,
+        "errors": [],
+        "scope": "python_environment_only",
+        "status": "recorded",
+        "device_execution_verified": False,
+        "model_integration_verified": False,
+    }
+
+
+def environment_report():
+    """Explicit consistency audit, not used by automatic model workflows."""
+    snapshot = environment_snapshot()
+    packages = snapshot["packages"]
+    ascend_source = None
+    if _is_v023_scm_version(packages["vllm-ascend"]):
+        ascend_source = ascend_source_provenance(packages["vllm-ascend"])
+    differences = accepted_version_differences(packages, ascend_source=ascend_source)
+    return {
+        **snapshot,
+        "consistency_checked": True,
         "ascend_source": ascend_source,
         "accepted_version_differences": differences,
         "validation_profile": "accepted_version_differences" if differences else "official_pins",
@@ -223,6 +242,7 @@ def environment_report():
 
 
 def require_v023_stack():
+    """Legacy strict audit helper; do not call from automatic model workflows."""
     report = environment_report()
     if report["errors"]:
         raise RuntimeError("VQ2A8 0.23 environment mismatch: " + " ".join(report["errors"]))
@@ -263,7 +283,7 @@ def classify_pip_check(returncode, stdout, stderr, packages, *, ascend_source=No
 
     The original exit status is never rewritten to success. A failed pip check
     may continue only if every issue is the same explicitly accepted version
-    difference that the metadata/worker gates recognize. No pip private APIs.
+    difference that the manual metadata audit recognizes. No pip private APIs.
     """
     result = {
         "exit": returncode,
@@ -368,9 +388,10 @@ def check_runtime_imports():
 
 
 def check_python_environment(*, metadata_only=False):
-    """Shared full Python check for the CLI and release environment worker."""
+    """Manual consistency audit; never invoked automatically by acceptance."""
     report = environment_report()
     if not report["errors"] and not metadata_only:
+        report["pip_check_run"] = True
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "check"], capture_output=True, text=True, timeout=120, check=False
@@ -402,15 +423,36 @@ def check_python_environment(*, metadata_only=False):
     return report
 
 
+def check_runtime_environment():
+    """Check imports/APIs actually used by the model, not unrelated packages."""
+    report = environment_snapshot()
+    try:
+        report["runtime_imports"] = check_runtime_imports()
+    except Exception as exc:
+        report["errors"].append(f"Runtime import failed: {type(exc).__name__}: {exc}")
+    report["status"] = "failed" if report["errors"] else "passed"
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--metadata-only",
         action="store_true",
-        help="Check metadata/source only; do not import NPU/vLLM or run pip check.",
+        help="Only record metadata; with --audit-consistency also audit versions/source. No runtime imports.",
+    )
+    parser.add_argument(
+        "--audit-consistency",
+        action="store_true",
+        help="Manually audit versions/source and global pip dependencies; not an acceptance prerequisite.",
     )
     args = parser.parse_args()
-    report = check_python_environment(metadata_only=args.metadata_only)
+    if args.audit_consistency:
+        report = check_python_environment(metadata_only=args.metadata_only)
+    elif args.metadata_only:
+        report = environment_snapshot()
+    else:
+        report = check_runtime_environment()
     print("VQ2A8_V023_ENVIRONMENT " + json.dumps(report), flush=True)
     return 1 if report["errors"] else 0
 

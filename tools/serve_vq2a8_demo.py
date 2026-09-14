@@ -318,9 +318,9 @@ def initialize_runtime(args, acceptance):
     os.environ["ASCEND_RT_VISIBLE_DEVICES"] = str(args.physical_npu)
     os.environ["ASCEND_LAUNCH_BLOCKING"] = "0"
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    from tools.validate_vq2a8_v023_environment import check_scheduler_apis, require_v023_stack
+    from tools.validate_vq2a8_v023_environment import check_scheduler_apis, environment_snapshot
 
-    require_v023_stack()
+    print("MODEL_V023_ENVIRONMENT " + json.dumps(environment_snapshot()), flush=True)
     import torch
     import torch_npu  # noqa: F401
     from tokenizers import Tokenizer

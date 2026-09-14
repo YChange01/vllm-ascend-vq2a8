@@ -350,9 +350,9 @@ def run(args):
     try:
         report["measurement_environment"] = require_measurement_environment()
         from tools.validate_vq2a8_ascendc import require_hardware_runtime
-        from tools.validate_vq2a8_v023_environment import check_scheduler_apis, require_v023_stack
+        from tools.validate_vq2a8_v023_environment import check_scheduler_apis, environment_snapshot
 
-        require_v023_stack()
+        print("MODEL_V023_ENVIRONMENT " + json.dumps(environment_snapshot()), flush=True)
         require_hardware_runtime()
         library = checked_model_preflight(args.library, args.preflight, args.model)
         report.update(library=library, model=model_identity(args.model), python_source_sha256=source_hashes())

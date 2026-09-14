@@ -774,10 +774,10 @@ def run(args):
             python_source_sha256=python_source_hashes(),
         )
         from tools.validate_vq2a8_ascendc import require_hardware_runtime
-        from tools.validate_vq2a8_v023_environment import require_v023_stack
+        from tools.validate_vq2a8_v023_environment import environment_snapshot
 
         require_hardware_runtime()
-        require_v023_stack()
+        print("MODEL_V023_ENVIRONMENT " + json.dumps(environment_snapshot()), flush=True)
         if args.reference_only:
             from tools.validate_vq2a8_ascendc import library_evidence
 

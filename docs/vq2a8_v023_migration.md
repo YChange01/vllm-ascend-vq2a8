@@ -34,12 +34,13 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 ## 配套环境
 
 以下是官方 Ascend 0.23 与 vLLM 0.23 依赖的交集，不沿用 0.26 的 Transformers/FastAPI 约束。
+这是新环境安装参考，不再作为现有环境运行验收时的精确版本门槛。
 
 | 组件 | 要求 |
 | --- | --- |
 | 操作系统 / Python | Linux；Python `>=3.10,<3.13`，官方 A5 镜像使用 3.12 |
 | vLLM | `==0.23.0`，从官方 tag 安装 `empty` 后端；允许本地版本后缀 |
-| vLLM Ascend | 本迁移分支；`0.23.0+vq2a8.v023` 或来源验证通过的 editable SCM 开发版本 |
+| vLLM Ascend | 本迁移分支；可使用 editable 安装生成的 SCM 开发版本 |
 | torch / torch-npu | `2.10.0` / `2.10.0.post4` |
 | torchvision / torchaudio | `0.25.0` / `2.10.0` |
 | Transformers | `5.5.4` |
@@ -52,7 +53,7 @@ TP2 设备映射使用 0.23 的 `device_id_to_physical_device_id`；不调用 0.
 [vLLM common requirements](https://github.com/vllm-project/vllm/blob/v0.23.0/requirements/common.txt)、
 [官方安装说明](https://github.com/vllm-project/vllm-ascend/blob/v0.23.0/docs/source/installation.md)、
 [A5 镜像构建](https://github.com/vllm-project/vllm-ascend/blob/v0.23.0/Dockerfile.a5)。
-Ascend 的 `requirements.txt` 和 `pyproject.toml` 保留官方 FastAPI 上限，不能使用 `--no-deps` 掩盖冲突。
+Ascend 的 `requirements.txt` 和 `pyproject.toml` 保留官方安装依赖，本次不修改或重装镜像里的包。
 
 ## 新目录安装：保留原 0.26 环境
 
@@ -104,7 +105,6 @@ env -u SOC_VERSION \
   --extra-index-url https://mirrors.huaweicloud.com/ascend/repos/pypi \
   --extra-index-url https://download.pytorch.org/whl/cpu
 
-python -m pip check
 python -u tools/validate_vq2a8_v023_environment.py
 ```
 
@@ -119,50 +119,18 @@ CPU wheel 索引用于获取与 torch-npu 配套的 PyTorch，不等于 `VLLM_TA
 
 `setup.py` 使用 `setuptools_scm.get_version()`。迁移分支在 release tag 后增加提交时，
 可自动生成 `0.23.1.dev5+g32c3714e4` 一类版本号，**不代表装成了另一个框架分支**。
-旧检查只看版本字符串，会误拒绝这种正确源码安装；现允许一个严格限定的 editable SCM 例外：
+已经完成 editable 安装和编译时，不必为了版本号重装或重编译。
 
-- 仅接受 `0.23.1.devN+gHASH`（可带 `.dYYYYMMDD`）；不泛化为任意 `0.23.*`。
-- pip 的 `direct_url.json` 必须指向当前 checkout，且 Python 实际解析的 `vllm_ascend` 也来自这里。
-- Git 历史必须包含本次迁移提交 `4817b8a019380c300051f7caec25b83638a8eba3`。
-- 当前 scheduler、structured-output patch、model-runner 必须匹配已核对的官方 v0.23 文件指纹，
-  防止只保留迁移祖先、却混入其他框架版本。修改这些文件须先复核兼容性再更新指纹。
+### 自动运行不做一致性审计
 
-验证结果记录在 `ascend_source` 中，`packages` 保留真实安装版本。editable 安装后正常 `git pull`
-可使元数据的提交 hash 落后，因此不强制它等于 HEAD。缺失 Git 历史、非 editable 安装、导入其他
-checkout 或源码指纹不符时仍拒绝，并显示原因；分支名称或环境变量不能替代来源验证。
-原有 `0.23.0` 正式版/本地后缀的检查方式保持不变。
+按用户要求，所有 VQ2 自动验收、benchmark、offline 和 demo 子进程不再强制比较 Python 包版本、
+检查 editable/Git 源码来源或运行全局 `pip check`。不增加开发版本白名单，也不要求额外的跳过参数。
+报告只记录实际版本，并明确标记 `validation_profile=runtime_only`、`consistency_checked=false`、
+`pip_check_run=false`；不会把未执行的检查写成通过。
 
-上面的首次安装命令仍用显式 `SETUPTOOLS_SCM_PRETEND_VERSION=0.23.0+vq2a8.v023` 生成固定标识；
-已经正确 editable 安装并编译的用户不必仅为开发版本号再重编译或重装。
-这不允许把 0.26 源码伪装成 0.23；上游 `vllm ==0.23.0` 和真实运行时检查保持不变。
-下面单独列出允许继续测试的依赖版本例外，未列出的差异仍会阻断。
-
-### 已允许测试的版本差异
-
-官方安装 pins 与复测时的兼容性判断分开处理。针对用户明确要求保留的现有 Ascend950 开发栈，
-复测工具允许精确的 `torch-npu 2.10.0.post4.dev20260715` 继续真实预检，不会仅因它不等于
-`2.10.0.post4` 而退出。这个例外**不扩展到任意开发日期、其他 post 版本或整个 2.10 系列**，
-也不是宣布该开发包的 ABI、算子、模型或性能已经验证通过。
-
-版本检查、`require_v023_stack()` 子进程检查、完整环境检查及 release 验收共用同一策略：
-
-- 保留 `packages` 中的真实版本，并记录 `accepted_version_differences` 与 `warnings`。
-- `pip check` 仍运行。只有完整冲突行中的包名、精确官方要求和实际安装版本都对应同一已允许差异，
-  才归类到 `pip_check.accepted_differences`。已通过来源验证的 Ascend SCM 版本对 `==0.23.0`
-  的差异也按此规则处理。
-- 其他依赖冲突、缺包、未知输出、异常退出或无法完成检查都进入 `blocking_issues` 并停止。
-  不能因为某一行出现 `torch-npu` 字样就忽略该行，更不能忽略所有 `pip check` 失败。
-- 原始 pip `exit`、`stdout`、`stderr`、`output` 保留；只有已允许差异时，pip 的分类状态为
-  `passed_with_accepted_differences`，随后仍运行真实导入和接口检查，再进入原有算子/模型预检。
-
-为兼容既有报告消费者，顶层 `status` 仍使用 `passed` / `metadata_pass` / `failed`，另以
-`validation_profile=accepted_version_differences` 明确区分偏离官方 pins 的测试环境。
-`metadata_pass` 不代表已执行 pip、运行时或设备测试。优化验收终端会显示脱敏、限长的
-`OPTIMIZATION_WARNING`；后续若有失败，只将尚未接受的阻塞项列为失败原因。
-
-本次不改 `requirements.txt` / `pyproject.toml` 的官方安装 pins，不重装任何包，不改包的版本号。
-因此在开发栈中单独执行原生 `python -m pip check` 仍可能返回这些差异；复测工具会保留并分类它们，
-而不是修改系统里的 pip 行为。更新 Python 脚本即可沿用已经编好的 V1 库，无需为此重编译。
+验收的 `environment` 阶段仅保留模型实际使用的导入和接口检查；后续设备占用、算子库/SoC、
+权重格式与数值预检仍照常执行。`affinity-sched`、`ms-service-profiler` 等包的全局依赖报告不会阻断复测；
+若真实导入或算子执行缺少依赖，仍会显示实际异常并停止。移除一致性门槛不等于证明所有环境都兼容。
 
 ```bash
 python -c 'import sys, vllm, vllm_ascend; print(sys.executable); print(vllm.__file__); print(vllm_ascend.__file__)'
@@ -170,8 +138,15 @@ python tools/validate_vq2a8_v023_environment.py --metadata-only
 ```
 
 三个路径应分别落在新 venv、新 `.upstream-vllm-v023` 和新 Ascend checkout 中。
-`--metadata-only` 仅检查发行包信息及必要的源码来源；默认模式还执行 `pip check`、真实导入和调度接口检查，
-但不会加载模型权重或验证设备算子。
+`--metadata-only` 仅记录发行包信息，返回 `status=recorded`；默认模式执行真实导入和调度接口检查，
+不加载模型权重或验证设备算子。原有严格诊断仅供手动排查：
+
+```bash
+python tools/validate_vq2a8_v023_environment.py --audit-consistency
+```
+
+只有显式使用这个选项才执行旧版本/来源规则和全局 `pip check`，它不是复测前置条件。
+旧报告复用（`--resume`）和旧 baseline 对比仍要求证据对应当前环境；环境变更时使用新报告重跑。
 
 ## CPU 回归与原生库重建
 

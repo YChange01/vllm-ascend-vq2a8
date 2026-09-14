@@ -292,7 +292,7 @@ def _printed_report(capsys):
 @pytest.mark.parametrize("runtime_failure", [False, True])
 def test_accepted_pip_difference_still_runs_real_api_gate(monkeypatch, capsys, runtime_failure):
     _mock_metadata(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency"])
     calls = []
 
     def pip_check(command, **kwargs):
@@ -328,7 +328,7 @@ def test_accepted_pip_difference_still_runs_real_api_gate(monkeypatch, capsys, r
 
 def test_mixed_pip_failure_skips_runtime_even_when_torch_variant_approved(monkeypatch, capsys):
     _mock_metadata(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency"])
     monkeypatch.setattr(
         environment.subprocess,
         "run",
@@ -345,7 +345,7 @@ def test_mixed_pip_failure_skips_runtime_even_when_torch_variant_approved(monkey
 @pytest.mark.parametrize("failure", [OSError("pip unavailable"), subprocess.TimeoutExpired("pip check", 120)])
 def test_process_failure_does_not_become_accepted_variant(monkeypatch, capsys, failure):
     _mock_metadata(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency"])
 
     def failed(*args, **kwargs):
         raise failure
@@ -361,7 +361,7 @@ def test_process_failure_does_not_become_accepted_variant(monkeypatch, capsys, f
 
 def test_metadata_only_reports_exception_without_pip_or_runtime(monkeypatch, capsys):
     _mock_metadata(monkeypatch)
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--metadata-only"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency", "--metadata-only"])
     monkeypatch.setattr(environment.subprocess, "run", lambda *args, **kwargs: pytest.fail("Unexpected subprocess"))
     monkeypatch.setattr(environment, "check_runtime_imports", lambda: pytest.fail("Unexpected NPU runtime import"))
     assert environment.main() == 0
@@ -374,7 +374,7 @@ def test_metadata_only_reports_exception_without_pip_or_runtime(monkeypatch, cap
     assert "runtime_imports" not in report
 
 
-@pytest.mark.parametrize("issue", ["metadata mismatch", "unapproved pip conflict", "runtime API mismatch"])
+@pytest.mark.parametrize("issue", ["runtime import failed", "missing engine entry point", "runtime API mismatch"])
 def test_release_environment_uses_shared_failure_gate_before_any_device_work(monkeypatch, tmp_path, capsys, issue):
     from tools import accept_vq2a8_release as release
     from tools import validate_vq2a8_ascendc as native
@@ -383,8 +383,9 @@ def test_release_environment_uses_shared_failure_gate_before_any_device_work(mon
         "status": "failed",
         "errors": [issue],
         "packages": _packages(),
-        "warnings": ["explicitly accepted torch-npu development variant"],
-        "accepted_version_differences": [{"package": "torch-npu", "actual": TORCH_NPU_DEV}],
+        "validation_profile": "runtime_only",
+        "consistency_checked": False,
+        "pip_check_run": False,
     }
     calls = []
 
@@ -392,7 +393,7 @@ def test_release_environment_uses_shared_failure_gate_before_any_device_work(mon
         calls.append("shared-python-check")
         return copy.deepcopy(report)
 
-    monkeypatch.setattr(environment, "check_python_environment", shared_gate)
+    monkeypatch.setattr(environment, "check_runtime_environment", shared_gate)
     monkeypatch.setattr(native, "require_hardware_runtime", lambda: pytest.fail("Device guard must not run"))
     monkeypatch.setattr(release, "library_evidence", lambda *args: pytest.fail("Library must not be examined"))
     monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("No second pip invocation"))
@@ -404,7 +405,7 @@ def test_release_environment_uses_shared_failure_gate_before_any_device_work(mon
     assert not args.output_dir.exists()
 
 
-def test_release_accepted_difference_continues_hardware_checks_and_preserves_runtime_summary(
+def test_release_runtime_only_check_continues_hardware_checks_and_preserves_runtime_summary(
     monkeypatch, tmp_path, capsys
 ):
     from tools import accept_vq2a8_release as release
@@ -416,10 +417,9 @@ def test_release_accepted_difference_continues_hardware_checks_and_preserves_run
         "status": "passed",
         "errors": [],
         "packages": _packages(),
-        "warnings": ["explicitly accepted torch-npu development variant"],
-        "validation_profile": "accepted_version_differences",
-        "accepted_version_differences": [{"package": "torch-npu", "actual": TORCH_NPU_DEV}],
-        "pip_check": {"exit": 1, "status": "passed_with_accepted_differences", "blocking_issues": []},
+        "validation_profile": "runtime_only",
+        "consistency_checked": False,
+        "pip_check_run": False,
         "runtime_imports": runtime,
     }
 
@@ -464,7 +464,7 @@ def test_release_accepted_difference_continues_hardware_checks_and_preserves_run
             get_device_properties=lambda index: "unit-test-properties",
         ),
     )
-    monkeypatch.setattr(environment, "check_python_environment", shared_gate)
+    monkeypatch.setattr(environment, "check_runtime_environment", shared_gate)
     monkeypatch.setattr(native, "require_hardware_runtime", hardware)
     monkeypatch.setattr(release, "library_evidence", library_evidence)
     monkeypatch.setattr(release.subprocess, "run", lambda *args, **kwargs: pytest.fail("No second pip invocation"))
@@ -477,10 +477,11 @@ def test_release_accepted_difference_continues_hardware_checks_and_preserves_run
     saved = json.loads((args.output_dir / "summary.json").read_text(encoding="utf-8"))
     assert saved["status"] == "PASS"
     assert saved["runtime"] == saved["runtime_imports"] == runtime
-    assert saved["pip_check"]["exit"] == 1
+    assert saved["pip_check_run"] is False
+    assert saved["consistency_checked"] is False
+    assert "pip_check" not in saved
     assert saved["packages"]["torch-npu"] == TORCH_NPU_DEV
-    assert saved["accepted_version_differences"] == report["accepted_version_differences"]
-    assert saved["warnings"] == report["warnings"]
+    assert saved["validation_profile"] == "runtime_only"
     assert saved["library_sha256"] == "unit-test-only"
 
 
@@ -490,7 +491,8 @@ def test_release_worker_has_no_separate_bare_pip_or_runtime_import_gate():
     source = inspect.getsource(release.worker)
     tree = ast.parse(source)
     calls = [ast.unparse(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)]
-    assert calls.count("check_python_environment") == 1
+    assert calls.count("check_runtime_environment") == 1
+    assert "check_python_environment" not in calls
     assert "subprocess.run" not in calls
     assert "check_runtime_imports" not in calls
     assert "require_v023_stack" not in calls

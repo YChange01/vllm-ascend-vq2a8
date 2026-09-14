@@ -79,7 +79,7 @@ def test_unsupported_npu_host_is_not_certified(python, system):
 
 @pytest.mark.parametrize("failure", [OSError("pip unavailable"), subprocess.TimeoutExpired("pip check", 120)])
 def test_pip_check_errors_preserve_report_and_skip_runtime_imports(monkeypatch, capsys, failure):
-    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py"])
+    monkeypatch.setattr(sys, "argv", ["validate_vq2a8_v023_environment.py", "--audit-consistency"])
     monkeypatch.setattr(environment, "environment_report", lambda: {"errors": []})
 
     def failed_check(*args, **kwargs):
