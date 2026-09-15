@@ -64,9 +64,17 @@ def parse_args(argv=None):
         default="none",
         help="Opt-in single-token MoE NPUGraph; requires --device-route-decode; Attention/prefill stay eager",
     )
+    parser.add_argument(
+        "--graph-replay-stream",
+        choices=("owner", "caller"),
+        default="owner",
+        help="MoE graph replay stream: owner preserves the baseline; caller removes per-layer event bridges",
+    )
     args = parser.parse_args(argv)
     if args.decode_graph == "moe" and not args.device_route_decode:
         parser.error("--decode-graph moe requires --device-route-decode.")
+    if args.graph_replay_stream == "caller" and args.decode_graph != "moe":
+        parser.error("--graph-replay-stream caller requires --decode-graph moe.")
     if args.physical_npu < 0 or not 1 <= args.port <= 65535:
         parser.error("Require a nonnegative physical NPU and port in [1,65535].")
     if not args.host or any(character.isspace() for character in args.host):
@@ -119,6 +127,7 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_device_route_decode"] = True
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
+        additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
     overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
     return [
         sys.executable,
@@ -215,7 +224,7 @@ def main(argv=None):
                 f"Starting vllm serve at http://{args.host}:{args.port} "
                 f"(V4 TP1, device selector {args.physical_npu}, "
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
-                f"decode_graph={args.decode_graph}, full residency). "
+                f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
             )

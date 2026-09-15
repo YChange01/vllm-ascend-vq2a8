@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Explicitly prepared, single-owner-stream V4 MoE decode graph.
+"""Explicitly prepared V4 MoE decode graph with fixed capture/replay streams.
 
 This is runtime capture, not torch.compile or a full-model graph. The caller
 selects genuine decode steps; B1 shape alone must never select this path.
@@ -14,6 +14,7 @@ from time import perf_counter
 import torch
 
 GRAPH_WARMUPS = 2
+GRAPH_REPLAY_STREAM_POLICIES = ("owner", "caller")
 
 
 class V4MoEDecodeGraph:
@@ -23,6 +24,8 @@ class V4MoEDecodeGraph:
     v2.10.0 ``torch_npu/npu/graphs.py``. Actual wheel/CANN/native-op support
     must pass the physical-device probe. In particular, an unsupported owner
     stream is an error, never a reason to silently switch the bank's stream.
+    A separate fixed caller stream may replay the graph after capture; this
+    never changes the construction stream used by the native bank itself.
     """
 
     def __init__(self, device, *, backend=None, owners=(), signature=()):
@@ -34,9 +37,11 @@ class V4MoEDecodeGraph:
         self.contract = signature
         self.graph = self.hidden = self.input_ids = self.output = self.valid = None
         self.stream = self.stream_id = self.signature = None
+        self.replay_stream = self.replay_stream_id = None
         self.prepared = self.failed = self.closing = self.closed = False
         self.failure = self.cleanup_error = None
         self.warmups = self.captures = self.replays = 0
+        self.owner_replays = self.caller_replays = 0
         self.capture_attempts = self.replay_attempts = 0
         self.capture_s = 0.0
         self.allocated_before = self.allocated_after = None
@@ -78,10 +83,13 @@ class V4MoEDecodeGraph:
             raise ValueError("V4 MoE graph input signature changed; no implicit recapture.")
         return signature
 
-    def _current_stream(self):
+    def _current_stream(self, *, stream_policy="owner"):
+        if stream_policy not in GRAPH_REPLAY_STREAM_POLICIES:
+            raise ValueError("V4 MoE graph replay stream policy must be owner or caller.")
         current = self.backend.current_stream(self.device)
-        if self.stream_id is not None and current.npu_stream != self.stream_id:
-            raise RuntimeError("V4 MoE graph requires its single owner stream.")
+        expected = self.stream_id if stream_policy == "owner" else self.replay_stream_id
+        if expected is not None and current.npu_stream != expected:
+            raise RuntimeError(f"V4 MoE graph requires its bound {stream_policy} stream.")
         capturing = getattr(self.backend, "is_current_stream_capturing", None)
         if capturing is not None and capturing():
             raise RuntimeError("V4 MoE graph does not support nested capture or replay inside another graph.")
@@ -113,7 +121,7 @@ class V4MoEDecodeGraph:
         return output, valid
 
     @torch.inference_mode()
-    def prepare(self, compute, hidden, input_ids):
+    def prepare(self, compute, hidden, input_ids, *, replay_stream=None):
         """Warm up/capture once at startup, before any serving/timing window."""
         with self._exclusive():
             self._require_open()
@@ -121,7 +129,13 @@ class V4MoEDecodeGraph:
                 raise RuntimeError("V4 MoE graph preparation is single-shot; no recapture.")
             signature = self._check_inputs(hidden, input_ids)
             current = self._current_stream()
+            replay_stream = current if replay_stream is None else replay_stream
+            if not hasattr(replay_stream, "npu_stream") or (
+                hasattr(replay_stream, "device") and torch.device(replay_stream.device) != self.device
+            ):
+                raise ValueError("V4 MoE graph caller stream must belong to the graph device.")
             self.stream, self.stream_id, self.signature = current, current.npu_stream, signature
+            self.replay_stream, self.replay_stream_id = replay_stream, replay_stream.npu_stream
             self.owners += (compute,)
             started = perf_counter()
             try:
@@ -160,13 +174,21 @@ class V4MoEDecodeGraph:
         return self.snapshot()
 
     @torch.inference_mode()
-    def replay(self, hidden, input_ids):
+    def replay(self, hidden, input_ids, *, stream_policy="owner"):
+        """Replay on one bound stream, keeping escaped outputs independently owned.
+
+        Low-level users must fence both streams before switching policies;
+        DeviceRouteDecodeState.set_graph_replay_stream enforces that boundary.
+        torch-npu v2.10.0 NPUGraph::replay submits AclmdlRIExecuteAsync on the
+        current stream, independently of its non-default capture stream:
+        https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUGraph.cpp
+        """
         with self._exclusive():
             self._require_open()
             if not self.prepared:
                 raise RuntimeError("Prepare V4 MoE graph explicitly before decode; lazy capture is disabled.")
             self._check_inputs(hidden, input_ids)
-            self._current_stream()
+            self._current_stream(stream_policy=stream_policy)
             try:
                 self.hidden.copy_(hidden)
                 self.input_ids.copy_(input_ids)
@@ -176,10 +198,21 @@ class V4MoEDecodeGraph:
                 # output/flag must not observe a later replay overwriting it.
                 outputs = self.output.clone(), self.valid.clone()
                 self.replays += 1
+                if stream_policy == "owner":
+                    self.owner_replays += 1
+                else:
+                    self.caller_replays += 1
                 return outputs
             except BaseException as error:
                 self._latch(error)
                 raise
+
+    def _fence_streams(self):
+        """Fence both bound streams before switching policy or releasing owners."""
+        if self.replay_stream is not None and self.replay_stream_id != self.stream_id:
+            self.replay_stream.synchronize()
+        if self.stream is not None:
+            self.stream.synchronize()
 
     def close(self):
         """Fence before reset/release; failed fences retain every graph owner."""
@@ -188,8 +221,7 @@ class V4MoEDecodeGraph:
                 return
             self.closing = True
             try:
-                if self.stream is not None:
-                    self.stream.synchronize()
+                self._fence_streams()
                 if self.graph is not None:
                     self.graph.reset()
             except BaseException as error:
@@ -209,6 +241,8 @@ class V4MoEDecodeGraph:
             "scope": "moe_decode",
             "captures": self.captures,
             "replays": self.replays,
+            "owner_replays": self.owner_replays,
+            "caller_replays": self.caller_replays,
             "warmups": self.warmups,
             "capture_attempts": self.capture_attempts,
             "replay_attempts": self.replay_attempts,
@@ -221,6 +255,7 @@ class V4MoEDecodeGraph:
             "failure": self.failure,
             "cleanup_error": self.cleanup_error,
             "owner_stream": self.stream_id,
+            "replay_stream": self.replay_stream_id,
             "signature": {
                 "hidden_shape": list(self.signature[0]) if self.signature is not None else None,
                 "hidden_dtype": "torch.bfloat16",

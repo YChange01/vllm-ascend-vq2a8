@@ -36,6 +36,25 @@ def test_v4_server_defaults_are_single_card_small_eager_and_v1_library():
     assert args.library.name == "libvq2a8_ascendc.so"
     assert args.device_route_decode is False
     assert args.decode_graph == "none"
+    assert args.graph_replay_stream == "owner"
+
+
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_server_selects_replay_stream_without_new_library_or_capture_mode(tmp_path, policy):
+    argv, _, library = assets(tmp_path)
+    args = server.parse_args([*argv, "--device-route-decode", "--decode-graph", "moe", "--graph-replay-stream", policy])
+    command = server.build_command(args)
+    config = json.loads(value(command, "--additional-config"))["vq2a8_offline"]
+    assert config["v4_graph_replay_stream"] == policy
+    assert config["v4_decode_graph"] == "moe"
+    assert config["ascendc_library"] == str(library.resolve())
+    assert "--enforce-eager" in command
+
+
+@pytest.mark.parametrize("argv", [["--graph-replay-stream", "caller"], ["--graph-replay-stream", "auto"]])
+def test_server_rejects_invalid_or_inactive_replay_mode(argv):
+    with pytest.raises(SystemExit):
+        server.parse_args(argv)
 
 
 def test_moe_subgraph_cli_keeps_engine_eager_and_does_not_change_budget(tmp_path):

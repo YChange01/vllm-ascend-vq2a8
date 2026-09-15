@@ -22,7 +22,7 @@ from vllm_ascend.quantization.vq2a8_moe import route_vq2a8
 from vllm_ascend.quantization.vq2a8_optimization import FastMoEState, OptimizationOptions
 from vllm_ascend.quantization.vq2a8_reference import deepseek_v4_swiglu_reference
 from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_FIELDS
-from vllm_ascend.quantization.vq2a8_v4_graph import V4MoEDecodeGraph
+from vllm_ascend.quantization.vq2a8_v4_graph import GRAPH_REPLAY_STREAM_POLICIES, V4MoEDecodeGraph
 
 DEVICE_ROUTE_PRESET = "device_route_decode"
 MAX_DEVICE_ROUTE_SLOTS = 6
@@ -111,6 +111,7 @@ class DeviceRouteDecodeState(FastMoEState):
         self._graph_prepare_error = None
         self._graph_stream = self._graph_backend = self._graph_banks = None
         self._graph_compute = None
+        self._graph_replay_stream_policy = "owner"
         self._graph_metadata_bytes = self._graph_stream_bridges = 0
         self._graph_lock = Lock()
 
@@ -124,16 +125,19 @@ class DeviceRouteDecodeState(FastMoEState):
             self._graph_lock.release()
 
     @torch.inference_mode()
-    def prepare_graph(self, runtime, *, backend=None):
+    def prepare_graph(self, runtime, *, backend=None, replay_stream_policy="owner"):
         """Explicit startup-only capture; eager routing remains the default."""
         with self._graph_operation():
-            return self._prepare_graph(runtime, backend=backend)
+            return self._prepare_graph(runtime, backend=backend, replay_stream_policy=replay_stream_policy)
 
-    def _prepare_graph(self, runtime, *, backend=None):
+    def _prepare_graph(self, runtime, *, backend=None, replay_stream_policy="owner"):
         runtime._require_ready()
+        if replay_stream_policy not in GRAPH_REPLAY_STREAM_POLICIES:
+            raise ValueError("V4 MoE graph replay stream policy must be owner or caller.")
         if self._graph_started:
             raise RuntimeError("V4 MoE graph preparation is single-shot; no recapture.")
         self._graph_started = True
+        self._graph_replay_stream_policy = replay_stream_policy
         try:
             if backend is None and runtime.device.type != "npu":
                 raise ValueError("V4 MoE decode graph requires an NPU.")
@@ -156,7 +160,9 @@ class DeviceRouteDecodeState(FastMoEState):
                 self._decode_graph = graph
                 hidden = torch.zeros((1, runtime.config.hidden_size), device=runtime.device, dtype=torch.bfloat16)
                 input_ids = torch.zeros((1,), device=runtime.device, dtype=torch.int64)
-                graph.prepare(compute, hidden, input_ids)
+                # Always bind the startup caller, including owner-mode capture,
+                # so synchronized A/B policy switches need no new graph/pool.
+                graph.prepare(compute, hidden, input_ids, replay_stream=caller)
             caller.wait_stream(self._graph_stream)
             return self.graph_snapshot()
         except BaseException as error:
@@ -164,6 +170,38 @@ class DeviceRouteDecodeState(FastMoEState):
             if self._decode_graph is not None:
                 self._decode_graph._latch(error)
             raise
+
+    def set_graph_replay_stream(self, policy):
+        """Switch the same graph only at a fenced, non-concurrent boundary.
+
+        Model callers additionally fence the complete request before switching
+        every layer. The device fence also covers retained validity produced
+        by an earlier owner-mode call on a third stream; tracking an unbounded
+        stream inventory is unnecessary. Owner-mode callers remain responsible
+        for ordinary producer/consumer ordering between their own streams.
+        These fences are never part of the per-token replay path.
+        """
+        with self._graph_operation():
+            if policy not in GRAPH_REPLAY_STREAM_POLICIES:
+                raise ValueError("V4 MoE graph replay stream policy must be owner or caller.")
+            if self._decode_graph is None:
+                raise RuntimeError("Prepare V4 MoE graph before selecting its replay stream.")
+            graph = self._decode_graph
+            graph._require_open()
+            if not graph.prepared:
+                raise RuntimeError("Prepare V4 MoE graph before selecting its replay stream.")
+            capturing = getattr(self._graph_backend, "is_current_stream_capturing", None)
+            if capturing is not None and capturing():
+                raise RuntimeError("Switch V4 MoE graph replay stream outside another capture.")
+            if policy != self._graph_replay_stream_policy:
+                try:
+                    self._graph_backend.synchronize(graph.device)
+                    graph._fence_streams()
+                except BaseException as error:
+                    graph._latch(error)
+                    raise
+                self._graph_replay_stream_policy = policy
+            return self.graph_snapshot()
 
     @torch.inference_mode()
     def forward_graph(self, runtime, hidden, input_ids):
@@ -179,19 +217,32 @@ class DeviceRouteDecodeState(FastMoEState):
             capturing = getattr(self._graph_backend, "is_current_stream_capturing", None)
             if capturing is not None and capturing():
                 raise RuntimeError("V4 MoE graph does not support replay inside another capture.")
+            policy = self._graph_replay_stream_policy
+            if policy == "caller":
+                # Reject unexpected callers before any copy/submission/latch.
+                # Native bank guards still run on their construction stream
+                # during capture; graph replay does not re-enter those calls.
+                graph._current_stream(stream_policy="caller")
             try:
-                cross_stream = caller.npu_stream != self._graph_stream.npu_stream
-                if cross_stream:
-                    self._graph_stream.wait_stream(caller)
-                    _record_tensor_stream(hidden, self._graph_stream)
-                    _record_tensor_stream(input_ids, self._graph_stream)
-                with self._graph_backend.stream(self._graph_stream):
-                    output, valid = graph.replay(hidden, input_ids)
-                if cross_stream:
-                    caller.wait_stream(self._graph_stream)
-                    _record_tensor_stream(output, caller)
-                    _record_tensor_stream(valid, caller)
-                    self._graph_stream_bridges += 1
+                if policy == "caller":
+                    # Static inputs/private pool/payloads have strong graph
+                    # owners until both capture and caller streams are fenced
+                    # at close. Copies, replay and escaped clones are ordered
+                    # on this one caller stream, needing no per-layer bridge.
+                    output, valid = graph.replay(hidden, input_ids, stream_policy="caller")
+                else:
+                    cross_stream = caller.npu_stream != self._graph_stream.npu_stream
+                    if cross_stream:
+                        self._graph_stream.wait_stream(caller)
+                        _record_tensor_stream(hidden, self._graph_stream)
+                        _record_tensor_stream(input_ids, self._graph_stream)
+                    with self._graph_backend.stream(self._graph_stream):
+                        output, valid = graph.replay(hidden, input_ids)
+                    if cross_stream:
+                        caller.wait_stream(self._graph_stream)
+                        _record_tensor_stream(output, caller)
+                        _record_tensor_stream(valid, caller)
+                        self._graph_stream_bridges += 1
                 # The current flag escapes the graph pool before caller-stream
                 # consumption. Python native counters remain eager-only.
                 self.retain(valid)
@@ -207,6 +258,9 @@ class DeviceRouteDecodeState(FastMoEState):
                 "prepared": False,
                 "captures": 0,
                 "replays": 0,
+                "owner_replays": 0,
+                "caller_replays": 0,
+                "replay_stream_policy": self._graph_replay_stream_policy,
                 "warmups": 0,
                 "entries": 0,
                 "pool_count": 0,
@@ -219,7 +273,12 @@ class DeviceRouteDecodeState(FastMoEState):
             }
         return {
             **self._decode_graph.snapshot(),
-            "stream_policy": "dedicated_graph_owner_with_caller_event_bridges",
+            "stream_policy": (
+                "dedicated_graph_owner_with_caller_event_bridges"
+                if self._graph_replay_stream_policy == "owner"
+                else "fixed_caller_replay_without_per_layer_event_bridges"
+            ),
+            "replay_stream_policy": self._graph_replay_stream_policy,
             "stream_bridges": self._graph_stream_bridges,
             "graph_metadata_bytes": self._graph_metadata_bytes,
             "graph_payload_copy_bytes": 0,

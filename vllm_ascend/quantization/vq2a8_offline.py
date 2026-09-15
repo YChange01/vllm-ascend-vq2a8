@@ -60,6 +60,7 @@ def offline_engine_options(
     v4_serving=False,
     v4_device_route_decode=False,
     v4_decode_graph="none",
+    v4_graph_replay_stream="owner",
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
@@ -88,6 +89,10 @@ def offline_engine_options(
         v4_decode_graph != "none" and (execution_policy != "ascendc_v4" or not v4_device_route_decode)
     ):
         raise ValueError("v4_decode_graph requires none|moe; moe requires V4 device-route decode.")
+    if v4_graph_replay_stream not in ("owner", "caller") or (
+        v4_graph_replay_stream == "caller" and v4_decode_graph != "moe"
+    ):
+        raise ValueError("v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
@@ -139,6 +144,7 @@ def offline_engine_options(
                 **({"v4_serving": True} if v4_serving else {}),
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
                 **({"v4_decode_graph": v4_decode_graph} if v4_decode_graph != "none" else {}),
+                **({"v4_graph_replay_stream": v4_graph_replay_stream} if v4_decode_graph != "none" else {}),
                 "cache_experts": 256 if execution_policy in CACHE_EXECUTION_POLICIES else 2,
                 "token_chunk": 2,
                 "cache_budget_gib": cache_budget_gib,
@@ -193,6 +199,7 @@ def validate_offline_config(config) -> dict:
         "v4_serving",
         "v4_device_route_decode",
         "v4_decode_graph",
+        "v4_graph_replay_stream",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -328,6 +335,9 @@ def validate_offline_config(config) -> dict:
         raise ValueError("v4_decode_graph requires none|moe and execution_policy=ascendc_v4.")
     if graph_mode == "moe" and (tp_size != 1 or options.get("v4_device_route_decode") is not True):
         raise ValueError("V4 MoE decode graph requires TP1 and v4_device_route_decode=true.")
+    replay_stream = options.get("v4_graph_replay_stream", "owner")
+    if replay_stream not in ("owner", "caller") or (replay_stream == "caller" and graph_mode != "moe"):
+        raise ValueError("v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe.")
     if graph_mode == "moe":
         graph_kv_bytes = getattr(config.cache_config, "kv_cache_memory_bytes", None)
         if type(graph_kv_bytes) is not int or graph_kv_bytes <= 0:

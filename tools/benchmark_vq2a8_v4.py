@@ -32,6 +32,7 @@ from tools.vq2a8_perf_report import MAX_CONTEXT, distribution, token_metrics
 REPO = Path(__file__).resolve().parents[1]
 LAYERS = 43
 V4_POLICY = "ascendc_v4"
+GRAPH_OPTIMIZATIONS = ("moe_graph", "moe_graph_caller")
 SCOPE = "TP1_B1_EAGER_CONTEXT_LE_128_V1_BATCHED_ARITHMETIC"
 SOURCE_NAMES = (
     "vllm_ascend/quantization/vq2a8_execution.py",
@@ -85,11 +86,17 @@ def parse_args(argv=None):
         help="Compare batched baseline and device-route decode in one V4 resident engine (requires rebuilt library)",
     )
     parser.add_argument("--decode-graph", choices=("none", "moe"), default="none")
+    parser.add_argument(
+        "--graph-replay-stream",
+        choices=("owner", "caller"),
+        default="owner",
+        help="Caller replay compares with the existing owner-stream MoE graph in the same engine.",
+    )
     args = parser.parse_args(argv)
+    if args.graph_replay_stream == "caller" and args.decode_graph != "moe":
+        parser.error("--graph-replay-stream caller requires --decode-graph moe.")
     if args.decode_graph == "moe" and (not args.device_route_decode or args.reference_report or args.reference_only):
-        parser.error(
-            "MoE graph compares with same-engine device-route eager; require --device-route-decode, no V1 reference."
-        )
+        parser.error("MoE graph comparisons require --device-route-decode and no V1 reference.")
     try:
         args.cases = validate_v4_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
     except (TypeError, ValueError) as exc:
@@ -121,11 +128,31 @@ def parse_args(argv=None):
     return args
 
 
-def request_schedule(warmups, repeats, *, device_route_decode=False, decode_graph="none"):
+def graph_comparison_modes(replay_stream):
+    if replay_stream == "caller":
+        return "moe_graph", "moe_graph_caller"
+    if replay_stream == "owner":
+        return "device_route_decode", "moe_graph"
+    raise ValueError("Unknown MoE graph replay stream policy.")
+
+
+def graph_replay_policy(optimization):
+    return "caller" if optimization == "moe_graph_caller" else "owner"
+
+
+def graph_ratio_key(replay_stream):
+    return (
+        "tpot_ratio_vs_same_engine_moe_graph_owner"
+        if replay_stream == "caller"
+        else "tpot_ratio_vs_same_engine_device_route"
+    )
+
+
+def request_schedule(warmups, repeats, *, device_route_decode=False, decode_graph="none", graph_replay_stream="owner"):
     """Warm both paths before alternating AB/BA; never rebuild/reload the engine."""
     modes = ("batched", "device_route_decode") if device_route_decode else ("batched",)
     if decode_graph == "moe":
-        modes = ("device_route_decode", "moe_graph")
+        modes = graph_comparison_modes(graph_replay_stream)
     for kind, count in (("warmup", warmups), ("measured", repeats)):
         for index in range(count):
             order = modes if index % 2 == 0 else tuple(reversed(modes))
@@ -149,20 +176,32 @@ def set_graph_worker(worker, enabled):
     return worker.get_model().set_v4_graph_enabled(enabled)
 
 
+def set_graph_replay_stream_worker(worker, policy):
+    return worker.get_model().set_v4_graph_replay_stream(policy)
+
+
 def configure_v4(llm, *, measurement, optimization, graph_available=False):
     from tools.benchmark_vq2a8_offline import configure
     from tools.validate_vq2a8_tp1_offline import single_worker_result
 
-    preset = "device_route_decode" if optimization == "moe_graph" else optimization
+    graph_enabled = optimization in GRAPH_OPTIMIZATIONS
+    preset = "device_route_decode" if graph_enabled else optimization
     configure(llm, measurement=measurement, compact=True, optimization=preset)
     if graph_available:
-        single_worker_result(llm.collective_rpc(set_graph_worker, args=(optimization == "moe_graph",)))
+        # These control RPCs run between requests, outside all timing windows.
+        # Both caller/owner policies share the same prepared graph and pool.
+        single_worker_result(
+            llm.collective_rpc(set_graph_replay_stream_worker, args=(graph_replay_policy(optimization),))
+        )
+        single_worker_result(llm.collective_rpc(set_graph_worker, args=(graph_enabled,)))
 
 
-def check_graph_activity(before, after, output_tokens, *, enabled=True):
+def check_graph_activity(before, after, output_tokens, *, enabled=True, replay_stream="owner"):
     """Logical replay evidence plus strict per-layer readiness; not kernel timing."""
     if type(output_tokens) is not int or output_tokens < 2 or type(enabled) is not bool:
         raise ValueError("Graph evidence requires output >=2 and a boolean mode.")
+    if replay_stream not in ("owner", "caller"):
+        raise ValueError("Graph evidence requires an owner/caller replay policy.")
     expected = output_tokens - 1 if enabled else 0
     if set(before) != {str(index) for index in range(LAYERS)} or set(after) != set(before):
         raise ValueError("Missing per-layer MoE graph evidence.")
@@ -175,15 +214,32 @@ def check_graph_activity(before, after, output_tokens, *, enabled=True):
                 raise ValueError(f"Layer {layer} graph was not captured exactly once.")
             if not isinstance(record.get("signature"), dict) or not record["signature"]:
                 raise ValueError(f"Layer {layer} graph signature is missing.")
+            if record.get("replay_stream_policy") != replay_stream:
+                raise ValueError(f"Layer {layer} graph replay stream policy does not match this sample.")
+            if any(type(record.get(key)) is not int or record[key] < 0 for key in ("owner_stream", "replay_stream")):
+                raise ValueError(f"Layer {layer} graph lacks bound capture/caller stream identities.")
         left, right = previous.get("replays"), current.get("replays")
         if any(type(value) is not int or value < 0 for value in (left, right)) or right - left != expected:
             raise ValueError(f"Layer {layer} replay count does not match decode tokens (prefill excluded).")
         if previous.get("signature") != current.get("signature"):
             raise ValueError(f"Layer {layer} graph signature changed during request.")
+        if any(previous[key] != current[key] for key in ("owner_stream", "replay_stream")):
+            raise ValueError(f"Layer {layer} graph stream binding changed during request.")
+        deltas = {
+            "owner_replays": expected if replay_stream == "owner" else 0,
+            "caller_replays": expected if replay_stream == "caller" else 0,
+            "stream_bridges": expected if replay_stream == "owner" else 0,
+        }
+        for key, wanted in deltas.items():
+            left, right = previous.get(key), current.get(key)
+            if any(type(value) is not int or value < 0 for value in (left, right)) or right - left != wanted:
+                raise ValueError(f"Layer {layer} graph {key} does not match the selected replay policy.")
     return {
         "layers": LAYERS,
         "per_layer_decode_replays": expected,
         "measured_capture_delta": 0,
+        "replay_stream_policy": replay_stream,
+        "per_layer_stream_bridges": expected if replay_stream == "owner" else 0,
         "scope": "logical_wrapper_replays_not_profiler_kernel_launches",
         "full_model_graph_verified": False,
     }
@@ -311,7 +367,11 @@ def diagnostic(
     graph_activity = None
     if graph_available:
         graph_activity = check_graph_activity(
-            before.get("graph", {}), after.get("graph", {}), count, enabled=optimization == "moe_graph"
+            before.get("graph", {}),
+            after.get("graph", {}),
+            count,
+            enabled=optimization in GRAPH_OPTIMIZATIONS,
+            replay_stream=graph_replay_policy(optimization),
         )
     if optimization == "device_route_decode":
         route_activity = check_device_route_activity(before["optimization"], after["optimization"], len(prompt), count)
@@ -350,7 +410,7 @@ def diagnostic(
         if len(record["steps"]) != count:
             raise ValueError("Missing native per-step coverage.")
         for index, (actual, wanted) in enumerate(zip(record["steps"], expected)):
-            if optimization == "moe_graph" and index > 0:
+            if optimization in GRAPH_OPTIMIZATIONS and index > 0:
                 if actual != {"tokens": 1, "graph_replays": 1, "counter_scope": "graph_replay_not_native_launch"}:
                     raise ValueError("Missing decode graph trace evidence.")
                 continue
@@ -409,10 +469,10 @@ def run(args):
     path = output / "summary.json"
     policy = "ascendc" if args.reference_only else V4_POLICY
     graph_available = args.decode_graph == "moe"
-    optimization = (
-        "moe_graph" if graph_available else ("device_route_decode" if args.device_route_decode else "batched")
-    )
-    baseline_mode = "device_route_decode" if graph_available else "batched"
+    if graph_available:
+        baseline_mode, optimization = graph_comparison_modes(args.graph_replay_stream)
+    else:
+        baseline_mode, optimization = "batched", "device_route_decode" if args.device_route_decode else "batched"
     comparison_key = "graph_comparison" if graph_available else "device_route_comparison"
     report = dict(
         status="RUNNING",
@@ -434,6 +494,8 @@ def run(args):
         graph_comparison="NOT_RUN",
         requested_graph_mode=args.decode_graph,
         effective_graph_mode="none",
+        requested_graph_replay_stream=args.graph_replay_stream,
+        effective_graph_replay_stream=None,
         graph_scope="moe_decode1_only" if graph_available else "none",
         baseline_mode=baseline_mode,
         graph_functional_verified=False,
@@ -501,6 +563,7 @@ def run(args):
             ascendc_sha256=library["sha256"],
             **({"v4_device_route_decode": True} if args.device_route_decode else {}),
             v4_decode_graph=args.decode_graph,
+            v4_graph_replay_stream=args.graph_replay_stream,
             **({"cache_memory_fraction": args.memory_fraction} if args.memory_fraction is not None else {}),
         )
         options.update(
@@ -600,7 +663,11 @@ def run(args):
                     raise ValueError("V4 differs from measured V1 batched logits/tokens; timing stopped.")
             write_json(path, report)
             for kind, index, sample_optimization in request_schedule(
-                args.warmups, args.repeats, device_route_decode=args.device_route_decode, decode_graph=args.decode_graph
+                args.warmups,
+                args.repeats,
+                device_route_decode=args.device_route_decode,
+                decode_graph=args.decode_graph,
+                graph_replay_stream=args.graph_replay_stream,
             ):
                 configure_v4(llm, measurement=True, optimization=sample_optimization, graph_available=graph_available)
                 before = snapshot(llm)
@@ -616,11 +683,16 @@ def run(args):
                 if graph_available:
                     sample["graph_before"], sample["graph_after"] = before.get("graph", {}), after.get("graph", {})
                     sample["graph_activity"] = check_graph_activity(
-                        sample["graph_before"], sample["graph_after"], count, enabled=sample_optimization == "moe_graph"
+                        sample["graph_before"],
+                        sample["graph_after"],
+                        count,
+                        enabled=sample_optimization in GRAPH_OPTIMIZATIONS,
+                        replay_stream=graph_replay_policy(sample_optimization),
                     )
+                    sample["graph_replay_stream"] = graph_replay_policy(sample_optimization)
                     sample["native_counter_scope"] = (
                         "eager_prefill_submissions_only_graph_replays_reported_separately"
-                        if sample_optimization == "moe_graph"
+                        if sample_optimization in GRAPH_OPTIMIZATIONS
                         else "eager_prefill_and_decode_submissions"
                     )
                 if policy == V4_POLICY:
@@ -657,8 +729,11 @@ def run(args):
                 entry["baseline_metrics"] = measured_metrics(report["samples"], case, baseline_mode)
                 ratio = entry["metrics"]["tpot_s"]["median"] / entry["baseline_metrics"]["tpot_s"]["median"]
                 entry[
-                    "tpot_ratio_vs_same_engine_device_route" if graph_available else "tpot_ratio_vs_same_engine_batched"
+                    graph_ratio_key(args.graph_replay_stream)
+                    if graph_available
+                    else "tpot_ratio_vs_same_engine_batched"
                 ] = ratio
+                entry["tpot_ratio_vs_same_engine_baseline"] = ratio
                 if graph_available:
                     entry["graph_performance_target_met"] = ratio <= 0.9 and (
                         entry["metrics"]["ttft_s"]["median"] <= 1.05 * entry["baseline_metrics"]["ttft_s"]["median"]
@@ -679,6 +754,7 @@ def run(args):
             graph_comparison="PASS" if graph_available else "NOT_RUN",
             graph_functional_verified=graph_available,
             effective_graph_mode=args.decode_graph,
+            effective_graph_replay_stream=args.graph_replay_stream if graph_available else None,
             graph_performance_target_met=(
                 all(case["graph_performance_target_met"] for case in report["cases"].values())
                 if graph_available

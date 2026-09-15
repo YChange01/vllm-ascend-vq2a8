@@ -27,7 +27,15 @@ import time
 from pathlib import Path
 
 from tools.accept_vq2a8_optimizations import failure_causes
-from tools.benchmark_vq2a8_v4 import check_graph_activity, require_idle_device, validate_v4_cases
+from tools.benchmark_vq2a8_v4 import (
+    GRAPH_OPTIMIZATIONS,
+    check_graph_activity,
+    graph_comparison_modes,
+    graph_ratio_key,
+    graph_replay_policy,
+    require_idle_device,
+    validate_v4_cases,
+)
 from tools.diagnose_vq2a8_tp1_startup import terminate_child
 from tools.profile_vq2a8_ascendc import write_json
 from tools.vq2a8_live_log import LiveChildLog
@@ -59,11 +67,18 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--decode-graph", choices=("none", "moe"), default="none")
+    parser.add_argument(
+        "--graph-replay-stream",
+        choices=("owner", "caller"),
+        default="owner",
+        help="Caller replay compares with the existing owner-stream MoE graph in the same engine.",
+    )
     args = parser.parse_args(argv)
+    if args.graph_replay_stream == "caller" and args.decode_graph != "moe":
+        parser.error("--graph-replay-stream caller requires --decode-graph moe.")
     if args.decode_graph == "moe" and (not args.device_route_decode or args.compare_v1):
         parser.error(
-            "--decode-graph moe requires --device-route-decode and uses its same-engine eager baseline, "
-            "not --compare-v1."
+            "--decode-graph moe requires --device-route-decode and uses a same-engine baseline, not --compare-v1."
         )
     try:
         cases = validate_v4_cases([tuple(map(int, case.split(":"))) for case in args.cases.split(",")])
@@ -144,6 +159,8 @@ def commands(args, output):
                     "--report-dir",
                     str(output / "graph_preflight"),
                     "--queue-lifetime",
+                    "--graph-replay-stream",
+                    args.graph_replay_stream,
                 ],
             )
         )
@@ -187,6 +204,7 @@ def commands(args, output):
                 str(output / "v4"),
                 *(["--device-route-decode"] if args.device_route_decode else []),
                 *(["--decode-graph", "moe"] if args.decode_graph == "moe" else []),
+                *(["--graph-replay-stream", args.graph_replay_stream] if args.decode_graph == "moe" else []),
                 *(["--reference-report", str(output / "v1_reference/summary.json")] if args.compare_v1 else []),
             ],
         )
@@ -258,7 +276,7 @@ def check_graph_receipt(result, args):
         if case.get("status") != "PASS" or case.get("graph_comparison", {}).get("accepted") is not True:
             raise ValueError("Graph acceptance requires exact per-case comparison evidence.")
         for kind, size in (("warmup", args.warmups), ("measured", args.repeats)):
-            for mode in ("device_route_decode", "moe_graph"):
+            for mode in graph_comparison_modes(args.graph_replay_stream):
                 selected = [
                     sample
                     for sample in samples
@@ -275,7 +293,8 @@ def check_graph_receipt(result, args):
                         sample.get("graph_before", {}),
                         sample.get("graph_after", {}),
                         count,
-                        enabled=mode == "moe_graph",
+                        enabled=mode in GRAPH_OPTIMIZATIONS,
+                        replay_stream=graph_replay_policy(mode),
                     )
 
 
@@ -312,6 +331,8 @@ def run(args):
         graph_comparison="NOT_RUN",
         requested_graph_mode=args.decode_graph,
         effective_graph_mode="none",
+        requested_graph_replay_stream=args.graph_replay_stream,
+        effective_graph_replay_stream=None,
         graph_functional_verified=False,
         full_model_graph_verified=False,
     )
@@ -344,10 +365,12 @@ def run(args):
             or (
                 args.decode_graph == "moe"
                 and (
-                    result.get("optimization") != "moe_graph"
+                    result.get("optimization") != graph_comparison_modes(args.graph_replay_stream)[1]
+                    or result.get("baseline_mode") != graph_comparison_modes(args.graph_replay_stream)[0]
                     or result.get("graph_comparison") != "PASS"
                     or result.get("graph_functional_verified") is not True
                     or result.get("effective_graph_mode") != "moe"
+                    or result.get("effective_graph_replay_stream") != args.graph_replay_stream
                     or result.get("full_model_graph_verified") is not False
                 )
             )
@@ -365,12 +388,14 @@ def run(args):
             graph_comparison=result.get("graph_comparison", "NOT_RUN"),
             graph_performance_target_met=result.get("graph_performance_target_met"),
             effective_graph_mode=result.get("effective_graph_mode", "none"),
+            effective_graph_replay_stream=result.get("effective_graph_replay_stream"),
             graph_functional_verified=result.get("graph_functional_verified", False),
             graph_scope=result.get("graph_scope", "none"),
             baseline_mode=result.get("baseline_mode", "batched"),
         )
-        candidate = "moe_graph" if graph_mode else "device_route_decode"
-        baseline_mode = "device_route_decode" if graph_mode else "batched"
+        baseline_mode, candidate = (
+            graph_comparison_modes(args.graph_replay_stream) if graph_mode else ("batched", "device_route_decode")
+        )
         comparison_key = "graph_comparison" if graph_mode else "device_route_comparison"
         for name, case in result["cases"].items():
             metrics = case["metrics"]
@@ -409,10 +434,12 @@ def run(args):
                     "baseline_mode": baseline_mode,
                     "same_engine_baseline_tpot_median_s": case["baseline_metrics"]["tpot_s"]["median"],
                     "tpot_ratio_vs_same_engine_baseline": case[
-                        "tpot_ratio_vs_same_engine_device_route" if graph_mode else "tpot_ratio_vs_same_engine_batched"
+                        graph_ratio_key(args.graph_replay_stream) if graph_mode else "tpot_ratio_vs_same_engine_batched"
                     ],
                     comparison_key: "PASS",
                 }
+                if graph_mode:
+                    comparison.update(graph_replay_stream=args.graph_replay_stream, candidate_mode=candidate)
                 if not graph_mode:
                     comparison.update(
                         same_engine_batched_tpot_median_s=case["baseline_metrics"]["tpot_s"]["median"],

@@ -66,6 +66,7 @@ def isolated_model(*, serving=True, graph=False):
         "prepare_v4_graphs",
         "_check_v4_graph_memory",
         "set_v4_graph_enabled",
+        "set_v4_graph_replay_stream",
         "v4_graph_report",
         "performance_snapshot",
         "_forward_without_v4_graph_phase",
@@ -144,6 +145,7 @@ def isolated_model(*, serving=True, graph=False):
         model._v4_graph_kv_cache_bytes = 256 * 1024**2
         for layer in layers.values():
             layer.prepare_v4_graph = Mock()
+            layer.set_v4_graph_replay_stream = Mock()
             layer.v4_graph_report = Mock(return_value={"captures": 1, "entries": 1, "replays": 0})
             layer.set_v4_graph_enabled = Mock(
                 side_effect=lambda value, target=layer: setattr(target, "_v4_graph_enabled", value)
@@ -624,6 +626,78 @@ def test_graph_ab_switch_retains_prepared_graphs_and_runtime(graph_model):
             assert layer._optimization is states[index] and layer._v4_graph_enabled is enabled
             layer.prepare_v4_graph.assert_called_once_with()
     assert len(selected) == 2
+
+
+def test_caller_policy_startup_and_ab_switch_are_fenced_without_recapture(graph_model, device_fence):
+    model, owner, _, selected = graph_model
+    model._v4_requested_replay_stream = "caller"
+    report = model.prepare_v4_graphs()
+    assert report["replay_stream_policy"] == report["requested_replay_stream_policy"] == "caller"
+    states = {index: layer._optimization for index, layer in owner.layers.items()}
+    for policy in ("owner", "caller", "owner", "caller"):
+        device_fence.reset_mock()
+        for layer in owner.layers.values():
+            layer.set_v4_graph_replay_stream.reset_mock()
+            layer.set_v4_graph_replay_stream.side_effect = lambda value: device_fence.assert_called_once_with()
+        report = model.set_v4_graph_replay_stream(policy)
+        assert report["replay_stream_policy"] == policy
+        assert report["requested_replay_stream_policy"] == "caller"
+        assert report["effective_graph_mode"] == "moe"
+        for index, layer in owner.layers.items():
+            layer.set_v4_graph_replay_stream.assert_called_once_with(policy)
+            layer.prepare_v4_graph.assert_called_once_with()
+            assert layer._optimization is states[index]
+        # A repeated policy assignment has no further fence or side effects.
+        assert model.set_v4_graph_replay_stream(policy) == report
+        device_fence.assert_called_once_with()
+    assert len(selected) == 2
+
+
+@pytest.mark.parametrize("policy", [None, True, 1, "default", "auto"])
+def test_replay_stream_rejects_invalid_policy_before_mutation(graph_model, policy, device_fence):
+    model, owner, _, _ = graph_model
+    model.prepare_v4_graphs()
+    device_fence.reset_mock()
+    with pytest.raises(ValueError, match="owner or caller"):
+        model.set_v4_graph_replay_stream(policy)
+    device_fence.assert_not_called()
+    assert model._v4_graph_replay_stream == "owner"
+    assert not model._v4_graphs_failed
+    for layer in owner.layers.values():
+        layer.set_v4_graph_replay_stream.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["fence", "layer"])
+def test_replay_stream_partial_switch_failure_stops_serving(graph_model, device_fence, failure):
+    model, owner, context, _ = graph_model
+    model.prepare_v4_graphs()
+    if failure == "fence":
+        device_fence.side_effect = RuntimeError("policy fence failed")
+    else:
+        owner.layers[1].set_v4_graph_replay_stream.side_effect = RuntimeError("policy layer failed")
+    with pytest.raises(RuntimeError, match="policy .* failed"):
+        model.set_v4_graph_replay_stream("caller")
+    assert model._v4_graphs_failed
+    assert model._v4_graph_replay_stream == "owner"
+    context.vq2a8_request_phase = "decode"
+    with pytest.raises(RuntimeError, match="no eager fallback"):
+        model.forward(*tokens())
+    with pytest.raises(RuntimeError, match="healthy idle"):
+        model.set_v4_graph_replay_stream("owner")
+
+
+def test_replay_stream_switch_requires_prepared_idle_model(graph_model, device_fence):
+    model, owner, _, _ = graph_model
+    with pytest.raises(RuntimeError, match="Prepare V4"):
+        model.set_v4_graph_replay_stream("caller")
+    model.prepare_v4_graphs()
+    model._v4_graph_forward_active = True
+    device_fence.reset_mock()
+    with pytest.raises(RuntimeError, match="healthy idle"):
+        model.set_v4_graph_replay_stream("caller")
+    device_fence.assert_not_called()
+    for layer in owner.layers.values():
+        layer.set_v4_graph_replay_stream.assert_not_called()
 
 
 def test_graph_probe_configuration_keeps_prepared_runtime_and_rejects_preset_replacement(graph_model):

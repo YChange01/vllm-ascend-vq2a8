@@ -75,6 +75,7 @@ def parse_args(argv=None):
     parser.add_argument("--library", type=Path, default=BUILD_DIR / "libvq2a8_ascendc.so")
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--launch-blocking", choices=("0",), default="0")
+    parser.add_argument("--graph-replay-stream", choices=("owner", "caller"), default="owner")
     parser.add_argument("--queue-lifetime", action="store_true", help="also run bounded asynchronous replay pressure")
     parser.add_argument("--queue-iterations", type=int, default=QUEUE_MIN_ITERATIONS)
     parser.add_argument("--report-dir", type=Path, help="new output directory; never overwrite an old receipt")
@@ -106,6 +107,8 @@ def child_command(args):
         str(args.timeout_s),
         "--launch-blocking",
         "0",
+        "--graph-replay-stream",
+        args.graph_replay_stream,
     ]
     if args.queue_lifetime:
         command.extend(["--queue-lifetime", "--queue-iterations", str(args.queue_iterations)])
@@ -405,12 +408,102 @@ def make_moe_runtime(device, *, bank_factory, hash_route, top_k):
     return runtime
 
 
-def run_moe_checks(device, *, bank_factory, synchronize, stage=None, lifetime_iterations=0):
+def check_stream_replay_delta(before, after, count, policy):
+    """Check the selected real replay path, not just the aggregate counter."""
+    if policy not in ("owner", "caller"):
+        raise ValueError("Unknown graph replay stream policy.")
+    if (
+        before.get("replay_stream_policy") != policy
+        or after.get("replay_stream_policy") != policy
+        or type(before.get("captures")) is not int
+        or type(after.get("captures")) is not int
+        or type(after.get("entries")) is not int
+        or before.get("entries") != 1
+        or before["captures"] < 1
+        or after.get("captures") != before.get("captures")
+        or after.get("entries") != 1
+    ):
+        raise AssertionError("MoE graph changed capture, entry or replay stream policy")
+    increments = {
+        "replays": count,
+        "owner_replays": count if policy == "owner" else 0,
+        "caller_replays": count if policy == "caller" else 0,
+        "stream_bridges": count if policy == "owner" else 0,
+    }
+    for key, wanted in increments.items():
+        if (
+            type(before.get(key)) is not int
+            or type(after.get(key)) is not int
+            or before[key] < 0
+            or after[key] - before[key] != wanted
+        ):
+            raise AssertionError(f"MoE {policy} replay has incorrect {key} delta")
+
+
+def exercise_stream_policy_checks(state, runtime, templates, *, synchronize):
+    """Reject unrelated streams and switch the same native graph at boundaries."""
+    backend = state._graph_backend
+    hidden, ids, expected = templates[0]
+    before = state.graph_snapshot()
+    # Caller mode cannot silently acquire another caller stream. Rejection
+    # must happen before enqueue, so there is no new work to fence on it.
+    unrelated = backend.Stream(device=runtime.device)
+    with backend.stream(unrelated):
+        try:
+            state.forward_graph(runtime, hidden, ids)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Caller replay accepted an unrelated stream")
+    # Owner-mode replay still requires the actual capture owner. Do not loosen
+    # the old contract just because an explicit caller mode now exists.
+    try:
+        state._decode_graph.replay(hidden, ids, stream_policy="owner")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Owner replay accepted the caller stream")
+    after_rejections = state.graph_snapshot()
+    if after_rejections.get("failed") or after_rejections["replays"] != before["replays"]:
+        raise AssertionError("Stream rejection enqueued work or poisoned an otherwise healthy graph")
+    steps, preserved = [], []
+    for policy in ("owner", "caller", "owner", "caller"):
+        synchronize()
+        state.set_graph_replay_stream(policy)
+        start = state.graph_snapshot()
+        state.valid = None
+        output = state.forward_graph(runtime, hidden.clone(), ids.clone())
+        synchronize()
+        exact_tensor(output, expected, f"stream_policy_{policy}")
+        if not bool(state.valid):
+            raise AssertionError("Replay stream switch changed validity")
+        for previous in preserved:
+            exact_tensor(previous, expected, "stream_policy_preserved_output")
+        preserved.append(output)
+        end = state.graph_snapshot()
+        check_stream_replay_delta(start, end, 1, policy)
+        steps.append({"policy": policy, "before": start, "after": end, "bit_exact": True})
+    if state.graph_snapshot()["captures"] != before["captures"]:
+        raise AssertionError("Replay stream switch recaptured the graph")
+    return {
+        "wrong_caller_rejected": True,
+        "owner_guard_preserved": True,
+        "previous_outputs_preserved": True,
+        "same_capture": True,
+        "steps": steps,
+    }
+
+
+def run_moe_checks(
+    device, *, bank_factory, synchronize, stage=None, lifetime_iterations=0, replay_stream_policy="owner"
+):
     import torch
 
     stage = stage or (lambda _: nullcontext())
     if lifetime_iterations and not QUEUE_MIN_ITERATIONS <= lifetime_iterations <= QUEUE_MAX_ITERATIONS:
         raise ValueError("MoE lifetime iterations must be bounded in [2049,8192].")
+    if replay_stream_policy not in ("owner", "caller"):
+        raise ValueError("Unknown graph replay stream policy.")
     checks = []
     for hash_route, top_k in ((True, 1), (True, 6), (False, 1)):
         with stage(f"moe_hash{int(hash_route)}_topk{top_k}"):
@@ -418,8 +511,9 @@ def run_moe_checks(device, *, bank_factory, synchronize, stage=None, lifetime_it
             state = runtime._optimization
             eager_banks = runtime._device_route_banks
             # Exercise the actual production metadata-only bank construction,
-            # private capture stream and caller-stream input/output bridges.
-            state.prepare_graph(runtime)
+            # private capture stream and the explicitly selected replay stream.
+            state.prepare_graph(runtime, replay_stream_policy=replay_stream_policy)
+            prepared_report = state.graph_snapshot()
             hidden = torch.full((1, MOE_WIDTH), 0.125, dtype=torch.bfloat16, device=device)
             token = torch.zeros(1, dtype=torch.int64, device=device)
             cases = [
@@ -474,10 +568,17 @@ def run_moe_checks(device, *, bank_factory, synchronize, stage=None, lifetime_it
             ):
                 raise AssertionError("MoE token-only or hidden-only change did not change the eager oracle output")
             report = state.graph_snapshot()
-            if report["captures"] != 1 or report["replays"] != len(cases) or report["stream_bridges"] != len(cases):
+            check_stream_replay_delta(prepared_report, report, len(cases), replay_stream_policy)
+            if report["captures"] != 1 or report["replays"] != len(cases):
                 raise AssertionError("MoE graph recaptured or lacked real replay coverage")
             if runtime._device_route_banks is not eager_banks or report["graph_payload_copy_bytes"] != 0:
                 raise AssertionError("MoE graph replaced the eager banks or copied resident payloads")
+            stream_contract = {"enabled": False}
+            if replay_stream_policy == "caller":
+                stream_contract = {
+                    "enabled": True,
+                    **exercise_stream_policy_checks(state, runtime, templates, synchronize=synchronize),
+                }
             lifetime = {"enabled": False}
             if lifetime_iterations and hash_route and top_k == 6:
                 lifetime = {
@@ -494,7 +595,9 @@ def run_moe_checks(device, *, bank_factory, synchronize, stage=None, lifetime_it
                     "hidden": MOE_WIDTH,
                     "checks": rows,
                     "graph": report,
-                    "production_stream_bridge_verified": True,
+                    "production_replay_stream_verified": True,
+                    "production_stream_bridge_verified": replay_stream_policy == "owner",
+                    "stream_contract": stream_contract,
                     "shared_expert_arithmetic": "original_gate_up_swiglu_down",
                     "queue_lifetime": lifetime,
                 }
@@ -504,19 +607,21 @@ def run_moe_checks(device, *, bank_factory, synchronize, stage=None, lifetime_it
 
 
 def exercise_moe_lifetime(state, runtime, templates, *, synchronize, iterations, stage, observe=memory_observation):
-    """Stress actual production stream bridges, early input release and reuse."""
+    """Stress the selected production stream, early input release and reuse."""
     import torch
 
     if type(iterations) is not int or not QUEUE_MIN_ITERATIONS <= iterations <= QUEUE_MAX_ITERATIONS:
         raise ValueError("MoE lifetime iterations must be bounded in [2049,8192].")
     before = state.graph_snapshot()
+    policy = before["replay_stream_policy"]
     valid = torch.ones((), dtype=torch.bool, device=runtime.device)
     left = torch.arange(16, dtype=torch.float32, device=runtime.device).reshape(1, 16)
     right = torch.eye(16, dtype=torch.float32, device=runtime.device)
     synchronize()
     memory_before = observe(runtime.device)
     preserved = []
-    with stage("moe_production_bridge_lifetime"):
+    phase = f"moe_production_{policy}_lifetime"
+    with stage(phase):
         for iteration in range(iterations):
             hidden, ids, expected = templates[iteration % 2]
             hidden, ids = hidden.clone(), ids.clone()
@@ -532,21 +637,15 @@ def exercise_moe_lifetime(state, runtime, templates, *, synchronize, iterations,
                 preserved.append((output, expected))
             del output, product
             if (iteration + 1) % QUEUE_PROGRESS_INTERVAL == 0 or iteration + 1 == iterations:
-                emit(CASE, "QUEUE_PROGRESS", stage="moe_production_bridge_lifetime", iterations=iteration + 1)
+                emit(CASE, "QUEUE_PROGRESS", stage=phase, iterations=iteration + 1)
     synchronize()
     memory_after = observe(runtime.device)
     if not bool(valid.cpu()):
-        raise AssertionError("Production MoE bridge lifetime changed outputs or validity")
+        raise AssertionError("Production MoE replay lifetime changed outputs or validity")
     for output, expected in preserved:
         exact_tensor(output, expected, "moe_bridge_preserved_output")
     after = state.graph_snapshot()
-    if (
-        after["captures"] != before["captures"]
-        or after["entries"] != 1
-        or after["replays"] - before["replays"] != iterations
-        or after["stream_bridges"] - before["stream_bridges"] != iterations
-    ):
-        raise AssertionError("Production MoE bridge lifetime recaptured or missed replay/stream work")
+    check_stream_replay_delta(before, after, iterations, policy)
     for key in ("allocated_bytes", "reserved_bytes", "rss_bytes"):
         if (
             key in memory_before
@@ -723,6 +822,7 @@ def run_case_child(args):
                 synchronize=sync,
                 stage=stage,
                 lifetime_iterations=args.queue_iterations if args.queue_lifetime else 0,
+                replay_stream_policy=args.graph_replay_stream,
             )
             lifetime = {"enabled": False}
             if args.queue_lifetime:
@@ -747,6 +847,8 @@ def run_case_child(args):
             CASE,
             "CASE_PASS",
             scope=SCOPE,
+            replay_stream_policy=args.graph_replay_stream,
+            low_level_replay_stream_policy="owner",
             checks=checks,
             moe_checks=moe,
             queue_lifetime=lifetime,
@@ -773,6 +875,8 @@ def plan(args):
     return {
         "scope": SCOPE,
         "physical_npu": args.physical_npu,
+        "replay_stream_policy": args.graph_replay_stream,
+        "low_level_replay_stream_policy": "owner",
         "command": child_command(args),
         "synthetic_geometry": {
             "experts": EXPERTS,
@@ -796,7 +900,9 @@ def plan(args):
     }
 
 
-def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITERATIONS):
+def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITERATIONS, replay_stream_policy="owner"):
+    if replay_stream_policy not in ("owner", "caller"):
+        raise ValueError("Unknown graph replay stream policy.")
     receipts = [
         event for event in result.get("events", []) if event.get("case") == CASE and event.get("event") == "CASE_PASS"
     ]
@@ -807,6 +913,8 @@ def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITE
         receipt.get("scope") != SCOPE
         or receipt.get("device_execution_verified") is not True
         or receipt.get("graph_functional_verified") is not True
+        or receipt.get("replay_stream_policy") != replay_stream_policy
+        or receipt.get("low_level_replay_stream_policy") != "owner"
     ):
         raise ValueError("Graph child lacks actual native graph verification.")
     excluded = (
@@ -829,7 +937,8 @@ def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITE
         if row["kind"] == "pipeline":
             invalid.add("nan_hidden")
         if (
-            graph.get("captures") != 1
+            any(type(graph.get(key)) is not int or graph[key] < 0 for key in ("captures", "entries", "replays"))
+            or graph.get("captures") != 1
             or graph.get("entries") != 1
             or graph.get("replays") != len(DYNAMIC_CASE_NAMES)
             or row.get("same_static_addresses") is not True
@@ -856,12 +965,20 @@ def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITE
             names[2:2] = ["same_hidden_token_b", "same_token_hidden_b"]
             names += ["invalid_token", "recover_token", "missing_slot", "recover_slot"]
         if (
-            graph.get("captures") != 1
+            any(
+                type(graph.get(key)) is not int or graph[key] < 0
+                for key in ("captures", "entries", "replays", "owner_replays", "caller_replays", "stream_bridges")
+            )
+            or graph.get("captures") != 1
             or graph.get("entries") != 1
             or graph.get("replays") != len(names)
-            or graph.get("stream_bridges") != len(names)
+            or graph.get("replay_stream_policy") != replay_stream_policy
+            or graph.get("stream_bridges") != (len(names) if replay_stream_policy == "owner" else 0)
+            or graph.get("owner_replays") != (len(names) if replay_stream_policy == "owner" else 0)
+            or graph.get("caller_replays") != (len(names) if replay_stream_policy == "caller" else 0)
             or graph.get("graph_payload_copy_bytes") != 0
-            or row.get("production_stream_bridge_verified") is not True
+            or row.get("production_replay_stream_verified") is not True
+            or row.get("production_stream_bridge_verified") is not (replay_stream_policy == "owner")
             or [check.get("case") for check in checks] != names
             or any(
                 check.get("bit_exact") is not True or check.get("valid") is not (check.get("case") not in invalid)
@@ -869,6 +986,46 @@ def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITE
             )
         ):
             raise ValueError("Graph child lacks production MoE replay/stream/validity evidence.")
+        if replay_stream_policy == "caller":
+            contract = row.get("stream_contract", {})
+            steps = contract.get("steps", [])
+            if (
+                any(
+                    contract.get(key) is not True
+                    for key in (
+                        "enabled",
+                        "wrong_caller_rejected",
+                        "owner_guard_preserved",
+                        "previous_outputs_preserved",
+                        "same_capture",
+                    )
+                )
+                or [step.get("policy") for step in steps] != ["owner", "caller", "owner", "caller"]
+                or any(step.get("bit_exact") is not True for step in steps)
+            ):
+                raise ValueError("Caller graph lacks same-capture switching/stream rejection evidence.")
+            try:
+                previous = graph
+                for step in steps:
+                    start = step.get("before", {})
+                    if any(
+                        start.get(key) != previous.get(key)
+                        for key in (
+                            "captures",
+                            "entries",
+                            "replays",
+                            "owner_replays",
+                            "caller_replays",
+                            "stream_bridges",
+                        )
+                    ):
+                        raise AssertionError("Caller graph switch counters are not continuous")
+                    if step.get("before", {}).get("captures") != 1:
+                        raise AssertionError("Caller graph switch did not preserve the original capture")
+                    check_stream_replay_delta(step.get("before", {}), step.get("after", {}), 1, step["policy"])
+                    previous = step["after"]
+            except AssertionError as error:
+                raise ValueError("Caller graph switch counter evidence is invalid.") from error
         if require_lifetime and row["hash_route"] and row["top_k"] == 6:
             lifetime = row.get("queue_lifetime", {})
             before, after = lifetime.get("graph_before", {}), lifetime.get("graph_after", {})
@@ -877,11 +1034,15 @@ def validate_receipt(result, *, require_lifetime=False, iterations=QUEUE_MIN_ITE
                 or lifetime.get("iterations") != iterations
                 or lifetime.get("all_iteration_checks_passed") is not True
                 or lifetime.get("explicit_per_iteration_synchronize") is not False
+                or before.get("captures") != graph["captures"]
                 or after.get("captures") != before.get("captures")
                 or after.get("replays", -1) - before.get("replays", -1) != iterations
-                or after.get("stream_bridges", -1) - before.get("stream_bridges", -1) != iterations
             ):
                 raise ValueError("Requested production MoE bridge lifetime evidence is missing.")
+            try:
+                check_stream_replay_delta(before, after, iterations, replay_stream_policy)
+            except AssertionError as error:
+                raise ValueError("Requested production MoE lifetime stream evidence is invalid.") from error
     if require_lifetime:
         lifetime = receipt.get("queue_lifetime", {})
         graph = lifetime.get("graph", {})
@@ -927,7 +1088,12 @@ def main(argv=None):
             )
             report["result"] = result
             report["status"] = result["status"]
-            validate_receipt(result, require_lifetime=args.queue_lifetime, iterations=args.queue_iterations)
+            validate_receipt(
+                result,
+                require_lifetime=args.queue_lifetime,
+                iterations=args.queue_iterations,
+                replay_stream_policy=args.graph_replay_stream,
+            )
             report.update(status="PASS", device_execution_verified=True, graph_functional_verified=True)
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED"

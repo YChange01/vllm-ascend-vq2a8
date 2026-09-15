@@ -161,6 +161,74 @@ def test_graph_plan_uses_same_engine_device_route_eager_no_v1_load(tmp_path):
     assert "batched" not in {mode for _, _, mode in schedule}
 
 
+def test_caller_graph_plan_compares_existing_graph_without_an_extra_model_load(tmp_path):
+    args = arguments(
+        tmp_path, "--device-route-decode", "--decode-graph", "moe", "--graph-replay-stream", "caller", "--plan-only"
+    )
+    steps = dict(accept.commands(args, tmp_path / "report"))
+    assert "v1_reference" not in steps
+    for name in ("graph_preflight", "v4"):
+        command = steps[name]
+        assert command[command.index("--graph-replay-stream") + 1] == "caller"
+    assert benchmark.parse_args(steps["v4"][3:]).graph_replay_stream == "caller"
+    schedule = list(
+        benchmark.request_schedule(2, 5, device_route_decode=True, decode_graph="moe", graph_replay_stream="caller")
+    )
+    assert schedule[:4] == [
+        ("warmup", 0, "moe_graph"),
+        ("warmup", 0, "moe_graph_caller"),
+        ("warmup", 1, "moe_graph_caller"),
+        ("warmup", 1, "moe_graph"),
+    ]
+    assert schedule[4:8] == [
+        ("measured", 0, "moe_graph"),
+        ("measured", 0, "moe_graph_caller"),
+        ("measured", 1, "moe_graph_caller"),
+        ("measured", 1, "moe_graph"),
+    ]
+    assert {mode for _, _, mode in schedule} == {"moe_graph", "moe_graph_caller"}
+    for mode in benchmark.GRAPH_OPTIMIZATIONS:
+        assert sum(kind == "measured" and actual == mode for kind, _, actual in schedule) == 5
+
+
+@pytest.mark.parametrize("extra", [[], ["--device-route-decode"], ["--decode-graph", "moe"]])
+@pytest.mark.parametrize("worker", [False, True])
+def test_caller_graph_requires_explicit_moe_and_device_route(tmp_path, extra, worker):
+    required = ["--library", "fake.so", "--preflight", "preflight.json", "--output-dir", str(tmp_path)]
+    with pytest.raises(SystemExit):
+        if worker:
+            benchmark.parse_args([*required, *extra, "--graph-replay-stream", "caller"])
+        else:
+            arguments(tmp_path, *extra, "--graph-replay-stream", "caller")
+
+
+@pytest.mark.parametrize(
+    "mode,policy,enabled",
+    [("moe_graph", "owner", True), ("moe_graph_caller", "caller", True), ("device_route_decode", "owner", False)],
+)
+def test_same_engine_graph_configuration_only_switches_policy_and_enable_between_requests(
+    monkeypatch, mode, policy, enabled
+):
+    from tools import benchmark_vq2a8_offline
+
+    calls = []
+    model = SimpleNamespace(
+        set_v4_graph_replay_stream=lambda value: calls.append(("policy", value)),
+        set_v4_graph_enabled=lambda value: calls.append(("enabled", value)),
+    )
+    worker = SimpleNamespace(get_model=lambda: model)
+    llm = SimpleNamespace(collective_rpc=lambda func, args: [func(worker, *args)])
+    monkeypatch.setattr(
+        benchmark_vq2a8_offline, "configure", lambda *args, **kwargs: calls.append(("configure", kwargs))
+    )
+    benchmark.configure_v4(llm, measurement=True, optimization=mode, graph_available=True)
+    assert calls == [
+        ("configure", {"measurement": True, "compact": True, "optimization": "device_route_decode"}),
+        ("policy", policy),
+        ("enabled", enabled),
+    ]
+
+
 def test_graph_case_matrix_includes_singleton_prefill(tmp_path):
     args = arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--cases", "1:4,10:4")
     steps = dict(accept.commands(args, tmp_path / "report"))
@@ -179,7 +247,7 @@ def test_graph_plan_rejects_wrong_baseline(tmp_path, extra):
         arguments(tmp_path, "--decode-graph", "moe", *extra)
 
 
-def graph_activity(enabled=True):
+def graph_activity(enabled=True, replay_stream="owner"):
     before = {
         str(i): {
             "ready": True,
@@ -187,6 +255,12 @@ def graph_activity(enabled=True):
             "captures": 1,
             "entries": 1,
             "replays": 10,
+            "owner_replays": 7,
+            "caller_replays": 3,
+            "stream_bridges": 7,
+            "owner_stream": 10 + i,
+            "replay_stream": 0,
+            "replay_stream_policy": replay_stream,
             "signature": {"shape": [1, 4096]},
         }
         for i in range(benchmark.LAYERS)
@@ -194,15 +268,20 @@ def graph_activity(enabled=True):
     after = copy.deepcopy(before)
     for record in after.values():
         record["replays"] += 3 if enabled else 0
+        record[replay_stream + "_replays"] += 3 if enabled else 0
+        record["stream_bridges"] += 3 if enabled and replay_stream == "owner" else 0
     return before, after
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_graph_evidence_excludes_prefill_and_captures(enabled):
-    before, after = graph_activity(enabled)
-    evidence = benchmark.check_graph_activity(before, after, 4, enabled=enabled)
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_graph_evidence_excludes_prefill_and_captures(enabled, policy):
+    before, after = graph_activity(enabled, policy)
+    evidence = benchmark.check_graph_activity(before, after, 4, enabled=enabled, replay_stream=policy)
     assert evidence["per_layer_decode_replays"] == (3 if enabled else 0)
     assert evidence["measured_capture_delta"] == 0 and not evidence["full_model_graph_verified"]
+    assert evidence["replay_stream_policy"] == policy
+    assert evidence["per_layer_stream_bridges"] == (3 if enabled and policy == "owner" else 0)
 
 
 @pytest.mark.parametrize(
@@ -227,12 +306,54 @@ def test_graph_evidence_fails_closed_for_fallback_recapture_or_stale_state(key, 
         benchmark.check_graph_activity(before, after, 4)
 
 
-def graph_receipt():
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("owner_replays", 8),
+        ("caller_replays", 3),
+        ("caller_replays", True),
+        ("stream_bridges", 8),
+        ("replay_stream_policy", "owner"),
+        ("replay_stream", 1),
+        ("replay_stream", None),
+        ("owner_stream", False),
+    ],
+)
+def test_caller_graph_evidence_rejects_owner_fallback_bridge_or_wrong_stream(field, value):
+    before, after = graph_activity(replay_stream="caller")
+    after["42"][field] = value
+    with pytest.raises(ValueError):
+        benchmark.check_graph_activity(before, after, 4, replay_stream="caller")
+
+
+def test_caller_graph_metrics_never_mix_owner_baseline_or_warmups():
+    samples = [
+        {
+            "case": "p1-o4",
+            "kind": kind,
+            "optimization": mode,
+            **dict.fromkeys(("ttft_s", "tpot_s", "e2e_s", "output_tokens_per_s", "device_span_ms"), value),
+        }
+        for kind, mode, value in (
+            ("warmup", "moe_graph_caller", 5),
+            ("measured", "moe_graph", 0.108),
+            ("measured", "moe_graph_caller", 0.09),
+            ("measured", "moe_graph_caller", 0.092),
+        )
+    ]
+    assert benchmark.measured_metrics(samples, "p1-o4", "moe_graph")["tpot_s"]["median"] == 0.108
+    assert benchmark.measured_metrics(samples, "p1-o4", "moe_graph_caller")["tpot_s"]["median"] == pytest.approx(0.091)
+    assert benchmark.graph_ratio_key("caller") == "tpot_ratio_vs_same_engine_moe_graph_owner"
+
+
+def graph_receipt(replay_stream="owner"):
     samples = []
     for kind, count in (("warmup", 2), ("measured", 5)):
-        for mode in ("device_route_decode", "moe_graph"):
+        for mode in benchmark.graph_comparison_modes(replay_stream):
             for repeat in range(count):
-                before, after = graph_activity(mode == "moe_graph")
+                before, after = graph_activity(
+                    mode in benchmark.GRAPH_OPTIMIZATIONS, benchmark.graph_replay_policy(mode)
+                )
                 samples.append(
                     dict(
                         case="p10-o4",
@@ -251,6 +372,31 @@ def graph_receipt():
 
 def test_graph_supervisor_rechecks_layer_evidence_for_both_modes(tmp_path):
     accept.check_graph_receipt(graph_receipt(), arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe"))
+
+
+def test_caller_supervisor_requires_replay_for_both_graph_modes(tmp_path):
+    args = arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--graph-replay-stream", "caller")
+    accept.check_graph_receipt(graph_receipt("caller"), args)
+    with pytest.raises(ValueError):
+        accept.check_graph_receipt(graph_receipt("owner"), args)
+
+
+@pytest.mark.parametrize("mutation", ["baseline_eager", "baseline_stale", "candidate_owner", "candidate_bridges"])
+def test_caller_supervisor_rejects_wrong_graph_policy_receipts(tmp_path, mutation):
+    result = graph_receipt("caller")
+    if mutation == "baseline_eager":
+        result["samples"][0]["optimization"] = "device_route_decode"
+    elif mutation == "baseline_stale":
+        result["samples"][0]["graph_after"] = result["samples"][0]["graph_before"]
+    elif mutation == "candidate_owner":
+        result["samples"][-1]["graph_after"]["0"]["replay_stream_policy"] = "owner"
+    else:
+        result["samples"][-1]["graph_after"]["0"]["stream_bridges"] += 1
+    with pytest.raises(ValueError):
+        accept.check_graph_receipt(
+            result,
+            arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--graph-replay-stream", "caller"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -615,6 +761,68 @@ def test_supervisor_prints_actual_case_medians_and_transfer_evidence(monkeypatch
     assert accept.run(arguments(tmp_path)) == 0
     output = capsys.readouterr().out
     assert '"tpot_median_s": 0.25' in output and '"expert_payload_h2d_bytes_per_request": 0' in output
+
+
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+@pytest.mark.parametrize(
+    "failure", [None, "wrong_policy", "wrong_baseline", "wrong_candidate", "layer_policy", "bridge"]
+)
+def test_graph_supervisor_reports_selected_policy_comparison_only(monkeypatch, tmp_path, capsys, policy, failure):
+    monkeypatch.setattr(accept.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(accept, "require_idle_device", lambda *a: {"state": "idle"})
+    baseline, candidate = benchmark.graph_comparison_modes(policy)
+    receipt = graph_receipt(policy)
+    receipt.update(
+        status="PASS",
+        execution_policy="ascendc_v4",
+        performance_measurement_verified=True,
+        optimization=candidate,
+        baseline_mode=baseline,
+        graph_comparison="PASS",
+        graph_functional_verified=True,
+        effective_graph_mode="moe",
+        effective_graph_replay_stream=policy,
+        full_model_graph_verified=False,
+        v1_comparison="NOT_RUN",
+    )
+    receipt["cases"]["p10-o4"].update(
+        metrics={key: {"median": value} for key, value in (("ttft_s", 0.2), ("tpot_s", 0.09), ("e2e_s", 0.47))},
+        baseline_metrics={"tpot_s": {"median": 0.108}},
+        **{benchmark.graph_ratio_key(policy): 0.09 / 0.108},
+    )
+    for sample in receipt["samples"]:
+        sample["expert_payload_h2d_bytes"] = 0
+    if failure == "wrong_policy":
+        receipt["effective_graph_replay_stream"] = "caller" if policy == "owner" else "owner"
+    elif failure == "wrong_baseline":
+        receipt["baseline_mode"] = "batched"
+    elif failure == "wrong_candidate":
+        receipt["optimization"] = "device_route_decode"
+    elif failure == "layer_policy":
+        receipt["samples"][-1]["graph_after"]["0"]["replay_stream_policy"] = "invalid"
+    elif failure == "bridge":
+        receipt["samples"][-1]["graph_after"]["0"]["stream_bridges"] += 1
+
+    def supervise(command, log, env, seconds):
+        if log.stem == "v4":
+            directory = log.parent / "v4"
+            directory.mkdir()
+            (directory / "summary.json").write_text(json.dumps(receipt), encoding="utf-8")
+        return {"exit": 0, "timeout": False, "log": str(log)}
+
+    monkeypatch.setattr(accept, "supervise", supervise)
+    args = arguments(tmp_path, "--device-route-decode", "--decode-graph", "moe", "--graph-replay-stream", policy)
+    assert accept.run(args) == int(failure is not None)
+    output = capsys.readouterr().out
+    report = json.loads((tmp_path / "report/run.json").read_text(encoding="utf-8"))
+    if failure is None:
+        assert report["performance_measurement_verified"] is True
+        assert report["baseline_mode"] == baseline and report["effective_graph_replay_stream"] == policy
+        assert f'"candidate_mode": "{candidate}"' in output and f'"baseline_mode": "{baseline}"' in output
+        assert '"same_engine_baseline_tpot_median_s": 0.108' in output
+    else:
+        assert report["status"] == "FAIL" and not report["performance_measurement_verified"]
+        assert "V4_RESULT " not in output
 
 
 @pytest.mark.parametrize("failure", [None, "global", "exact", "baseline", "candidate", "transfer"])

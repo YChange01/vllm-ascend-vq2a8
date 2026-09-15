@@ -39,11 +39,13 @@ class FakeGraph:
         self.backend = backend
         self.compute = self.outputs = None
         self.replays = self.resets = 0
+        self.replay_streams = []
 
     def replay(self):
         if self.backend.fail_replay:
             raise RuntimeError("injected replay failure")
         self.replays += 1
+        self.replay_streams.append(self.backend.current.npu_stream)
         # This models static device destinations, but cannot emulate native
         # queue/allocator behavior. Real NPU graph tests are a separate gate.
         for destination, value in zip(self.outputs, self.compute()):
@@ -64,10 +66,18 @@ class FakeBackend:
         self.graphs = []
         self.capture_entries = 0
         self.fail_capture = self.fail_replay = self.fail_reset = False
+        self.synchronizations = 0
+        self.fail_synchronize = False
 
     def current_stream(self, device):
         assert device == torch.device("cpu")
         return self.current
+
+    def synchronize(self, device):
+        assert device == torch.device("cpu")
+        if self.fail_synchronize:
+            raise RuntimeError("injected device synchronize failure")
+        self.synchronizations += 1
 
     def Stream(self, *, device):
         assert device == torch.device("cpu")
@@ -138,6 +148,37 @@ def prepared_graph():
     hidden, tokens = inputs()
     graph.prepare(compute, hidden, tokens)
     return backend, graph, compute
+
+
+def prepared_caller_graph():
+    backend = FakeBackend()
+    caller = backend.current
+    capture = backend.Stream(device=torch.device("cpu"))
+    graph = V4MoEDecodeGraph("cpu", backend=backend)
+    compute = ObservedCompute(backend)
+    with backend.stream(capture):
+        graph.prepare(compute, *inputs(), replay_stream=caller)
+    return backend, graph, compute
+
+
+def prepared_state(monkeypatch, *, policy="owner"):
+    runtime, hidden = make_runtime(hash_route=True)
+    configure_runtime(runtime, "device_route_decode")
+    state, backend = runtime._optimization, FakeBackend()
+    real_compute = DeviceRouteGraphCompute
+
+    def wrapped_compute(current, *, banks=None):
+        compute = real_compute(current, banks=banks)
+        observed = ObservedCompute(backend, compute)
+        observed.signature = compute.signature
+        observed.check_runtime_contract = compute.check_runtime_contract
+        return observed
+
+    monkeypatch.setattr("vllm_ascend.quantization.vq2a8_v4_device_route.DeviceRouteGraphCompute", wrapped_compute)
+    metadata = {**runtime._device_route_banks, "metadata_bytes": 512}
+    monkeypatch.setattr("vllm_ascend.quantization.vq2a8_v4_device_route.create_device_route_banks", lambda _: metadata)
+    state.prepare_graph(runtime, backend=backend, replay_stream_policy=policy)
+    return runtime, hidden, state, backend
 
 
 def test_explicit_prepare_only_and_dynamic_replay_preserves_old_output_and_valid():
@@ -484,4 +525,211 @@ def test_replay_has_bounded_owned_storage_under_long_cpu_protocol_stress():
     assert graph.owners is owners
     assert graph.captures == len(backend.graphs) == 1 and graph.replays == 2049
     assert backend.current.synchronizations == 2
+    graph.close()
+
+
+def test_caller_replay_uses_bound_stream_preserves_outputs_and_owner_baseline():
+    backend, graph, compute = prepared_caller_graph()
+    addresses = tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    retained = []
+    for policy, token in (("caller", 2), ("owner", -1), ("caller", 3), ("owner", 2)):
+        # Direct core API requires this boundary when changing the replay stream.
+        graph._fence_streams()
+        stream = graph.replay_stream if policy == "caller" else graph.stream
+        hidden, tokens = inputs(token, torch.int32)
+        with backend.stream(stream):
+            actual = graph.replay(hidden, tokens, stream_policy=policy)
+        expected = compute.evaluate(hidden, tokens)
+        assert all(torch.equal(a, e) for a, e in zip(actual, expected))
+        retained.append((actual, tuple(value.clone() for value in expected)))
+    assert all(torch.equal(a, e) for actual, expected in retained for a, e in zip(actual, expected))
+    assert addresses == tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    report = graph.snapshot()
+    assert report["owner_stream"] == 29 and report["replay_stream"] == 19
+    assert report["owner_replays"] == report["caller_replays"] == 2
+    assert report["replays"] == 4 and report["captures"] == 1
+    assert backend.graphs[0].replay_streams == [19, 29, 19, 29]
+    graph.close()
+
+
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_core_wrong_bound_replay_stream_rejects_before_submission(policy):
+    backend, graph, _ = prepared_caller_graph()
+    backend.current = FakeStream(77)
+    before = graph.snapshot()
+    with pytest.raises(RuntimeError, match=f"bound {policy} stream"):
+        graph.replay(*inputs(), stream_policy=policy)
+    assert before == graph.snapshot()
+    assert not graph.failed and backend.graphs[0].replays == 0
+    graph.close()
+
+
+def test_core_rejects_unknown_replay_policy_and_wrong_device_caller():
+    backend, graph, _ = prepared_caller_graph()
+    with pytest.raises(ValueError, match="owner or caller"):
+        graph.replay(*inputs(), stream_policy="auto")
+    assert graph.replay_attempts == 0 and not graph.failed
+    graph.close()
+    graph = V4MoEDecodeGraph("cpu", backend=backend)
+    caller = FakeStream(77)
+    caller.device = torch.device("meta")
+    with pytest.raises(ValueError, match="graph device"):
+        graph.prepare(ObservedCompute(backend), *inputs(), replay_stream=caller)
+    assert graph.graph is None and not graph.prepared
+
+
+@pytest.mark.parametrize("failing_stream", ["owner", "caller"])
+def test_close_fences_both_streams_and_keeps_pool_on_either_failure(failing_stream):
+    backend, graph, _ = prepared_caller_graph()
+    graph.replay(*inputs(), stream_policy="caller")
+    target = graph.stream if failing_stream == "owner" else graph.replay_stream
+    target.fail_sync = True
+    owners = graph.owners
+    with pytest.raises(RuntimeError, match="synchronize failure"):
+        graph.close()
+    assert graph.owners is owners and graph.graph is not None and graph.output is not None
+    assert backend.graphs[0].resets == 0
+    target.fail_sync = False
+    graph.close()
+    assert graph.stream.synchronizations >= 3  # Two preparation fences and close.
+    assert graph.replay_stream.synchronizations >= 1
+    assert backend.graphs[0].resets == 1 and graph.closed
+
+
+@pytest.mark.parametrize("initial_policy", ["owner", "caller"])
+def test_state_switches_same_graph_and_fences_only_policy_changes(monkeypatch, initial_policy):
+    runtime, hidden, state, backend = prepared_state(monkeypatch, policy=initial_policy)
+    graph = state._decode_graph
+    eager_banks, captured_banks = runtime._device_route_banks, state._graph_banks
+    pointers = tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    previous = []
+    records = []
+    monkeypatch.setattr(
+        "vllm_ascend.quantization.vq2a8_v4_device_route._record_tensor_stream",
+        lambda tensor, stream: records.append(stream.npu_stream),
+    )
+    for policy, token in (("owner", 0), ("caller", 1), ("caller", 0), ("owner", 1)):
+        old = state.graph_snapshot()["replay_stream_policy"]
+        fences = graph.stream.synchronizations, graph.replay_stream.synchronizations
+        device_fences = backend.synchronizations
+        state.set_graph_replay_stream(policy)
+        delta = int(old != policy)
+        assert (graph.stream.synchronizations, graph.replay_stream.synchronizations) == tuple(f + delta for f in fences)
+        assert backend.synchronizations == device_fences + delta
+        expected = DeviceRouteGraphCompute(runtime)(hidden, torch.tensor([token]))[0]
+        before_waits = list(graph.stream.waits), list(graph.replay_stream.waits)
+        before_records = len(records)
+        before_fences = graph.stream.synchronizations, graph.replay_stream.synchronizations
+        before_device_fences = backend.synchronizations
+        with no_host_tensor_reads(monkeypatch):
+            output = state.forward_graph(runtime, hidden, torch.tensor([token], dtype=torch.int32))
+        assert torch.equal(output, expected) and bool(state.valid)
+        assert before_fences == (graph.stream.synchronizations, graph.replay_stream.synchronizations)
+        assert before_device_fences == backend.synchronizations
+        if policy == "caller":
+            assert before_waits == (graph.stream.waits, graph.replay_stream.waits)
+            assert before_records == len(records)
+        previous.append((output, expected.clone()))
+    assert all(torch.equal(actual, expected) for actual, expected in previous)
+    assert pointers == tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    assert runtime._device_route_banks is eager_banks and state._graph_banks is captured_banks
+    report = state.graph_snapshot()
+    assert report["captures"] == report["entries"] == report["pool_count"] == 1
+    assert report["owner_replays"] == report["caller_replays"] == report["stream_bridges"] == 2
+    assert backend.graphs[0].replay_streams == [29, 19, 19, 29]
+    assert records == [29, 29, 19, 19] * 2
+    state.close_graph()
+
+
+def test_state_caller_mode_rejects_unbound_stream_without_latching(monkeypatch):
+    runtime, hidden, state, backend = prepared_state(monkeypatch, policy="caller")
+    caller = backend.current
+    backend.current = FakeStream(77)
+    before = state.graph_snapshot()
+    with pytest.raises(RuntimeError, match="bound caller stream"):
+        state.forward_graph(runtime, hidden, torch.tensor([0]))
+    assert before == state.graph_snapshot() and not state._decode_graph.failed
+    backend.current = caller
+    state.forward_graph(runtime, hidden, torch.tensor([0]))
+    assert state.graph_snapshot()["caller_replays"] == 1
+    assert state.graph_snapshot()["stream_bridges"] == 0
+    state.close_graph()
+
+
+def test_state_switch_from_third_stream_owner_call_fences_device_without_rebinding(monkeypatch):
+    runtime, hidden, state, backend = prepared_state(monkeypatch)
+    caller = backend.current
+    third_stream = FakeStream(77)
+    with backend.stream(third_stream):
+        state.forward_graph(runtime, hidden, torch.tensor([0]))
+    assert backend.synchronizations == 0
+    state.set_graph_replay_stream("caller")
+    assert backend.synchronizations == 1
+    assert state.graph_snapshot()["replay_stream"] == caller.npu_stream
+    state.forward_graph(runtime, hidden, torch.tensor([1]))
+    assert bool(state.valid)
+    assert state.graph_snapshot()["stream_bridges"] == 1
+    assert state.graph_snapshot()["caller_replays"] == state.graph_snapshot()["owner_replays"] == 1
+    state.close_graph()
+
+
+def test_state_replay_policy_rejects_before_ready_during_capture_and_after_close(monkeypatch):
+    runtime, _ = make_runtime()
+    configure_runtime(runtime, "device_route_decode")
+    state = runtime._optimization
+    with pytest.raises(RuntimeError, match="Prepare"):
+        state.set_graph_replay_stream("caller")
+    with pytest.raises(ValueError, match="owner or caller"):
+        state.prepare_graph(runtime, backend=FakeBackend(), replay_stream_policy="auto")
+    assert not state._graph_started
+    _, _, state, backend = prepared_state(monkeypatch)
+    with pytest.raises(ValueError, match="owner or caller"):
+        state.set_graph_replay_stream("auto")
+    backend.capturing = object()
+    with pytest.raises(RuntimeError, match="outside another capture"):
+        state.set_graph_replay_stream("caller")
+    backend.capturing = None
+    assert not state._decode_graph.failed
+    state.close_graph()
+    with pytest.raises(RuntimeError, match="closed or closing"):
+        state.set_graph_replay_stream("caller")
+
+
+@pytest.mark.parametrize("failing_stream", ["owner", "caller", "device"])
+def test_state_policy_switch_failure_keeps_old_policy_and_every_owner(monkeypatch, failing_stream):
+    _, _, state, backend = prepared_state(monkeypatch)
+    graph = state._decode_graph
+    target = graph.stream if failing_stream == "owner" else graph.replay_stream
+    backend.fail_synchronize = failing_stream == "device"
+    target.fail_sync = failing_stream != "device"
+    owners, banks = graph.owners, state._graph_banks
+    with pytest.raises(RuntimeError, match="synchronize failure"):
+        state.set_graph_replay_stream("caller")
+    assert state.graph_snapshot()["replay_stream_policy"] == "owner"
+    assert graph.failed and graph.owners is owners and state._graph_banks is banks
+    with pytest.raises(RuntimeError, match="previously failed"):
+        state.set_graph_replay_stream("owner")
+    target.fail_sync = backend.fail_synchronize = False
+    state.close_graph()
+
+
+def test_caller_replay_protocol_stress_keeps_static_owners_and_prior_outputs(monkeypatch):
+    backend, graph, compute = prepared_caller_graph()
+    owners = graph.owners
+    addresses = tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    preserved = []
+    with no_host_tensor_reads(monkeypatch):
+        for index in range(2049):
+            hidden, tokens = inputs(index % 2, torch.int32)
+            output, valid = graph.replay(hidden, tokens, stream_policy="caller")
+            if index % 512 == 0:
+                preserved.append(((output, valid), compute.evaluate(hidden, tokens)))
+            del hidden, tokens, output, valid
+    assert all(torch.equal(a, e) for actual, expected in preserved for a, e in zip(actual, expected))
+    assert graph.owners is owners
+    assert addresses == tuple(t.data_ptr() for t in (graph.hidden, graph.input_ids, graph.output, graph.valid))
+    assert graph.caller_replays == graph.replays == 2049 and graph.owner_replays == 0
+    assert graph.captures == len(backend.graphs) == 1
+    assert graph.stream.synchronizations == 2 and graph.replay_stream.synchronizations == 0
+    assert backend.graphs[0].replay_streams == [19] * 2049
     graph.close()

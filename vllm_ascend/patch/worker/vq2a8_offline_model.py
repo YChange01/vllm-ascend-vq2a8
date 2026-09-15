@@ -169,6 +169,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
+        self._v4_requested_replay_stream = options.get("v4_graph_replay_stream", "owner")
+        self._v4_graph_replay_stream = "owner"
         self._v4_graphs_ready = False
         self._v4_graphs_failed = False
         self._v4_graph_enabled = False
@@ -303,6 +305,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 )
             torch.npu.synchronize()
             self._v4_graphs_ready = True
+            self.set_v4_graph_replay_stream(self._v4_requested_replay_stream)
             self.set_v4_graph_enabled(True)
         except Exception:
             self._v4_graphs_ready = False
@@ -346,12 +349,41 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_graph_enabled = enabled
         return self.v4_graph_report()
 
+    def set_v4_graph_replay_stream(self, policy):
+        """Same captured graphs, different submission stream, between requests.
+
+        The device fence covers all layers and any graph-output consumers.
+        Never switch ownership while previous static-buffer work is pending.
+        """
+        if policy not in ("owner", "caller"):
+            raise ValueError("V4 graph replay stream must be owner or caller.")
+        if self._v4_graphs_failed or self._v4_graph_forward_active:
+            raise RuntimeError("V4 graph replay stream can only change on a healthy idle model.")
+        if self._v4_decode_graph != "moe" or not self._v4_graphs_ready:
+            raise RuntimeError("Prepare V4 MoE graphs before selecting the replay stream.")
+        if policy == self._v4_graph_replay_stream:
+            return self.v4_graph_report()
+        try:
+            torch.npu.synchronize()
+            for layer in self.model.offline_owner.layers.values():
+                layer.set_v4_graph_replay_stream(policy)
+            self._v4_graph_replay_stream = policy
+        except Exception:
+            # Do not serve with a partially changed set of layer policies.
+            self._v4_graphs_failed = True
+            raise
+        return self.v4_graph_report()
+
     def v4_graph_report(self):
         return {
             "requested_graph_mode": self._v4_decode_graph,
             "effective_graph_mode": "moe" if self._v4_graph_enabled else "none",
+            "requested_replay_stream_policy": self._v4_requested_replay_stream,
+            "replay_stream_policy": self._v4_graph_replay_stream,
             "graph_scope": "V4_TP1_B1_MOE_DECODE1_ONLY",
-            "baseline_mode": "device_route_decode_eager",
+            "baseline_mode": (
+                "moe_graph_owner" if self._v4_requested_replay_stream == "caller" else "device_route_decode_eager"
+            ),
             "ready": self._v4_graphs_ready,
             "failed": self._v4_graphs_failed,
             "full_model_graph_verified": False,

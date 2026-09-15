@@ -66,6 +66,37 @@ def test_moe_graph_options_are_explicit_and_keep_engine_eager(tmp_path):
     assert "v4_decode_graph" not in engine_options(tmp_path)["additional_config"]["vq2a8_offline"]
 
 
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_graph_replay_stream_round_trips_with_unchanged_memory_and_topology(tmp_path, policy):
+    plan = engine_options(tmp_path, v4_device_route_decode=True, v4_decode_graph="moe", v4_graph_replay_stream=policy)
+    cfg = config(tmp_path)
+    cfg.additional_config = plan["additional_config"]
+    cfg.cache_config.kv_cache_memory_bytes = plan["kv_cache_memory_bytes"]
+    assert offline.validate_offline_config(cfg)["v4_graph_replay_stream"] == policy
+    assert plan["enforce_eager"] and plan["compilation_config"] == {"mode": 0, "cudagraph_mode": "NONE"}
+    assert plan["kv_cache_memory_bytes"] == 1024**3
+    assert "v4_graph_replay_stream" not in engine_options(tmp_path)["additional_config"]["vq2a8_offline"]
+
+
+@pytest.mark.parametrize("policy", [None, True, False, 1, "auto", "default"])
+def test_bad_graph_replay_stream_rejected_at_both_config_entrypoints(tmp_path, policy):
+    with pytest.raises(ValueError, match="v4_graph_replay_stream"):
+        engine_options(tmp_path, v4_device_route_decode=True, v4_decode_graph="moe", v4_graph_replay_stream=policy)
+    cfg = config(tmp_path)
+    cfg.additional_config["vq2a8_offline"]["v4_graph_replay_stream"] = policy
+    with pytest.raises(ValueError, match="v4_graph_replay_stream"):
+        offline.validate_offline_config(cfg)
+
+
+def test_caller_replay_requires_moe_graph(tmp_path):
+    with pytest.raises(ValueError, match="caller requires"):
+        engine_options(tmp_path, v4_graph_replay_stream="caller")
+    cfg = config(tmp_path)
+    cfg.additional_config["vq2a8_offline"]["v4_graph_replay_stream"] = "caller"
+    with pytest.raises(ValueError, match="caller requires"):
+        offline.validate_offline_config(cfg)
+
+
 @pytest.mark.parametrize("kv", [None, True, 0, -1, 17 * 1024**3])
 def test_graph_requires_explicit_kv_covered_by_existing_reserve(tmp_path, kv):
     cfg = config(tmp_path)

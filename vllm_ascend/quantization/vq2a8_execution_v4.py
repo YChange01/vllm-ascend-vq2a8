@@ -240,6 +240,13 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
             raise ValueError("V4 graph phase must be an explicit boolean.")
         self._v4_graph_is_decode = is_decode
 
+    def set_v4_graph_replay_stream(self, policy):
+        """Change only at a fenced model request boundary; no new capture."""
+        self._require_ready()
+        if self._v4_graph_state is None:
+            raise RuntimeError("Prepare V4 MoE graph before selecting its replay stream.")
+        self._v4_graph_state.set_graph_replay_stream(policy)
+
     def set_v4_graph_enabled(self, enabled: bool):
         if type(enabled) is not bool:
             raise ValueError("V4 graph enabled must be boolean.")

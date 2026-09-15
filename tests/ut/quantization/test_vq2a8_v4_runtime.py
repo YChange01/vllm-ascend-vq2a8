@@ -97,6 +97,21 @@ class FakeGraphState:
         self.closed = True
 
 
+def test_replay_stream_selection_delegates_to_existing_prepared_state(runtime):
+    initialize(runtime)
+    with pytest.raises(RuntimeError, match="Prepare V4"):
+        runtime.set_v4_graph_replay_stream("caller")
+    runtime._optimization = state = FakeGraphState()
+    runtime.prepare_v4_graph()
+    selected = []
+    state.set_graph_replay_stream = selected.append
+    runtime.set_v4_graph_replay_stream("caller")
+    runtime.set_v4_graph_replay_stream("owner")
+    assert selected == ["caller", "owner"]
+    assert runtime._v4_graph_state is state and state.prepared
+    assert runtime.cache_loads == len(runtime.layer.expert_ids)
+
+
 def test_graph_requires_explicit_prepare_and_semantic_decode(runtime, monkeypatch):
     initialize(runtime)
     with pytest.raises(RuntimeError, match="not prepared"):

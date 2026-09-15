@@ -7,6 +7,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -75,6 +76,7 @@ def test_graph_probe_defaults_and_child_command_are_small_and_isolated():
     args = tool.parse_args([])
     assert args.physical_npu == 1 and args.timeout_s == 300
     assert args.launch_blocking == "0" and not args.queue_lifetime
+    assert args.graph_replay_stream == "owner"
     assert args.queue_iterations == 2049
     command = tool.child_command(args)
     assert command[:2] == [sys.executable, "-u"] and "--child" in command
@@ -96,6 +98,7 @@ def test_graph_probe_defaults_and_child_command_are_small_and_isolated():
         ["--queue-iterations", "8193"],
         ["--queue-iterations", "2050"],
         ["--child", "--plan-only"],
+        ["--graph-replay-stream", "automatic"],
     ],
 )
 def test_probe_rejects_unsupported_inputs_before_execution(args):
@@ -104,7 +107,8 @@ def test_probe_rejects_unsupported_inputs_before_execution(args):
     assert error.value.code == 2
 
 
-def test_plan_only_never_imports_torch_or_vllm_or_creates_reports(tmp_path):
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_plan_only_never_imports_torch_or_vllm_or_creates_reports(tmp_path, policy):
     script = REPO / "tools/validate_vq2a8_v4_graph.py"
     target = tmp_path / "must-not-exist"
     code = (
@@ -115,12 +119,14 @@ def test_plan_only_never_imports_torch_or_vllm_or_creates_reports(tmp_path):
         "  raise AssertionError('unexpected runtime import: '+name)\n"
         " return original(name,*args,**kwargs)\n"
         "builtins.__import__=guarded\n"
-        f"sys.argv=[{str(script)!r},'--plan-only','--queue-lifetime','--report-dir',{str(target)!r}]\n"
+        f"sys.argv=[{str(script)!r},'--plan-only','--queue-lifetime','--report-dir',{str(target)!r},"
+        f"'--graph-replay-stream',{policy!r}]\n"
         f"runpy.run_path({str(script)!r},run_name='__main__')\n"
     )
     result = subprocess.run([sys.executable, "-c", code], cwd=REPO, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
+    assert report["replay_stream_policy"] == policy
     assert report["physical_npu"] == 1 and report["queue_lifetime"]["iterations_per_phase"] == 2049
     for name in (
         "device_execution_verified",
@@ -307,7 +313,27 @@ def test_lifetime_cpu_orchestration_has_no_loop_host_reads_or_fences(monkeypatch
     assert result["performance_verified"] is False
 
 
-def receipt():
+def switch_receipt(initial):
+    current = dict(initial)
+    steps = []
+    for policy in ("owner", "caller", "owner", "caller"):
+        current["replay_stream_policy"] = policy
+        before = dict(current)
+        current["replays"] += 1
+        current[f"{policy}_replays"] += 1
+        current["stream_bridges"] += int(policy == "owner")
+        steps.append({"policy": policy, "before": before, "after": dict(current), "bit_exact": True})
+    return {
+        "enabled": True,
+        "wrong_caller_rejected": True,
+        "owner_guard_preserved": True,
+        "previous_outputs_preserved": True,
+        "same_capture": True,
+        "steps": steps,
+    }
+
+
+def receipt(policy="owner"):
     low = [
         {
             "k": k,
@@ -336,18 +362,24 @@ def receipt():
         if hashed:
             names[2:2] = ["same_hidden_token_b", "same_token_hidden_b"]
             names += ["invalid_token", "recover_token", "missing_slot", "recover_slot"]
+        graph = {
+            "captures": 1,
+            "entries": 1,
+            "replays": len(names),
+            "replay_stream_policy": policy,
+            "stream_bridges": len(names) if policy == "owner" else 0,
+            "owner_replays": len(names) if policy == "owner" else 0,
+            "caller_replays": len(names) if policy == "caller" else 0,
+            "graph_payload_copy_bytes": 0,
+        }
         moe.append(
             {
                 "hash_route": hashed,
                 "top_k": top_k,
-                "graph": {
-                    "captures": 1,
-                    "entries": 1,
-                    "replays": len(names),
-                    "stream_bridges": len(names),
-                    "graph_payload_copy_bytes": 0,
-                },
-                "production_stream_bridge_verified": True,
+                "graph": graph,
+                "production_replay_stream_verified": True,
+                "production_stream_bridge_verified": policy == "owner",
+                "stream_contract": switch_receipt(graph) if policy == "caller" else {"enabled": False},
                 "checks": [
                     {"case": name, "bit_exact": True, "valid": name not in {"nan", "invalid_token", "missing_slot"}}
                     for name in names
@@ -362,6 +394,8 @@ def receipt():
                 "case": tool.CASE,
                 "event": "CASE_PASS",
                 "scope": tool.SCOPE,
+                "replay_stream_policy": policy,
+                "low_level_replay_stream_policy": "owner",
                 "device_execution_verified": True,
                 "graph_functional_verified": True,
                 "checks": low,
@@ -438,6 +472,125 @@ def test_requested_lifetime_cannot_pass_on_short_receipt():
         tool.validate_receipt(receipt(), require_lifetime=True)
 
 
+def test_caller_probe_selected_explicitly_and_forwarded_to_child():
+    args = tool.parse_args(["--graph-replay-stream", "caller", "--plan-only"])
+    command = tool.child_command(args)
+    assert command[command.index("--graph-replay-stream") + 1] == "caller"
+    report = tool.plan(args)
+    assert report["replay_stream_policy"] == "caller"
+    assert report["low_level_replay_stream_policy"] == "owner"
+    assert report["graph_functional_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        None,
+        "policy",
+        "bridge",
+        "owner_counter",
+        "caller_counter",
+        "switch",
+        "rejection",
+        "switch_counter",
+        "boolean_counter",
+        "switch_discontinuity",
+    ],
+)
+def test_caller_receipt_requires_caller_work_and_same_graph_switches(bad):
+    result = receipt("caller")
+    event = result["events"][0]
+    row = event["moe_checks"][0]
+    if bad == "policy":
+        event["replay_stream_policy"] = "owner"
+    elif bad == "bridge":
+        row["graph"]["stream_bridges"] = 1
+    elif bad == "owner_counter":
+        row["graph"]["owner_replays"] = 1
+    elif bad == "caller_counter":
+        row["graph"]["caller_replays"] = 0
+    elif bad == "switch":
+        row["stream_contract"]["steps"].pop()
+    elif bad == "rejection":
+        row["stream_contract"]["wrong_caller_rejected"] = False
+    elif bad == "switch_counter":
+        row["stream_contract"]["steps"][1]["after"]["stream_bridges"] += 1
+    elif bad == "boolean_counter":
+        row["graph"]["stream_bridges"] = False
+    elif bad == "switch_discontinuity":
+        row["stream_contract"]["steps"][1]["before"]["replays"] += 10
+        row["stream_contract"]["steps"][1]["after"]["replays"] += 10
+    if bad is None:
+        actual = tool.validate_receipt(result, replay_stream_policy="caller")
+        assert actual["replay_stream_policy"] == "caller"
+        with pytest.raises(ValueError):
+            tool.validate_receipt(result)
+    else:
+        with pytest.raises(ValueError):
+            tool.validate_receipt(result, replay_stream_policy="caller")
+
+
+@pytest.mark.parametrize("bad", [None, "wrong_caller", "owner_guard", "alias", "counter"])
+def test_stream_policy_probe_checks_real_control_flow_and_output_ownership(bad):
+    # This injection tests rejection/switch orchestration with CPU tensors.
+    # Only run_case_child can certify actual NPUGraph stream behavior.
+    backend = SimpleNamespace(current=0)
+    backend.Stream = lambda **kwargs: SimpleNamespace(npu_stream=2)
+
+    @contextmanager
+    def stream(value):
+        previous, backend.current = backend.current, value.npu_stream
+        try:
+            yield
+        finally:
+            backend.current = previous
+
+    backend.stream = stream
+
+    class State:
+        _graph_backend = backend
+        valid = None
+        policy = "caller"
+        counts = {"replays": 0, "owner_replays": 0, "caller_replays": 0, "stream_bridges": 0}
+        reused = torch.zeros((1, 4))
+
+        def graph_snapshot(self):
+            return {"captures": 1, "entries": 1, "replay_stream_policy": self.policy, **self.counts}
+
+        def set_graph_replay_stream(self, policy):
+            self.policy = policy
+
+        def forward_graph(self, runtime, hidden, ids):
+            if backend.current != 0 and bad != "wrong_caller":
+                raise RuntimeError("Wrong caller")
+            self.counts["replays"] += 1
+            self.counts[f"{self.policy}_replays"] += 1
+            self.counts["stream_bridges"] += int(self.policy == "owner" or bad == "counter")
+            self.valid = torch.tensor(True)
+            if bad == "alias":
+                self.reused.add_(1)
+                return self.reused
+            return hidden.clone()
+
+    state = State()
+
+    def owner_replay(*args, **kwargs):
+        if bad != "owner_guard":
+            raise RuntimeError("Wrong owner")
+
+    state._decode_graph = SimpleNamespace(replay=owner_replay)
+    runtime = SimpleNamespace(device=torch.device("cpu"))
+    template = (torch.ones((1, 4)), torch.zeros(1, dtype=torch.int64), torch.ones((1, 4)))
+    if bad is None:
+        result = tool.exercise_stream_policy_checks(state, runtime, [template], synchronize=lambda: None)
+        assert result["wrong_caller_rejected"] and result["owner_guard_preserved"]
+        assert [step["policy"] for step in result["steps"]] == ["owner", "caller", "owner", "caller"]
+        assert state.counts == {"replays": 4, "owner_replays": 2, "caller_replays": 2, "stream_bridges": 2}
+    else:
+        with pytest.raises(AssertionError):
+            tool.exercise_stream_policy_checks(state, runtime, [template], synchronize=lambda: None)
+
+
 def test_moe_fixture_uses_original_packed_layout_and_bounded_sparse_lookup():
     runtime = tool.make_moe_runtime(torch.device("cpu"), bank_factory=CpuBank, hash_route=True, top_k=6)
     assert runtime.config.hidden_size == 512 and runtime.config.num_experts == 8
@@ -450,12 +603,14 @@ def test_moe_fixture_uses_original_packed_layout_and_bounded_sparse_lookup():
         tool.make_moe_runtime(torch.device("cpu"), bank_factory=CpuBank, hash_route=False, top_k=6)
 
 
-def test_moe_probe_uses_production_entry_points_with_actual_cpu_tensor_comparison(monkeypatch):
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+def test_moe_probe_uses_production_entry_points_with_actual_cpu_tensor_comparison(monkeypatch, policy):
     from vllm_ascend.quantization.vq2a8_v4_device_route import DeviceRouteDecodeState, DeviceRouteGraphCompute
 
-    def prepare(state, runtime):
+    def prepare(state, runtime, *, replay_stream_policy):
         state._test_compute = DeviceRouteGraphCompute(runtime)
         state._test_replays = 0
+        state._test_policy = replay_stream_policy
 
     def replay(state, runtime, hidden, ids):
         output, valid = state._test_compute(hidden, ids)
@@ -468,7 +623,10 @@ def test_moe_probe_uses_production_entry_points_with_actual_cpu_tensor_compariso
             "captures": 1,
             "entries": 1,
             "replays": state._test_replays,
-            "stream_bridges": state._test_replays,
+            "replay_stream_policy": state._test_policy,
+            "stream_bridges": state._test_replays if state._test_policy == "owner" else 0,
+            "owner_replays": state._test_replays if state._test_policy == "owner" else 0,
+            "caller_replays": state._test_replays if state._test_policy == "caller" else 0,
             "graph_payload_copy_bytes": 0,
         }
 
@@ -476,17 +634,22 @@ def test_moe_probe_uses_production_entry_points_with_actual_cpu_tensor_compariso
     monkeypatch.setattr(DeviceRouteDecodeState, "forward_graph", replay)
     monkeypatch.setattr(DeviceRouteDecodeState, "graph_snapshot", snapshot)
     monkeypatch.setattr(DeviceRouteDecodeState, "close_graph", lambda state: None)
-    rows = tool.run_moe_checks(torch.device("cpu"), bank_factory=CpuBank, synchronize=lambda: None)
+    monkeypatch.setattr(tool, "exercise_stream_policy_checks", lambda state, *a, **kw: switch_receipt(snapshot(state)))
+    rows = tool.run_moe_checks(
+        torch.device("cpu"), bank_factory=CpuBank, synchronize=lambda: None, replay_stream_policy=policy
+    )
     assert [(row["hash_route"], row["top_k"]) for row in rows] == [(True, 1), (True, 6), (False, 1)]
     for row in rows:
         assert row["shared_expert_arithmetic"] == "original_gate_up_swiglu_down"
-        assert row["graph"]["stream_bridges"] == len(row["checks"])
+        assert row["graph"]["stream_bridges"] == (len(row["checks"]) if policy == "owner" else 0)
+        assert row["graph"][f"{policy}_replays"] == len(row["checks"])
         assert all(check["bit_exact"] for check in row["checks"])
         assert "device_execution_verified" not in row
 
 
-@pytest.mark.parametrize("bad", ["output", "validity", "bridges", "memory", None])
-def test_production_bridge_lifetime_is_checked_at_boundaries(monkeypatch, bad):
+@pytest.mark.parametrize("policy", ["owner", "caller"])
+@pytest.mark.parametrize("bad", ["output", "validity", "bridges", "counter", "memory", None])
+def test_production_bridge_lifetime_is_checked_at_boundaries(monkeypatch, bad, policy):
     active = {"loop": False}
 
     @contextmanager
@@ -504,7 +667,12 @@ def test_production_bridge_lifetime_is_checked_at_boundaries(monkeypatch, bad):
                 "captures": 1,
                 "entries": 1,
                 "replays": self.replays,
-                "stream_bridges": self.replays - int(bad == "bridges" and self.replays > 0),
+                "replay_stream_policy": policy,
+                "stream_bridges": (self.replays if policy == "owner" else 0)
+                + int(bad == "bridges" and self.replays > 0),
+                "owner_replays": (self.replays if policy == "owner" else 0)
+                + int(bad == "counter" and self.replays > 0),
+                "caller_replays": self.replays if policy == "caller" else 0,
             }
 
         def forward_graph(self, runtime, hidden, ids):

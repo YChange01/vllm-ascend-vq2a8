@@ -1,10 +1,16 @@
 # V4 MoE decode graph：验证、服务与回滚
 
-本轮实现显式 `--decode-graph moe` 接入，不把 CPU 单元测试当作 NPU 验收。
-当前交付环境没有执行新图的 Ascend 硬件验证，也没有新图的 TTFT/TPOT 实测结果。
-既有 fix2 eager 小测试 PASS 与 HTTP 时延下降，不等于本图路径已通过硬件验收。
+显式 `--decode-graph moe` 接入不把 CPU 单元测试当作 NPU 验收。
+用户已报告原 owner-stream MoE 图的 HTTP 短请求结果：`你好`、输出 4 token，
+5 次 TTFT 中位数 226.023 ms、TPOT 中位数 108.036 ms。这是用户实机结果，
+不是当前开发环境重新测得，也不能和此前 10-token prompt 的 TTFT 直接比较。
+本次新增 caller-stream replay 的实机正确性、稳定性与时延收益尚待验证，见第 6 节。
 
-本地验证：1054 项 CPU 测试通过、5 项 Linux/主机 C++ 编译器相关测试跳过；
+本轮回归：1181 项 CPU 测试通过、5 项平台/编译器相关测试跳过；16 个变更 Python 文件通过
+Ruff 检查与格式检查、Python 3.11 语法解析，文档通过 Markdownlint。完整 `format.sh ci`
+因本地未安装 pre-commit 未能运行。上述结果不替代 NPU 原生探针与完整模型性能实测。
+
+此前 MoE 图接入的本地验证：1054 项 CPU 测试通过、5 项 Linux/主机 C++ 编译器相关测试跳过；
 覆盖 V4 图/服务/验收协议，以及原 activation、execution、offline、V3 和 AscendC 回归。
 测试使用真实 CPU Tensor 数值运算和显式 fake graph backend；隔离了不可用的
 vLLM 平台插件，未调用的 accelerator 导入替身一旦执行即报错，不模拟 NPU 成功。
@@ -146,3 +152,76 @@ capture/replay 异常、bit-exact 不符、validity 失效、旧输出被覆写�
 `--decode-graph none`（或删掉该参数），保留 `--device-route-decode`、相同 fix2 库、
 权重与预算，即恢复现有 eager 基线。不在已出错的 runtime 内自动降级后继续接受 token，
 不停止其他进程或重置整卡。
+
+## 6. 下一步优化：直接在调用流 replay
+
+新增 `--graph-replay-stream owner|caller`，默认仍为 `owner`。
+`caller` 必须搭配 `--decode-graph moe --device-route-decode`；仍然仅捕获 MoE，
+不是整模型图，也不改变算子数学、专家常驻、KV 预算或 token 有效性检查。
+
+原模式每个 decode token 的 43 层均执行调用流到专用图流、再返回的事件依赖。
+候选模式在启动时绑定调用流，仍在专用 owner 流构建 bank 和捕获，但 replay 直接提交到绑定的调用流，
+去掉这 43 组往返桥接及对应的跨流输出保活操作。输入 `copy_`、输出/validity `clone` 保留，
+旧输出不得被下一次 replay 覆盖。其他调用流会被拒绝；切换策略和销毁时仍 fence 两条流。
+模型侧策略切换另有整设备 fence，只发生于请求之间的低频切换，不计入请求测速。
+实现依据是 [torch-npu v2.10.0 NPUGraph.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUGraph.cpp)：
+捕获使用非默认流，replay 向当前流提交。上游接口依据不能代替当前 wheel/CANN 的实机探针。
+本轮没有 C++ 改动，继续使用已通过 fix2 的库，无需重新编译 `.so`。
+
+先停止自己拥有的同卡服务，在物理卡 1 空闲时执行有界探针；不要同时运行探针和大模型服务：
+
+```bash
+python -u tools/validate_vq2a8_v4_graph.py \
+  --library build/vq2a8-ascendc-v4-device-route-fix2/libvq2a8_ascendc.so \
+  --physical-npu 1 --graph-replay-stream caller \
+  --queue-lifetime --queue-iterations 2049 --timeout-s 300 \
+  --report-dir reports/v4-graph-caller-native
+```
+
+必须得到 `V4_GRAPH=PASS`。该探针明确区分两个范围：低层 select/pipeline 仍验证 owner 流基线；
+完整合成 MoE 使用生产 caller-stream 路径，验证动态输入、非法值恢复、旧输出保留，
+同一张图的 owner→caller→owner→caller 切换、拒绝无关调用流，以及 2049 次 caller replay
+与 eager matmul 混合执行。它不加载模型，不证明整模型正确性或时延收益。
+
+随后可以用同一引擎、同一图和同一库对比原 owner graph 与 caller graph；这次对照不再是 eager：
+
+```bash
+python -u tools/accept_vq2a8_v4.py \
+  --model /home/g00872988/vq2a8 \
+  --library build/vq2a8-ascendc-v4-device-route-fix2/libvq2a8_ascendc.so \
+  --physical-npu 1 --max-model-len 16 --kv-cache-mib 256 \
+  --memory-fraction 1.0 --engine-memory-fraction 0.9 --cache-reserve-gib 3 \
+  --device-route-decode --decode-graph moe --graph-replay-stream caller \
+  --cases 10:4,1:4 --warmups 2 --repeats 5 \
+  --output-dir reports/v4-graph-caller-ab
+```
+
+验收会单独启动模型，不是访问已有 HTTP 服务，因此同卡 HTTP 服务应先停掉。
+核对每层 capture 始终为 1，测量期间无 recapture；输出 4 token 时，owner 对照应增加
+3 次 `owner_replays` 和 3 次 `stream_bridges`，caller 候选应增加 3 次 `caller_replays`，
+但 `stream_bridges` 增量为 0。其余模式的 replay 计数不得增加。计数是逻辑路径证据，
+不是 profiler 实测 kernel 次数；无实际测量前不预设加速比。
+
+启动候选 HTTP 服务：
+
+```bash
+python -u tools/serve_vq2a8_v4.py \
+  --model /home/g00872988/vq2a8 \
+  --library build/vq2a8-ascendc-v4-device-route-fix2/libvq2a8_ascendc.so \
+  --physical-npu 1 --max-model-len 16 --kv-cache-mib 256 \
+  --memory-fraction 1.0 --engine-memory-fraction 0.9 --reserve-gib 3 \
+  --device-route-decode --decode-graph moe --graph-replay-stream caller \
+  --host 127.0.0.1 --port 8000
+```
+
+另一终端在同一容器内访问该服务，用相同 prompt 复测：
+
+```bash
+python -u tools/benchmark_vq2a8_serving.py \
+  --base-url http://127.0.0.1:8000 --model vq2a8 \
+  --prompt '你好' --max-tokens 4 --warmups 2 --repeats 20 --timeout 300
+```
+
+保持相同卡、prompt、输出长度、客户端和库，串行启动 owner/caller 服务分别记录原始样本。
+失败、结果不一致或稳定性下降时，停止候选服务，改成 `--graph-replay-stream owner` 重启，
+保留 `--decode-graph moe`，即可恢复用户已有收益的 MoE 图基线；不自动切换失败中的 runtime。
