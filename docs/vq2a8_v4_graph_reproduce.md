@@ -1,5 +1,8 @@
 # V4 MoE decode graph：验证、服务与回滚
 
+本文保留 MoE 图基线的验证步骤。新增的向量重排、融合激活准备和短上下文
+`decoder` 图均为独立 opt-in 路径，见 [三项优化验证指南](vq2a8_v4_perf3.md)。
+
 显式 `--decode-graph moe` 接入不把 CPU 单元测试当作 NPU 验收。
 用户已报告原 owner-stream MoE 图的 HTTP 短请求结果：`你好`、输出 4 token，
 5 次 TTFT 中位数 226.023 ms、TPOT 中位数 108.036 ms。这是用户实机结果，

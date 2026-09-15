@@ -24,7 +24,7 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
-from vllm_ascend.quantization.vq2a8_artifact import (
+from .vq2a8_artifact import (
     VQ2_CODEBOOK_SIZE,
     VQ2_CONSUMER_REFERENCE_COMMIT,
     VQ2_INDEX_BITS,
@@ -36,7 +36,7 @@ from vllm_ascend.quantization.vq2a8_artifact import (
     load_model_layout,
     read_safetensors_header,
 )
-from vllm_ascend.quantization.vq2a8_repack import (
+from .vq2a8_repack import (
     VQ2_DIRECT_TP1_FORMAT,
     validate_repacked_matrix,
 )

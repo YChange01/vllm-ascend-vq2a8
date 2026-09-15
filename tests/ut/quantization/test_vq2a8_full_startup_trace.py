@@ -50,7 +50,12 @@ def validation_function():
     # exercising the production config validator without importing vLLM.
     source = REPO / "vllm_ascend/quantization/vq2a8_offline.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    names = {"validate_offline_config", "_validate_cache_memory_fraction", "_validate_v4_compute_backend"}
+    names = {
+        "validate_offline_config",
+        "_validate_cache_memory_fraction",
+        "_validate_v4_compute_backend",
+        "_validate_v4_activation_options",
+    }
     body = [
         node
         for node in tree.body

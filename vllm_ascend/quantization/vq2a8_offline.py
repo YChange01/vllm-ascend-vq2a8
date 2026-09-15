@@ -24,17 +24,28 @@ from vllm_ascend.quantization.vq2a8_moe import VQ2TP1MoE
 from vllm_ascend.quantization.vq2a8_repack import VQ2_DIRECT_TP1_FORMAT
 from vllm_ascend.quantization.vq2a8_runtime import open_vq2a8_tp1_artifact
 from vllm_ascend.quantization.vq2a8_tp1_zn_runtime import artifact_format, open_vq2a8_tp1_zn_artifact
+from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import V4_V2_PREPACKED_FORMAT
 from vllm_ascend.quantization.vq2a8_zn_contract import VQ2_TP1_ZN_FORMAT
 
 OFFLINE_CONTEXT_LIMIT = 32
 OFFLINE_NEW_TOKENS = 4
 OFFLINE_RUNS = 2
+V4_DECODER_CONTEXT_LIMIT = 16
 CACHE_EXECUTION_POLICIES = ("cached", "ascendc", "ascendc_v2", "ascendc_v3", "ascendc_v4")
 
 
 def _validate_v4_compute_backend(value, policy):
     if value not in ("v1", "v2") or (value != "v1" and policy != "ascendc_v4"):
         raise ValueError("v4_compute_backend requires v1|v2; v2 requires execution_policy=ascendc_v4.")
+
+
+def _validate_v4_activation_options(reorder, preparation, backend, policy):
+    if reorder not in ("scalar", "vectorized"):
+        raise ValueError("v4_activation_reorder requires scalar|vectorized.")
+    if preparation not in ("rowwise", "fused"):
+        raise ValueError("v4_activation_preparation requires rowwise|fused.")
+    if (reorder != "scalar" or preparation != "rowwise") and (backend != "v2" or policy != "ascendc_v4"):
+        raise ValueError("V4 activation optimizations require execution_policy=ascendc_v4 and v4_compute_backend=v2.")
 
 
 def _validate_cache_memory_fraction(value, policy):
@@ -67,11 +78,16 @@ def offline_engine_options(
     v4_decode_graph="none",
     v4_graph_replay_stream="owner",
     v4_compute_backend="v1",
+    v4_activation_reorder="scalar",
+    v4_activation_preparation="rowwise",
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
     _validate_v4_compute_backend(v4_compute_backend, execution_policy)
+    _validate_v4_activation_options(
+        v4_activation_reorder, v4_activation_preparation, v4_compute_backend, execution_policy
+    )
     if execution_policy not in ("ascendc", "ascendc_v4") and (
         ascendc_library is not None or ascendc_sha256 is not None
     ):
@@ -92,14 +108,18 @@ def offline_engine_options(
         raise ValueError("v4_serving must be boolean and requires execution_policy=ascendc_v4.")
     if type(v4_device_route_decode) is not bool or (v4_device_route_decode and execution_policy != "ascendc_v4"):
         raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
-    if v4_decode_graph not in ("none", "moe") or (
+    if v4_decode_graph not in ("none", "moe", "decoder") or (
         v4_decode_graph != "none" and (execution_policy != "ascendc_v4" or not v4_device_route_decode)
     ):
-        raise ValueError("v4_decode_graph requires none|moe; moe requires V4 device-route decode.")
+        raise ValueError("v4_decode_graph requires none|moe|decoder; graphs require V4 device-route decode.")
     if v4_graph_replay_stream not in ("owner", "caller") or (
-        v4_graph_replay_stream == "caller" and v4_decode_graph != "moe"
+        v4_graph_replay_stream == "caller" and v4_decode_graph == "none"
     ):
-        raise ValueError("v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe.")
+        raise ValueError(
+            "v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe or decoder."
+        )
+    if v4_decode_graph == "decoder" and v4_graph_replay_stream != "caller":
+        raise ValueError("V4 decoder graph requires v4_graph_replay_stream=caller.")
     if cache_memory_fraction is not None:
         _validate_cache_memory_fraction(cache_memory_fraction, execution_policy)
     if type(tensor_parallel_size) is not int or tensor_parallel_size not in (1, 2):
@@ -127,8 +147,8 @@ def offline_engine_options(
         "enable_prefix_caching": False,
         "enable_chunked_prefill": False,
         "max_num_seqs": 1,
-        "max_model_len": OFFLINE_CONTEXT_LIMIT,
-        "max_num_batched_tokens": OFFLINE_CONTEXT_LIMIT,
+        "max_model_len": V4_DECODER_CONTEXT_LIMIT if v4_decode_graph == "decoder" else OFFLINE_CONTEXT_LIMIT,
+        "max_num_batched_tokens": V4_DECODER_CONTEXT_LIMIT if v4_decode_graph == "decoder" else OFFLINE_CONTEXT_LIMIT,
         "block_size": 128,
         "gpu_memory_utilization": 0.9 if execution_policy in CACHE_EXECUTION_POLICIES else 0.35,
         "kv_cache_memory_bytes": 1024**3,
@@ -150,6 +170,12 @@ def offline_engine_options(
                 **({"v3_serving": True} if v3_serving else {}),
                 **({"v4_serving": True} if v4_serving else {}),
                 **({"v4_compute_backend": v4_compute_backend} if v4_compute_backend != "v1" else {}),
+                **({"v4_activation_reorder": v4_activation_reorder} if v4_activation_reorder != "scalar" else {}),
+                **(
+                    {"v4_activation_preparation": v4_activation_preparation}
+                    if v4_activation_preparation != "rowwise"
+                    else {}
+                ),
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
                 **({"v4_decode_graph": v4_decode_graph} if v4_decode_graph != "none" else {}),
                 **({"v4_graph_replay_stream": v4_graph_replay_stream} if v4_decode_graph != "none" else {}),
@@ -209,6 +235,8 @@ def validate_offline_config(config) -> dict:
         "v4_decode_graph",
         "v4_graph_replay_stream",
         "v4_compute_backend",
+        "v4_activation_reorder",
+        "v4_activation_preparation",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -291,6 +319,16 @@ def validate_offline_config(config) -> dict:
     elif "ascendc_library" in options or "ascendc_sha256" in options:
         raise ValueError("Native library options require explicit execution_policy=ascendc or ascendc_v4.")
     _validate_v4_compute_backend(options.get("v4_compute_backend", "v1"), options.get("execution_policy"))
+    _validate_v4_activation_options(
+        options.get("v4_activation_reorder", "scalar"),
+        options.get("v4_activation_preparation", "rowwise"),
+        options.get("v4_compute_backend", "v1"),
+        options.get("execution_policy"),
+    )
+    if options.get("execution_policy") != "ascendc_v4" and any(
+        key in options for key in ("v4_activation_reorder", "v4_activation_preparation")
+    ):
+        raise ValueError("V4 activation options require execution_policy=ascendc_v4.")
     if "v4_compute_backend" in options and options.get("execution_policy") != "ascendc_v4":
         raise ValueError("v4_compute_backend requires execution_policy=ascendc_v4.")
     if options.get("execution_policy") == "ascendc_v4":
@@ -341,16 +379,20 @@ def validate_offline_config(config) -> dict:
     ):
         raise ValueError("v4_device_route_decode must be boolean and requires execution_policy=ascendc_v4.")
     graph_mode = options.get("v4_decode_graph", "none")
-    if graph_mode not in ("none", "moe") or (
+    if graph_mode not in ("none", "moe", "decoder") or (
         "v4_decode_graph" in options and options.get("execution_policy") != "ascendc_v4"
     ):
-        raise ValueError("v4_decode_graph requires none|moe and execution_policy=ascendc_v4.")
-    if graph_mode == "moe" and (tp_size != 1 or options.get("v4_device_route_decode") is not True):
+        raise ValueError("v4_decode_graph requires none|moe|decoder and execution_policy=ascendc_v4.")
+    if graph_mode != "none" and (tp_size != 1 or options.get("v4_device_route_decode") is not True):
         raise ValueError("V4 MoE decode graph requires TP1 and v4_device_route_decode=true.")
     replay_stream = options.get("v4_graph_replay_stream", "owner")
-    if replay_stream not in ("owner", "caller") or (replay_stream == "caller" and graph_mode != "moe"):
-        raise ValueError("v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe.")
-    if graph_mode == "moe":
+    if replay_stream not in ("owner", "caller") or (replay_stream == "caller" and graph_mode == "none"):
+        raise ValueError(
+            "v4_graph_replay_stream requires owner|caller; caller requires v4_decode_graph=moe or decoder."
+        )
+    if graph_mode == "decoder" and (replay_stream != "caller" or model.max_model_len > V4_DECODER_CONTEXT_LIMIT):
+        raise ValueError("V4 decoder graph requires caller replay and max_model_len <=16.")
+    if graph_mode != "none":
         graph_kv_bytes = getattr(config.cache_config, "kv_cache_memory_bytes", None)
         if type(graph_kv_bytes) is not int or graph_kv_bytes <= 0:
             raise ValueError(
@@ -463,9 +505,13 @@ class OfflineMoEOwner:
             backend = options.get("v4_compute_backend", "v1")
             _validate_v4_compute_backend(backend, options.get("execution_policy"))
             if backend == "v2":
-                from vllm_ascend.quantization.vq2a8_v4_v2 import load_v4_v2_library
+                from vllm_ascend.quantization.vq2a8_v4_v2 import load_v4_v2_library, require_v4_v2_features
 
                 self.native_library = load_v4_v2_library(options["ascendc_library"], options["ascendc_sha256"])
+                require_v4_v2_features(
+                    options.get("v4_activation_reorder", "scalar"),
+                    options.get("v4_activation_preparation", "rowwise"),
+                )
             else:
                 from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
 
@@ -505,7 +551,15 @@ class OfflineMoEOwner:
             )
         else:
             format_name = artifact_format(options["artifact"])
-            if format_name == VQ2_TP1_ZN_FORMAT:
+            if format_name == V4_V2_PREPACKED_FORMAT:
+                if options.get("execution_policy") != "ascendc_v4" or options.get("v4_compute_backend", "v1") != "v2":
+                    raise ValueError(
+                        "Prepacked V4 v2 experts require execution_policy=ascendc_v4 and v4_compute_backend=v2."
+                    )
+                from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import open_vq2a8_v4_v2_prepacked_artifact
+
+                self.artifact = open_vq2a8_v4_v2_prepacked_artifact(options["artifact"], model_root / "config.json")
+            elif format_name == VQ2_TP1_ZN_FORMAT:
                 if options.get("execution_policy") != "ascendc_v3":
                     raise ValueError("TP1 packed-zN requires execution_policy=ascendc_v3; no format fallback.")
                 self.artifact = open_vq2a8_tp1_zn_artifact(
@@ -521,6 +575,18 @@ class OfflineMoEOwner:
             else:
                 raise ValueError(f"Unsupported artifact format for TP1: {format_name!r}; no format fallback.")
         self.inventory = audit_offline_root(model_root)
+        if options.get("execution_policy") == "ascendc_v4" and options.get("v4_compute_backend", "v1") == "v2":
+            print(
+                "MODEL_V4_V2_EXPERT_SOURCE "
+                + json.dumps(
+                    {
+                        "artifact": str(self.artifact.root),
+                        "format": self.artifact.manifest.get("format"),
+                        "startup_conversion": self.artifact.manifest.get("format") != V4_V2_PREPACKED_FORMAT,
+                    }
+                ),
+                flush=True,
+            )
         self.options = options
         self.device = device
         self.layers: dict[int, VQ2TP1MoE] = {}
@@ -571,6 +637,15 @@ class OfflineMoEOwner:
                 self.device,
                 cache_experts=self.options.get("cache_experts", 2),
                 token_chunk=self.options.get("token_chunk", 2),
+                **(
+                    {
+                        "v4_activation_reorder": self.options.get("v4_activation_reorder", "scalar"),
+                        "v4_activation_preparation": self.options.get("v4_activation_preparation", "rowwise"),
+                    }
+                    if self.options.get("execution_policy") == "ascendc_v4"
+                    and self.options.get("v4_compute_backend", "v1") == "v2"
+                    else {}
+                ),
                 **(
                     {"tp_rank": self.tp_rank, "tp_group": self.tp_group, "projection_kernel": "v2"}
                     if getattr(self, "tp_size", 1) == 2
@@ -702,6 +777,26 @@ class OfflineMoEOwner:
                 print(f"MODEL layer={index} stage=v4_resident_load_start", flush=True)
                 layer.initialize_resident(budget_bytes=plan["layer_plans"][index]["planned_bytes"])
                 print(f"MODEL layer={index} stage=v4_resident_load_done", flush=True)
+                if self.options.get("v4_compute_backend", "v1") == "v2":
+                    report = layer.v4_report()
+                    print(
+                        "MODEL_V4_V2_LOAD "
+                        + json.dumps(
+                            {
+                                key: report[key]
+                                for key in (
+                                    "layer_index",
+                                    "source_format",
+                                    "startup_conversion",
+                                    "preload_host_convert_s",
+                                    "preload_host_read_s",
+                                    "preload_host_validate_s",
+                                    "preload_h2d_s",
+                                )
+                            }
+                        ),
+                        flush=True,
+                    )
             for layer in self.layers.values():
                 layer.check_resident_integrity()
             if self.options.get("v4_device_route_decode", False):

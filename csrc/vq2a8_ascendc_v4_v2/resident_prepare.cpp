@@ -16,10 +16,10 @@ __aicore__ inline void PrepareFence() {
   WaitFlag<E>(event);
 }
 
-// Correctness-first byte gather. Only activation bytes are reordered, AFTER
-// original RHT/FP8 preparation; compressed expert weights never move at runtime.
-// Route/row/K chunks are independent, including repeated expert IDs. This
-// scalar gather is deliberately isolated for later profiling/vectorization.
+// Only activation bytes are reordered, AFTER original RHT/FP8 preparation;
+// compressed expert weights never move at runtime. Keep the scalar baseline
+// and the opt-in UB/vector gather in separate compiled entry points.
+template <bool Vectorized = false>
 class ResidentPrepareKernel {
  public:
   __aicore__ inline void Init(GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias,
@@ -41,6 +41,20 @@ class ResidentPrepareKernel {
     pipe_.InitBuffer(outputUb_, kSelectColumns * sizeof(uint16_t));
     pipe_.InitBuffer(recordUb_, 96);  // Nine uint64 words, rounded to a DMA block.
     pipe_.InitBuffer(statusUb_, 32);
+    if constexpr (Vectorized) {
+      pipe_.InitBuffer(inputUb_, k_);
+      pipe_.InitBuffer(orderUb_, kSelectColumns * sizeof(int64_t));
+      pipe_.InitBuffer(orderOffsetsUb_, kSelectColumns * sizeof(uint32_t));
+      pipe_.InitBuffer(lowWordOffsetsUb_, kSelectColumns * sizeof(uint32_t));
+      // Gather offsets are BYTE offsets. Orders are validated nonnegative and
+      // less than K<=4096 at construction, so their low uint32 word is exact.
+      // Load the existing int64 metadata; do not allocate a second bank copy.
+      auto offsets = lowWordOffsetsUb_.Get<int32_t>();
+      CreateVecIndex(offsets, int32_t(0), kSelectColumns);
+      PipeBarrier<PIPE_V>();
+      Muls(offsets, offsets, int32_t(sizeof(int64_t)), kSelectColumns);
+      PipeBarrier<PIPE_V>();
+    }
   }
 
   __aicore__ inline void Process() {
@@ -57,14 +71,18 @@ class ResidentPrepareKernel {
         GlobalTensor<int64_t> order;
         order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(bank_.GetValue(entry + kBankOrder)));
         const uint64_t rowBase = (uint64_t(route) * m_ + row) * k_;
-        auto gathered = gatherUb_.Get<uint8_t>();
-        for (uint32_t i = 0; i < kSelectColumns; ++i) {
-          // Constructor verified a complete 0..K-1 permutation before upload.
-          gathered.SetValue(i, x_.GetValue(rowBase + static_cast<uint64_t>(order.GetValue(column + i))));
+        if constexpr (Vectorized) {
+          GatherVectorized(order, rowBase, column);
+        } else {
+          auto gathered = gatherUb_.Get<uint8_t>();
+          for (uint32_t i = 0; i < kSelectColumns; ++i) {
+            // Constructor verified a complete 0..K-1 permutation before upload.
+            gathered.SetValue(i, x_.GetValue(rowBase + static_cast<uint64_t>(order.GetValue(column + i))));
+          }
+          PrepareFence<HardEvent::S_MTE3>();
+          DataCopy(reordered_[rowBase + column], gathered, kSelectColumns);
+          PrepareFence<HardEvent::MTE3_S>();
         }
-        PrepareFence<HardEvent::S_MTE3>();
-        DataCopy(reordered_[rowBase + column], gathered, kSelectColumns);
-        PrepareFence<HardEvent::MTE3_S>();
       } else if (!valid && column < n_) {
         Duplicate(outputUb_.Get<uint16_t>(), kInvalidBf16, kSelectColumns);
         PrepareFence<HardEvent::V_MTE3>();
@@ -76,6 +94,34 @@ class ResidentPrepareKernel {
   }
 
  private:
+  __aicore__ inline void GatherVectorized(const GlobalTensor<int64_t>& order,
+                                        uint64_t rowBase, uint32_t column) {
+    auto input = inputUb_.Get<uint8_t>();
+    auto orderWords = orderUb_.Get<int64_t>();
+    auto orderOffsets = orderOffsetsUb_.Get<uint32_t>();
+    auto gathered = gatherUb_.Get<uint8_t>();
+    // One contiguous DMA per activation row and per 256-entry order segment,
+    // replacing 512 scalar GM loads. K is small enough to keep the entire
+    // activation row in UB (maximum 4096 bytes); no decoded weights in GM.
+    DataCopy(input, x_[rowBase], k_);
+    DataCopy(orderWords, order[column], kSelectColumns);
+    PrepareFence<HardEvent::MTE2_V>();
+    Gather(orderOffsets, orderWords.ReinterpretCast<uint32_t>(),
+           lowWordOffsetsUb_.Get<uint32_t>(), uint32_t(0), kSelectColumns);
+    PipeBarrier<PIPE_V>();
+    // Ascend950/dav3510 supports the count-based Gather<uint8_t> overload:
+    // asc-devkit include/basic_api/kernel_operator_vec_gather_intf.h and
+    // impl/basic_api/dav_3510/kernel_operator_vec_gather_impl.h,
+    // GatherApi2B8Impl/VfGatherApi2B8. Do not use the B16/B32-only level-0 API.
+    // This is a byte copy, NOT a cast: FP8 signed zero and NaN bits survive.
+    Gather(gathered, input, orderOffsets, uint32_t(0), kSelectColumns);
+    PrepareFence<HardEvent::V_MTE3>();
+    DataCopy(reordered_[rowBase + column], gathered, kSelectColumns);
+    // Protect both the output buffer and input/order buffers on reuse.
+    PrepareFence<HardEvent::MTE3_V>();
+    PrepareFence<HardEvent::V_MTE2>();
+  }
+
   __aicore__ inline void WriteDescriptor(uint32_t route, int64_t expert, bool valid) {
     auto record = recordUb_.Get<uint64_t>();
     for (uint32_t field = 0; field < kJobWords; ++field) record.SetValue(field, uint64_t(0));
@@ -104,6 +150,7 @@ class ResidentPrepareKernel {
 
   TPipe pipe_;
   TBuf<TPosition::VECCALC> gatherUb_, outputUb_, recordUb_, statusUb_;
+  TBuf<TPosition::VECCALC> inputUb_, orderUb_, orderOffsetsUb_, lowWordOffsetsUb_;
   GlobalTensor<uint64_t> bank_, descriptors_;
   GlobalTensor<int64_t> ids_;
   GlobalTensor<uint8_t> x_, reordered_;
@@ -119,7 +166,17 @@ extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare(
     GM_ADDR descriptors, GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes,
     uint32_t m, uint32_t n, uint32_t k) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  vq2a8_ascendc_v4_v2::ResidentPrepareKernel kernel;
+  vq2a8_ascendc_v4_v2::ResidentPrepareKernel<false> kernel;
+  kernel.Init(bank, routeIds, x, scale, bias, reordered, descriptors, output, valid, experts, routes, m, n, k);
+  kernel.Process();
+}
+
+extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_vectorized(
+    GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR reordered,
+    GM_ADDR descriptors, GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes,
+    uint32_t m, uint32_t n, uint32_t k) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::ResidentPrepareKernel<true> kernel;
   kernel.Init(bank, routeIds, x, scale, bias, reordered, descriptors, output, valid, experts, routes, m, n, k);
   kernel.Process();
 }
@@ -129,6 +186,17 @@ void LaunchResidentPrepare(void* stream, uint32_t blocks, void* bank, void* rout
                            void* bias, void* reordered, void* descriptors, void* output, void* valid,
                            uint32_t experts, uint32_t routes, uint32_t m, uint32_t n, uint32_t k) {
   vq2a8_ascendc_v4_v2_prepare<<<blocks, nullptr, stream>>>(
+      static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds), static_cast<GM_ADDR>(x),
+      static_cast<GM_ADDR>(scale), static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(reordered),
+      static_cast<GM_ADDR>(descriptors), static_cast<GM_ADDR>(output), static_cast<GM_ADDR>(valid),
+      experts, routes, m, n, k);
+}
+
+void LaunchResidentPrepareVectorized(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
+                                    void* scale, void* bias, void* reordered, void* descriptors,
+                                    void* output, void* valid, uint32_t experts, uint32_t routes,
+                                    uint32_t m, uint32_t n, uint32_t k) {
+  vq2a8_ascendc_v4_v2_prepare_vectorized<<<blocks, nullptr, stream>>>(
       static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds), static_cast<GM_ADDR>(x),
       static_cast<GM_ADDR>(scale), static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(reordered),
       static_cast<GM_ADDR>(descriptors), static_cast<GM_ADDR>(output), static_cast<GM_ADDR>(valid),

@@ -329,7 +329,12 @@ class DeviceRouteDecodeState(FastMoEState):
             self.stats["preparation_calls"] += 1
         quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
         with self.scope("native_projection"):
-            output, valid = bank.project(quantized, scale, bias, slots)
+            project = getattr(runtime, "project_v4_prepared", None)
+            output, valid = (
+                bank.project(quantized, scale, bias, slots)
+                if project is None
+                else project(bank, quantized, scale, bias, slots)
+            )
             self.retain((valid != 0).all() & torch.isfinite(output).all())
         runtime.native_calls += slots.numel()
         runtime.native_rows += slots.numel()
@@ -413,13 +418,15 @@ class DeviceRouteGraphCompute:
         geometries = {}
         for kind in ("gate_up", "down"):
             _, spec = self.banks[kind]
-            preparation = RowwiseVQ2A8Preparation(compact=True)
+            preparation = getattr(runtime, "make_v4_preparation", RowwiseVQ2A8Preparation)(compact=True)
             preparation.prepare_for_graph(runtime.device, spec.rht_block_size)
             self.preparations[kind] = preparation
             geometries[kind] = [spec.rows, spec.columns, spec.rht_true_columns, spec.rht_block_size]
         self.signature = {
             "layer": getattr(runtime, "layer_index", None),
             "compute_backend": getattr(runtime, "v4_compute_backend", "v1"),
+            "activation_preparation": getattr(runtime, "v4_activation_preparation", "rowwise"),
+            "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
             "top_k": self.config.top_k,
             "hidden_size": self.config.hidden_size,
             "hash_route": self.root.get("gate.tid2eid") is not None,
@@ -438,6 +445,8 @@ class DeviceRouteGraphCompute:
         return (
             id(runtime),
             getattr(runtime, "v4_compute_backend", "v1"),
+            getattr(runtime, "v4_activation_preparation", "rowwise"),
+            getattr(runtime, "v4_activation_reorder", "scalar"),
             id(config),
             (
                 config.top_k,
@@ -483,7 +492,12 @@ class DeviceRouteGraphCompute:
         ]
         prepared = self.preparations[kind].many(requests, validity=retain)
         quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
-        output, valid = bank.project(quantized, scale, bias, slots)
+        project = getattr(self.runtime, "project_v4_prepared", None)
+        output, valid = (
+            bank.project(quantized, scale, bias, slots)
+            if project is None
+            else project(bank, quantized, scale, bias, slots)
+        )
         retain((valid != 0).all() & torch.isfinite(output).all())
         return output
 

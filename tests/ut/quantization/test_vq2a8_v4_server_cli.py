@@ -180,7 +180,6 @@ def test_device_route_is_explicit_v4_only_and_preserves_prefill_and_server_contr
         ["--kv-cache-mib", "256", "--reserve-gib", "0.99"],
         ["--tensor-parallel-size", "2"],
         ["--physical-npus", "0,1"],
-        ["--artifact", "/other/artifact"],
         ["--decode-graph", "moe"],
         ["--preparation", "fused"],
     ],

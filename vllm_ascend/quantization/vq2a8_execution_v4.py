@@ -108,6 +108,10 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         self._v4_graph_is_decode = False
         self._v4_graph_state = None
         self._v4_graph_bypasses = {}
+        self._v4_decoder_compute = None
+        self._v4_decoder_capture = False
+        self._v4_decoder_valid = None
+        self._v4_decoder_graph_owner = None
 
     def _require_ready(self):
         if not self._resident_ready or self._resident_failed:
@@ -133,6 +137,10 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
                 result.append((kind, field, _tensor_identity(tensor)))
         return tuple(result)
 
+    def _validate_resident_artifact(self):
+        if self.artifact.manifest.get("format") != VQ2_DIRECT_TP1_FORMAT:
+            raise ValueError("V4 requires the V1 direct-TP1 artifact; packed-zN is not supported.")
+
     def initialize_resident(self, *, budget_bytes: int):
         """Load this complete layer after the owner has planned the full model.
 
@@ -142,8 +150,7 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
         """
         if self._resident_started or self._resident_failed or self._cache:
             raise RuntimeError("V4 residency must initialize once from an empty cache.")
-        if self.artifact.manifest.get("format") != VQ2_DIRECT_TP1_FORMAT:
-            raise ValueError("V4 requires the V1 direct-TP1 artifact; packed-zN is not supported.")
+        self._validate_resident_artifact()
         plan = self.residency_plan([self.layer], budget_bytes)
         self._resident_plan = plan["layer_plans"][self.layer_index]
         self._resident_started = True
@@ -204,6 +211,11 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
 
     def forward(self, hidden, input_ids=None):
         self._require_ready()
+        if self._v4_decoder_capture:
+            if self._v4_decoder_compute is None or self._v4_graph_enabled:
+                raise RuntimeError("Decoder capture requires pure MoE compute without nested MoE graphs.")
+            output, self._v4_decoder_valid = self._v4_decoder_compute(hidden, input_ids)
+            return output
         if self._v4_graph_enabled:
             if self._v4_graph_state is None:
                 raise RuntimeError("V4 MoE graph must be prepared before requests; lazy capture is forbidden.")
@@ -300,10 +312,15 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
             raise
         # The optional native banks strongly own the same payload storage.
         # Release them only after the fence above, never while queued work runs.
+        if self._v4_decoder_graph_owner is not None:
+            self._v4_decoder_graph_owner.close()
+            self._v4_decoder_graph_owner = None
         if self._v4_graph_state is not None:
             self._v4_graph_state.close_graph()
             self._v4_graph_state = None
         self._device_route_banks = None
+        self._v4_decoder_compute = None
+        self._v4_decoder_valid = None
         self._optimization_states = {}
         self._optimization = None
         CachedVQ2TP1MoE.clear_cache(self)

@@ -62,9 +62,18 @@ def parse_args(argv=None):
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc-v4-v2" / LIBRARY_NAME)
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--phase", choices=("kernel", "resident", "lifetime", "graph", "all"), default="kernel")
+    parser.add_argument(
+        "--activation-reorder",
+        choices=("scalar", "vectorized"),
+        default="scalar",
+        help="resident post-FP8 byte permutation; vectorized requires the newly rebuilt library",
+    )
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--queue-iterations", type=int, default=QUEUE_DEFAULT_ITERATIONS)
     parser.add_argument("--model", type=Path, help="optional real artifact root; never starts a model")
+    parser.add_argument(
+        "--artifact", type=Path, help="optional prepacked V4/v2 artifact to compare with --model's original expert"
+    )
     parser.add_argument("--expert", default="0:0", help="one real artifact layer:expert")
     parser.add_argument("--allow-busy", action="store_true", help="explicitly allow known NPU occupancy")
     parser.add_argument("--report-dir", type=Path, help="new directory; existing results are never overwritten")
@@ -77,6 +86,10 @@ def parse_args(argv=None):
         parser.error(f"--queue-iterations must be {QUEUE_MIN_ITERATIONS}..{QUEUE_MAX_ITERATIONS}")
     if args.phase not in ("lifetime", "all") and args.queue_iterations != QUEUE_DEFAULT_ITERATIONS:
         parser.error("--queue-iterations requires --phase lifetime or all")
+    if args.activation_reorder == "vectorized" and args.phase == "kernel":
+        parser.error("--activation-reorder vectorized requires --phase resident, lifetime, graph, or all")
+    if args.artifact is not None and args.model is None:
+        parser.error("--artifact requires --model for the independent original-expert oracle")
     pieces = args.expert.split(":")
     if len(pieces) != 2 or not all(value.isdecimal() for value in pieces):
         parser.error("--expert requires nonnegative layer:expert")
@@ -98,6 +111,8 @@ def child_command(args):
         str(args.physical_npu),
         "--phase",
         args.phase,
+        "--activation-reorder",
+        args.activation_reorder,
         "--timeout-s",
         str(args.timeout_s),
         "--queue-iterations",
@@ -107,6 +122,8 @@ def child_command(args):
     ]
     if args.model is not None:
         command.extend(("--model", str(args.model.resolve())))
+    if args.artifact is not None:
+        command.extend(("--artifact", str(args.artifact.resolve())))
     return command
 
 
@@ -114,6 +131,8 @@ def validation_plan(args):
     return {
         "scope": "synthetic_and_optional_real_projection_only",
         "phase": args.phase,
+        "activation_reorder": args.activation_reorder,
+        "activation_reorder_verified": False,
         "phases": phases_for(args.phase),
         "command": child_command(args),
         "physical_npu": args.physical_npu,
@@ -129,6 +148,7 @@ def validation_plan(args):
             "bank_release_iterations": BANK_RELEASE_ITERATIONS,
         },
         "real_projection_requested": args.model is not None,
+        "prepacked_projection_requested": args.artifact is not None,
         "full_model_loaded": False,
         "model_integration_verified": False,
         "serving_verified": False,
@@ -244,6 +264,75 @@ def make_bank(experts, device, factory):
     return factory(*([payload[name] for payload in payloads] for name in FIELDS))
 
 
+class VectorizedBank:
+    """Probe-only adapter so every existing phase uses the requested native path.
+
+    Own exactly this bank, never a global list: lifetime_bank_release must still
+    destroy all Python owners before its device fence. Scalar probes retain
+    their original factory and class unchanged.
+    """
+
+    def __init__(self, bank):
+        self.bank = bank
+
+    def project(self, *args):
+        return self.bank.project_vectorized(*args)
+
+    def prepare_vectorized(self, *args):
+        return self.bank.prepare_vectorized(*args)
+
+    def select(self, ids):
+        return self.bank.select(ids)
+
+    def metadata(self):
+        return self.bank.metadata()
+
+
+def selected_bank_factory(factory, activation_reorder):
+    if activation_reorder == "scalar":
+        return factory
+    if activation_reorder != "vectorized":
+        raise ValueError("Unknown activation reorder")
+    return lambda *args: VectorizedBank(factory(*args))
+
+
+def run_vectorized_byte_checks(device, bank, experts, stage):
+    """Check all 256 encodings BEFORE compute, including signed zero/NaN bits."""
+    import torch
+
+    k = experts[0]["k"]
+    completed = []
+    selected = ((0, 1, 2, 0, 2, 1), (2, 2, 2, 2, 2, 2), (0, -1, 3, 2**32, -(2**63), 2**63 - 1))
+    for iteration, routes in enumerate(selected):
+        for rows in (1, 2, 32):
+            name = f"vectorized_bytes_k{k}_ids{iteration}_m{rows}"
+            # Construct raw FP8 bytes without any numeric conversion. Each row
+            # covers all byte patterns at least eight times, with changing data.
+            raw = ((torch.arange(len(routes) * rows * k) + iteration * 17) % 256).byte()
+            raw = raw.reshape(len(routes), rows, k)
+            q = raw.view(torch.float8_e4m3fn).to(device)
+            scale = torch.ones((len(routes), rows), device=device, dtype=torch.float32)
+            bias = torch.zeros_like(scale)
+            ids = torch.tensor(routes, device=device, dtype=torch.int64)
+            if rows == 1:
+                q, scale, bias = q[:, 0].contiguous(), scale[:, 0].contiguous(), bias[:, 0].contiguous()
+            with stage(name):
+                reordered, valid = bank.prepare_vectorized(q, scale, bias, ids)
+            got = reordered.view(torch.uint8).detach().cpu().reshape(len(routes), rows, k)
+            flags = valid.detach().cpu().tolist()
+            for route, expert in enumerate(routes):
+                expected_valid = 0 <= expert < len(experts)
+                if bool(flags[route]) != expected_valid:
+                    raise AssertionError(f"{name}: invalid route mask")
+                if expected_valid:
+                    order = experts[expert]["converted"]["activation_order"]
+                    expected = raw[route].index_select(1, order)
+                    if not torch.equal(got[route], expected):
+                        raise AssertionError(f"{name}: gathered FP8 bytes differ from original-order permutation")
+            completed.append(name)
+    return completed
+
+
 def routed_inputs(experts, routes, rows, iteration, device):
     import torch
 
@@ -287,6 +376,8 @@ def run_resident_checks(device, factory, stage, fixtures):
         if list(bank.metadata())[:3] != [EXPERTS, N, k]:
             raise AssertionError("Resident metadata geometry mismatch")
         banks[k] = bank
+        if isinstance(bank, VectorizedBank):
+            completed.extend(run_vectorized_byte_checks(device, bank, experts, stage))
         for iteration, selected in enumerate(routes):
             for rows in ROWS:
                 name = f"resident_k{k}_ids{iteration}_m{rows}"
@@ -490,11 +581,25 @@ def run_real_checks(args, device, grouped, factory, stage):
 
     layer, expert = map(int, args.expert.split(":"))
     artifact = open_vq2a8_tp1_artifact(args.model / "experts_vq_ascend_v2", args.model / "config.json")
+    prepacked = None
+    if args.artifact is not None:
+        from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import open_vq2a8_v4_v2_prepacked_artifact
+
+        prepacked = open_vq2a8_v4_v2_prepacked_artifact(args.artifact, args.model / "config.json")
     completed = []
     for kind in ("gate_up", "down"):
         with stage(f"real_{kind}_load"):
             payload, spec = artifact.load_expert(layer, expert, kind)
             converted = convert_expert_payload(payload, spec)
+            if prepacked is not None:
+                stored, stored_spec = prepacked.load_expert(layer, expert, kind)
+                if stored_spec != spec:
+                    raise AssertionError("Prepacked real expert changed its activation preparation contract")
+                for field in FIELDS:
+                    # Raw bytes also distinguish signed zero in FP32 metadata.
+                    if not torch.equal(stored[field].view(torch.uint8), converted[field].view(torch.uint8)):
+                        raise AssertionError(f"Prepacked real expert changed {kind}_{field} bytes")
+                converted = stored
             dense = decode_repacked_vq2a8_codebook_weight(payload, spec, compute_dtype=torch.float64)
             uploaded = {name: value.to(device) for name, value in converted.items()}
             bank = factory(*([uploaded[name]] for name in FIELDS)) if args.phase != "kernel" else None
@@ -579,8 +684,16 @@ def run_case_child(args):
             native = torch.ops.vq2a8_ascendc_v4_v2
             if native.abi_version() != 1:
                 raise ValueError("V4 + v2 ABI mismatch")
+            if args.activation_reorder == "vectorized":
+                try:
+                    reorder_version = native.activation_reorder_version()
+                except (AttributeError, RuntimeError) as exc:
+                    raise ValueError("Rebuild the V4 + v2 library for --activation-reorder vectorized") from exc
+                if reorder_version != 1:
+                    raise ValueError("V4 + v2 vectorized activation-reorder feature mismatch")
             factory = torch.classes.vq2a8_ascendc_v4_v2.ResidentBank
-            emit(CASE, "INFO", library=identity, device=device_info)
+            factory = selected_bank_factory(factory, args.activation_reorder)
+            emit(CASE, "INFO", library=identity, device=device_info, activation_reorder=args.activation_reorder)
         with torch.inference_mode():
             with stage("synthetic_setup"):
                 fixtures = {k: [synthetic_fixture(k, expert) for expert in range(EXPERTS)] for k in REDUCTIONS}
@@ -592,6 +705,8 @@ def run_case_child(args):
             "CASE_PASS",
             results=results,
             library=identity,
+            activation_reorder=args.activation_reorder,
+            activation_reorder_verified="resident" in results,
             device_execution_verified=True,
             graph_verified="graph" in results,
             model_integration_verified=False,
@@ -644,11 +759,18 @@ def main(argv=None):
                     or final.get("device_execution_verified") is not True
                     or set(completed) != expected_phases
                     or not all(completed.values())
+                    or final.get("activation_reorder", "scalar") != args.activation_reorder
+                    or (
+                        args.activation_reorder == "vectorized" and final.get("activation_reorder_verified") is not True
+                    )
                 ):
                     report.update(status="FAIL", error="Child returned incomplete projection evidence")
                 else:
                     report["device_execution_verified"] = True
                     report["graph_verified"] = final.get("graph_verified") is True and "graph" in completed
+                    report["activation_reorder_verified"] = (
+                        final.get("activation_reorder_verified") is True and "resident" in completed
+                    )
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED"
     except Exception as exc:

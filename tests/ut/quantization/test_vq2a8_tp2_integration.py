@@ -344,6 +344,7 @@ def test_tp2_architecture_alias_cannot_be_used_as_tp1_or_vice_versa():
     names = {"VQ2A8TP1OfflineForCausalLM", "VQ2A8TP2OfflineForCausalLM"}
     classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name in names]
     scope = {
+        "torch": torch,
         "AscendDeepseekV4ForCausalLM": object,
         "OfflineDecoderModel": object,
         "validate_offline_config": lambda cfg: {},

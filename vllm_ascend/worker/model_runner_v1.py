@@ -2317,7 +2317,9 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            if self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") == "moe":
+            if self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") in (
+                "moe", "decoder"
+            ):
                 # CPU scheduler progress distinguishes a one-token prefill
                 # from decode. _dummy_run deliberately never sets this marker.
                 is_v4_decode = (
@@ -3389,7 +3391,20 @@ class NPUModelRunner(GPUModelRunner):
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
         profile_cpp: bool = False,
+        vq2a8_capture_position: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if vq2a8_capture_position is not None:
+            if (
+                self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph") != "decoder"
+                or type(vq2a8_capture_position) is not int
+                or not 0 <= vq2a8_capture_position < self.model._v4_decoder_max_model_len
+                or num_tokens != 1
+                or not uniform_decode
+                or not force_attention
+                or not is_graph_capturing
+                or self.speculative_config is not None
+            ):
+                raise ValueError("Invalid explicit V4 B1 startup decoder capture request.")
         # only support eager mode and piecewise graph now
         assert cudagraph_runtime_mode is None or cudagraph_runtime_mode.valid_runtime_modes()
         # If cudagraph_mode.decode_mode() == FULL and
@@ -3538,12 +3553,21 @@ class NPUModelRunner(GPUModelRunner):
             # metadata reads block_table[:num_reqs_padded] below. Sync padded
             # rows as well so device-side metadata does not see stale block ids.
             self.input_batch.block_table.commit_block_table(num_reqs_padded)
+            if vq2a8_capture_position is not None:
+                # No scheduled request exists during worker startup. Capture
+                # writes only block zero, whose complete KV/state contents are
+                # snapshotted/restored by the model's decoder graph owner.
+                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                    table = self.input_batch.block_table[kv_cache_gid]
+                    table.get_device_tensor().zero_()
+                    table.slot_mapping.gpu.fill_(vq2a8_capture_position)
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             # check how to build dummy
             if self.use_compress:
-                self.positions.fill_(127)
-                self._dsa_positions_cpu_buf.fill_(127)
+                capture_position = 127 if vq2a8_capture_position is None else vq2a8_capture_position
+                self.positions.fill_(capture_position)
+                self._dsa_positions_cpu_buf.fill_(capture_position)
             attn_metadata, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
@@ -3577,6 +3601,13 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 input_ids = self.input_ids.gpu[:num_tokens_padded]
                 inputs_embeds = None
+
+            if vq2a8_capture_position is not None:
+                # Deterministic in-range synthetic IDs, not uninitialized
+                # dummy allocator contents. Replay copies each live token.
+                if input_ids is None:
+                    raise ValueError("Decoder graph startup requires actual token ID buffers.")
+                input_ids.fill_(0)
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]
@@ -3638,6 +3669,8 @@ class NPUModelRunner(GPUModelRunner):
                 input_ids=input_ids,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ):
+                if vq2a8_capture_position is not None:
+                    get_forward_context().vq2a8_capture_position = vq2a8_capture_position
                 outputs = self._model_forward(
                     num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds
                 )

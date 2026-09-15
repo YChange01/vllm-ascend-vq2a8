@@ -778,6 +778,10 @@ class NPUWorker(WorkerBase):
         # worker readiness. It never runs decoder/attention or writes KV state.
         if self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") == "moe":
             self.model_runner.get_model().prepare_v4_graphs()
+        elif self.vllm_config.additional_config.get("vq2a8_offline", {}).get("v4_decode_graph", "none") == "decoder":
+            # Explicit position-specialized decoder capture checkpoints and
+            # restores KV/compressor/indexer buffers before worker readiness.
+            self.model_runner.get_model().prepare_v4_graphs(runner=self.model_runner)
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:

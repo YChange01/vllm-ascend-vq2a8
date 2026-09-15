@@ -135,7 +135,7 @@ def test_owner_loads_only_candidate_and_selects_candidate_class(monkeypatch, tmp
 
     monkeypatch.setattr(vq2a8_ascendc, "load_pinned_library", forbidden)
     monkeypatch.setattr(offline, "artifact_format", lambda path: offline.VQ2_DIRECT_TP1_FORMAT)
-    artifact = object()
+    artifact = NS(root=tmp_path / "artifact", manifest={"format": offline.VQ2_DIRECT_TP1_FORMAT})
     monkeypatch.setattr(offline, "open_vq2a8_tp1_artifact", lambda *args, **kwargs: artifact)
     monkeypatch.setattr(offline, "audit_offline_root", lambda path: {})
     owner = offline.OfflineMoEOwner(tmp_path / "model", opts, NS(type="npu"))
@@ -163,6 +163,15 @@ def test_model_planner_uses_candidate_layout(monkeypatch, tmp_path):
             layer=header,
             initialize_resident=lambda **kw: calls.append(kw),
             check_resident_integrity=lambda: {},
+            v4_report=lambda: {
+                "layer_index": 0,
+                "source_format": offline.VQ2_DIRECT_TP1_FORMAT,
+                "startup_conversion": True,
+                "preload_host_convert_s": 0.0,
+                "preload_host_read_s": 0.0,
+                "preload_host_validate_s": 0.0,
+                "preload_h2d_s": 0.0,
+            },
         )
     }
 

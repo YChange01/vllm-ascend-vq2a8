@@ -5,6 +5,14 @@ decode graph, and its fixed asynchronous ownership protocol. It adapts the v2
 register-LUT/zN compute source, **not** the experimental v3 resident runtime.
 The old V4 backend remains the default and is not overwritten.
 
+To avoid repeating startup layout conversion, use the independent
+[CPU preconverted artifact](vq2a8_v4_v2_prepacked.md) with `--artifact`.
+This does not require another native build or change compute/graph options.
+
+For the independent vector reorder, fused preparation and expanded decoder
+graph candidates, see [three decode optimizations](vq2a8_v4_perf3.md). The
+commands below retain the original scalar/rowwise/MoE-only baseline.
+
 ## Scope and numerical contract
 
 - Execution policy stays `ascendc_v4`; `v4_compute_backend=v2` selects the candidate.

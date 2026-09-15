@@ -25,12 +25,18 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 MAX_CONTEXT = 128
+DECODER_GRAPH_MAX_CONTEXT = 16
 KV_BYTES = 1024**3
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("/home/g00872988/vq2a8"))
+    parser.add_argument(
+        "--artifact",
+        type=Path,
+        help="Expert artifact directory; defaults to MODEL/experts_vq_ascend_v2. Prepacked experts require backend v2",
+    )
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so")
     parser.add_argument(
         "--compute-backend",
@@ -39,6 +45,18 @@ def parse_args(argv=None):
         help="V4 compute kernel: v1 preserves the baseline; v2 needs libvq2a8_ascendc_v4_v2.so (not old v2/v3)",
     )
     parser.add_argument("--physical-npu", type=int, default=1)
+    parser.add_argument(
+        "--activation-reorder",
+        choices=("scalar", "vectorized"),
+        default="scalar",
+        help="V4 v2 FP8-byte reorder: scalar baseline or opt-in UB vector gather (requires rebuilt library)",
+    )
+    parser.add_argument(
+        "--activation-preparation",
+        choices=("rowwise", "fused"),
+        default="rowwise",
+        help="V4 v2 preparation: original rowwise or fused sign/quantization with unchanged RHT/bias GEMMs",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -66,9 +84,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--decode-graph",
-        choices=("none", "moe"),
+        choices=("none", "moe", "decoder"),
         default="none",
-        help="Opt-in single-token MoE NPUGraph; requires --device-route-decode; Attention/prefill stay eager",
+        help="Opt-in single-token graph: moe or position-specialized decoder (max length 16); prefill stays eager",
     )
     parser.add_argument(
         "--graph-replay-stream",
@@ -77,10 +95,18 @@ def parse_args(argv=None):
         help="MoE graph replay stream: owner preserves the baseline; caller removes per-layer event bridges",
     )
     args = parser.parse_args(argv)
-    if args.decode_graph == "moe" and not args.device_route_decode:
-        parser.error("--decode-graph moe requires --device-route-decode.")
-    if args.graph_replay_stream == "caller" and args.decode_graph != "moe":
-        parser.error("--graph-replay-stream caller requires --decode-graph moe.")
+    if args.decode_graph != "none" and not args.device_route_decode:
+        parser.error("--decode-graph moe/decoder requires --device-route-decode.")
+    if args.graph_replay_stream == "caller" and args.decode_graph == "none":
+        parser.error("--graph-replay-stream caller requires --decode-graph moe or decoder.")
+    if args.decode_graph == "decoder" and (
+        args.graph_replay_stream != "caller" or args.max_model_len > DECODER_GRAPH_MAX_CONTEXT
+    ):
+        parser.error("--decode-graph decoder requires --graph-replay-stream caller and --max-model-len <=16.")
+    if (
+        args.activation_reorder != "scalar" or args.activation_preparation != "rowwise"
+    ) and args.compute_backend != "v2":
+        parser.error("Activation optimizations require --compute-backend v2.")
     if args.physical_npu < 0 or not 1 <= args.port <= 65535:
         parser.error("Require a nonnegative physical NPU and port in [1,65535].")
     if not args.host or any(character.isspace() for character in args.host):
@@ -103,9 +129,9 @@ def parse_args(argv=None):
 
 def build_command(args):
     model, library = args.model.resolve(strict=True), args.library.resolve(strict=True)
-    artifact = (model / "experts_vq_ascend_v2").resolve(strict=True)
+    artifact = (args.artifact if args.artifact is not None else model / "experts_vq_ascend_v2").resolve(strict=True)
     if not model.is_dir() or not artifact.is_dir():
-        raise ValueError("Model and its standard experts_vq_ascend_v2 direct TP1 artifact must be directories.")
+        raise ValueError("Model and expert artifact must be directories.")
     if library.suffix != ".so" or not library.is_file():
         raise ValueError("--library must be an existing native .so file for the selected V4 compute backend.")
     if args.compute_backend == "v2" and library.name != "libvq2a8_ascendc_v4_v2.so":
@@ -139,6 +165,10 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_device_route_decode"] = True
     if args.compute_backend != "v1":
         additional["vq2a8_offline"]["v4_compute_backend"] = args.compute_backend
+    if args.activation_reorder != "scalar":
+        additional["vq2a8_offline"]["v4_activation_reorder"] = args.activation_reorder
+    if args.activation_preparation != "rowwise":
+        additional["vq2a8_offline"]["v4_activation_preparation"] = args.activation_preparation
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
@@ -238,6 +268,7 @@ def main(argv=None):
                 f"Starting vllm serve at http://{args.host}:{args.port} "
                 f"(V4 TP1, device selector {args.physical_npu}, "
                 f"compute_backend={args.compute_backend}, "
+                f"activation_reorder={args.activation_reorder}, activation_preparation={args.activation_preparation}, "
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
                 "Confirm this card is available; no other jobs are stopped.",

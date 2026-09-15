@@ -11,4 +11,8 @@ void LaunchResidentSelect(void* stream, uint32_t blocks, void* bank, void* route
 void LaunchResidentPrepare(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x, void* scale,
                            void* bias, void* reordered, void* descriptors, void* output, void* valid,
                            uint32_t experts, uint32_t routes, uint32_t m, uint32_t n, uint32_t k);
+void LaunchResidentPrepareVectorized(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
+                                    void* scale, void* bias, void* reordered, void* descriptors,
+                                    void* output, void* valid, uint32_t experts, uint32_t routes,
+                                    uint32_t m, uint32_t n, uint32_t k);
 }  // namespace vq2a8_ascendc_v4_v2

@@ -16,7 +16,6 @@ import math
 import time
 from pathlib import Path
 
-import numpy as np
 import regex as re
 import torch
 import torch.nn.functional as F
@@ -25,15 +24,57 @@ from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
 from vllm_ascend.quantization.vq2a8_execution import ALLOCATION_GRANULARITY, ASCENDC_MAX_JOBS, ASCENDC_MAX_ROWS
 from vllm_ascend.quantization.vq2a8_execution_v4 import AscendCV4VQ2TP1MoE, _tensor_identity
 from vllm_ascend.quantization.vq2a8_runtime import VQ2_TP1_TORCH_DTYPES
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_ABI_VERSION as V4_V2_ABI_VERSION,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_BANK_COPIES as V4_V2_BANK_COPIES,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_BANK_WORDS as V4_V2_BANK_WORDS,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_DTYPES as V4_V2_DTYPES,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_FIELDS as V4_V2_FIELDS,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_MAX_EXPERTS as V4_V2_MAX_EXPERTS,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_SUPPORTED_K as V4_V2_SUPPORTED_K,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    V4_V2_SUPPORTED_N as V4_V2_SUPPORTED_N,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    _cpu_tensor as _cpu_tensor,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    _geometry as _geometry,
+)
+from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
+    convert_expert_payload as convert_expert_payload,
+)
 
-V4_V2_ABI_VERSION = 1
-V4_V2_MAX_EXPERTS = 256
-V4_V2_SUPPORTED_N = 4096
-V4_V2_SUPPORTED_K = (2048, 4096)
-V4_V2_FIELDS = ("packed_zn", "pair_lut", "activation_order", "weight_scale", "weight_bias", "rht_sign")
-V4_V2_DTYPES = (torch.uint8, torch.uint8, torch.int64, torch.float32, torch.float32, torch.int8)
-V4_V2_BANK_WORDS = 8
-V4_V2_BANK_COPIES = 2  # eager plus optional graph; payload storage is shared
+
+def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, native_ops=None):
+    """Check only explicitly selected native extensions before weight loading."""
+    if reorder not in ("scalar", "vectorized") or preparation not in ("rowwise", "fused"):
+        raise ValueError("Invalid V4 v2 activation options.")
+    native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
+    for selected, feature in (
+        (reorder == "vectorized", "activation_reorder_version"),
+        (preparation == "fused", "activation_preparation_version"),
+    ):
+        if selected:
+            try:
+                version = getattr(native, feature)()
+            except (AttributeError, RuntimeError) as error:
+                raise RuntimeError(f"Rebuild V4 v2 library for {feature}; no fallback.") from error
+            if type(version) is not int or version != 1:
+                raise RuntimeError(f"Unsupported V4 v2 {feature}={version!r}; require 1.")
 
 
 def require_v4_v2_library():
@@ -68,71 +109,11 @@ def load_v4_v2_library(path, expected_sha256):
     return {"path": str(path), "sha256": actual, "abi_version": V4_V2_ABI_VERSION}
 
 
-def _geometry(n, k):
-    if n != V4_V2_SUPPORTED_N or k not in V4_V2_SUPPORTED_K:
-        raise ValueError("V4 v2 supports N=4096 and K=2048/4096 only; no alternate-kernel fallback.")
-
-
-def _cpu_tensor(tensor, name, dtype, shape=None):
-    if not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype or tensor.device.type != "cpu":
-        raise ValueError(f"{name} must be a CPU {dtype} tensor before conversion.")
-    if not tensor.is_contiguous() or (shape is not None and tuple(tensor.shape) != tuple(shape)):
-        raise ValueError(f"Invalid contiguous geometry for {name}.")
-    return tensor
-
-
-def convert_expert_payload(payload, spec):
-    """Convert one validated CPU expert, before its only payload H2D upload.
-
-    Nibble packing and arbitrary 16-entry FP8 pair LUTs are lossless. This
-    creates compressed zN data, not a dense FP8 expert or a second device bank.
-    Source preparation metadata deliberately remains in original K order.
-    """
-    if set(payload) != set(VQ2_TP1_TORCH_DTYPES):
-        raise ValueError("V4 v2 conversion requires exactly the six direct-TP1 fields.")
-    words = _cpu_tensor(payload["packed_indices"], "packed_indices", torch.int32)
-    if words.ndim != 2 or min(words.shape) <= 0:
-        raise ValueError("packed_indices requires positive [N/2,K/8] geometry.")
-    n, k = words.shape[0] * 2, words.shape[1] * 8
-    _geometry(n, k)
-    if spec.rows != n or spec.columns != k or not 0 < spec.rht_true_columns <= k:
-        raise ValueError("V4 v2 conversion geometry disagrees with matrix spec.")
-    books = _cpu_tensor(payload["codebooks"], "codebooks", torch.float8_e4m3fn)
-    if books.ndim != 4 or not 1 <= books.shape[0] <= 256 or tuple(books.shape[1:]) != (n // 32, 16, 2):
-        raise ValueError("codebooks requires [1..256,N/32,16,2] arbitrary FP8 pairs.")
-    ids = _cpu_tensor(payload["codebook_tile_ids"], "codebook_tile_ids", torch.uint8, (k,)).numpy()
-    if np.any(ids.astype(np.int64) >= books.shape[0]):
-        raise ValueError("V4 v2 codebook tile ID is out of range.")
-    byte_books = books.view(torch.uint8).numpy()
-    if np.any((byte_books & np.uint8(127)) == np.uint8(127)):
-        raise ValueError("V4 v2 codebooks contain E4M3FN NaN.")
-    retained = {}
-    for name in ("weight_scale", "weight_bias", "rht_sign"):
-        tensor = _cpu_tensor(payload[name], name, VQ2_TP1_TORCH_DTYPES[name], (k,))
-        valid = ((tensor == -1) | (tensor == 1)).all() if name == "rht_sign" else torch.isfinite(tensor).all()
-        if not bool(valid):
-            raise ValueError(f"Invalid expert preparation metadata: {name}.")
-        retained[name] = tensor
-    order = np.argsort(ids, kind="stable").astype(np.int64)
-    blocks = ids[order].reshape(-1, 256)
-    if not np.all(blocks == blocks[:, :1]):
-        raise ValueError("V4 v2 tile populations cannot form homogeneous K256 blocks; no lossy fallback.")
-    unsigned = words.numpy().view(np.uint32)
-    shifts = np.arange(8, dtype=np.uint32) * np.uint32(4)
-    indices = ((unsigned[..., None] >> shifts) & np.uint32(15)).astype(np.uint8).reshape(n // 2, k)
-    indices = indices[:, order]
-    zn = indices.reshape(n // 32, 16, k // 16, 16).transpose(0, 2, 3, 1)
-    packed_zn = np.ascontiguousarray(zn[..., 0::2] | (zn[..., 1::2] << np.uint8(4)))
-    pair_lut = np.ascontiguousarray(byte_books[blocks[:, 0]].reshape(k // 256, n // 32, 32))
-    return {
-        "packed_zn": torch.from_numpy(packed_zn),
-        "pair_lut": torch.from_numpy(pair_lut),
-        "activation_order": torch.from_numpy(order),
-        **retained,
-    }
-
-
 def _projection_shapes(layer, kind):
+    if getattr(layer, "v4_v2_prepacked", False):
+        # The prepacked reader checks actual serialized headers and model
+        # geometry. Do not interpret its six fields as legacy direct tensors.
+        return layer.projection_shapes(kind)
     count = len(layer.expert_ids)
     source = {name: tuple(layer.tensor_shapes[f"{kind}_{name}"]) for name in VQ2_TP1_TORCH_DTYPES}
     packed = source["packed_indices"]
@@ -211,14 +192,52 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     """V4 baseline lifetime and graph protocol, with no old-payload fallback."""
 
     v4_compute_backend = "v2"
+    v4_activation_reorder = "scalar"
+    v4_activation_preparation = "rowwise"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, v4_activation_reorder="scalar", v4_activation_preparation="rowwise", **kwargs):
+        if v4_activation_reorder not in ("scalar", "vectorized"):
+            raise ValueError("V4 v2 activation reorder requires scalar|vectorized.")
+        if v4_activation_preparation not in ("rowwise", "fused"):
+            raise ValueError("V4 v2 activation preparation requires rowwise|fused.")
+        self.v4_activation_reorder = v4_activation_reorder
+        self.v4_activation_preparation = v4_activation_preparation
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
+    def make_v4_preparation(self, *, compact=False, validity=None):
+        if self.v4_activation_preparation == "fused":
+            from vllm_ascend.quantization.vq2a8_activation_fused import FusedV4V2Preparation
+
+            return FusedV4V2Preparation(compact=compact, validity=validity)
+        return RowwiseVQ2A8Preparation(compact=compact, validity=validity)
+
+    def project_v4_prepared(self, bank, quantized, scale, bias, slots):
+        """Static host option; never read route IDs or copy expert payloads."""
+        project = bank.project_vectorized if self.v4_activation_reorder == "vectorized" else bank.project
+        return project(quantized, scale, bias, slots)
+
     def _prepare_host_expert(self, host):
-        return {kind: (convert_expert_payload(payload, spec), spec) for kind, (payload, spec) in host.items()}
+        from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import V4_V2_PREPACKED_FORMAT
+
+        if self.artifact.manifest.get("format") == V4_V2_PREPACKED_FORMAT:
+            # Reader has validated serialized layout and metadata. Never invoke
+            # conversion, reopen original weights or create another layout.
+            return host
+        start = time.perf_counter()
+        converted = {kind: (convert_expert_payload(payload, spec), spec) for kind, (payload, spec) in host.items()}
+        self.timing["host_convert_s"] = self.timing.get("host_convert_s", 0.0) + time.perf_counter() - start
+        return converted
+
+    def _validate_resident_artifact(self):
+        from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import V4_V2_PREPACKED_FORMAT
+
+        if self.artifact.manifest.get("format") == V4_V2_PREPACKED_FORMAT:
+            if not getattr(self.layer, "v4_v2_prepacked", False):
+                raise ValueError("V4 v2 prepacked artifacts require the dedicated validated reader.")
+            return
+        super()._validate_resident_artifact()
 
     def _fingerprint(self, expert_id):
         expert = self._cache[expert_id]
@@ -290,6 +309,8 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             if any((s.rows, s.columns, s.rht_true_columns, s.rht_block_size) != geometry for _, s in entries):
                 raise ValueError("V4 v2 resident bank requires matching expert geometry.")
             bank = bank_type(*[[payload[field] for payload, _ in entries] for field in V4_V2_FIELDS])
+            if self.v4_activation_reorder == "vectorized" and not hasattr(bank, "project_vectorized"):
+                raise RuntimeError("Rebuild the V4 v2 library for vectorized activation reorder; no scalar fallback.")
             if bank.metadata()[3] != len(ids) * V4_V2_BANK_WORDS * 8:
                 raise RuntimeError("V4 v2 native bank metadata differs from the residency plan.")
             banks[kind] = (bank, spec)
@@ -330,7 +351,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         if state is not None and (state.options.preparation != "rowwise" or state.options.pipeline):
             raise ValueError("V4 v2 requires original rowwise preparation; V1 pipeline/FWHT presets are unsupported.")
         if not hasattr(self, "_row_preparation"):
-            self._row_preparation = RowwiseVQ2A8Preparation()
+            self._row_preparation = self.make_v4_preparation()
         start = time.perf_counter()
         prepared = self._row_preparation.many(requests)
         self._timing_sync()
@@ -358,7 +379,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         slot_ids = self._device_route_banks["slots"]
         slots = torch.cat([slot_ids[slot : slot + 1] for _, slot in locations]).contiguous()
         start = time.perf_counter()
-        output, valid = bank.project(q, scale, bias, slots)
+        output, valid = self.project_v4_prepared(bank, q, scale, bias, slots)
         valid = (valid != 0).all() & torch.isfinite(output).all()
         if state is not None:
             state.retain(valid)
@@ -378,10 +399,21 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         self._v2_payload_locations.clear()
 
     def v4_report(self):
+        from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import V4_V2_PREPACKED_FORMAT
+
         report = super().v4_report()
+        source_format = self.artifact.manifest.get("format")
         return {
             **report,
             "compute_backend": "v2",
+            "source_format": source_format,
+            "startup_conversion": source_format != V4_V2_PREPACKED_FORMAT,
+            "preload_host_convert_s": self.timing.get("host_convert_s", 0.0),
+            "preload_host_read_s": self.timing.get("host_read_s", 0.0),
+            "preload_host_validate_s": self.timing.get("host_validate_s", 0.0),
+            "preload_h2d_s": self.timing.get("h2d_s", 0.0),
+            "activation_reorder": self.v4_activation_reorder,
+            "activation_preparation": self.v4_activation_preparation,
             "layout": "v2_zn_pair_lut",
             "arithmetic_contract": "v2_k_regrouped_requires_tolerance_validation",
             "metadata_bytes": self._device_route_banks["metadata_bytes"] if self._device_route_banks else 0,

@@ -40,6 +40,9 @@ def source_hashes(source=SOURCE):
         "grouped_binding.cpp",
         "resident_select.cpp",
         "resident_prepare.cpp",
+        "activation_kernel.cpp",
+        "activation_binding.cpp",
+        "activation_launch.h",
         "layout.h",
         "launch.h",
     )

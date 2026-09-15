@@ -20,6 +20,12 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4 import AscendDeepseekV4ForCausalLM, DeepseekV2DecoderLayer, DeepseekV4Model
 from vllm_ascend.quantization.vq2a8_offline import OfflineMoEOwner, validate_offline_config
 from vllm_ascend.quantization.vq2a8_root_fp8 import ROOT_FP8_POLICY, RootFP8State, root_linear_kind
+from vllm_ascend.quantization.vq2a8_v4_decoder_graph import (
+    DecoderStateSnapshot,
+    V4DecoderGraphBank,
+    mutable_decoder_tensors,
+)
+from vllm_ascend.quantization.vq2a8_v4_device_route import DeviceRouteGraphCompute, create_device_route_banks
 
 
 class OfflineRootFP8Method(LinearMethodBase):
@@ -167,6 +173,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v3_serving = options.get("v3_serving", False)
         self._v4_serving = options.get("v4_serving", False)
         self._v4_compute_backend = options.get("v4_compute_backend", "v1")
+        self._v4_activation_reorder = options.get("v4_activation_reorder", "scalar")
+        self._v4_activation_preparation = options.get("v4_activation_preparation", "rowwise")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -179,6 +187,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_graph_reserve_bytes = int(options.get("cache_reserve_gib", 16.0) * 1024**3)
         self._v4_graph_kv_cache_bytes = getattr(vllm_config.cache_config, "kv_cache_memory_bytes", None)
         self._v4_graph_memory = {}
+        self._v4_decoder_graph = None
+        self._v4_decoder_preparing = False
+        self._v4_decoder_max_model_len = vllm_config.model_config.max_model_len
         self._startup_trace_mode = options.get("v3_startup_trace", "off")
 
     def set_moe_parameters(self):
@@ -267,21 +278,26 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         for layer in layers:
             configure_runtime(layer, preset, profile=False)
         self._v4_serving_batched_ready = True
-        stage = "MODEL_V4_RUNTIME_PREPARED" if self._v4_decode_graph == "moe" else "MODEL_V4_SERVING_READY"
+        stage = "MODEL_V4_RUNTIME_PREPARED" if self._v4_decode_graph != "none" else "MODEL_V4_SERVING_READY"
         print(
             f"{stage} preset={preset} compute_backend={getattr(self, '_v4_compute_backend', 'v1')} "
+            f"activation_reorder={getattr(self, '_v4_activation_reorder', 'scalar')} "
+            f"activation_preparation={getattr(self, '_v4_activation_preparation', 'rowwise')} "
             "expert_payload_runtime_loading=False",
             flush=True,
         )
 
-    def prepare_v4_graphs(self):
-        """Prepare scratch MoE graphs after worker warmup, never by a request.
+    def prepare_v4_graphs(self, runner=None):
+        """Explicit startup capture: MoE-only, or checkpointed decoder graphs.
 
-        No decoder forward is called here: attention, KV and compressor state
-        must not be touched by graph warmup or capture.
+        The historical MoE path never touches attention/cache state. The new
+        decoder path requires the runner and restores mutable state after each
+        position's capture and validation replay. Neither uses a real request.
         """
         if self._v4_decode_graph == "none":
             return self.v4_graph_report()
+        if self._v4_decode_graph == "decoder":
+            return self._prepare_v4_decoder_graphs(runner)
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph preparation requires a healthy idle model.")
         if self._v4_graphs_ready:
@@ -320,6 +336,86 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         print("MODEL_V4_GRAPH_READY " + json.dumps(report), flush=True)
         return report
 
+    def _v4_decoder_compute(self, input_ids, positions):
+        # No profiling counters, deferred Python validity, or nested NPUGraph
+        # replay may enter capture. Pure MoE compute returns fresh device flags.
+        layers = tuple(self.model.offline_owner.layers.values())
+        for layer in layers:
+            layer._v4_decoder_capture = True
+        try:
+            hidden = super().forward(input_ids, positions, None, None)
+            flags = [layer._v4_decoder_valid for layer in layers]
+            if any(flag is None for flag in flags):
+                raise RuntimeError("Decoder capture did not execute every resident MoE layer.")
+            flags.append(torch.isfinite(hidden).all())
+            return hidden, torch.stack(flags).all()
+        finally:
+            for layer in layers:
+                layer._v4_decoder_capture = False
+
+    @torch.inference_mode()
+    def _prepare_v4_decoder_graphs(self, runner):
+        if self._v4_graphs_ready:
+            return self.v4_graph_report()
+        if self._v4_graphs_failed or self._v4_graph_forward_active or runner is None:
+            raise RuntimeError("Decoder graph preparation requires the idle startup runner.")
+        if (
+            not self._offline_loaded
+            or self._offline_root_mode != "bf16"
+            or not self._v4_device_route_decode
+            or self._v4_requested_replay_stream != "caller"
+            or self._v4_graph_kv_cache_bytes is None
+            or not getattr(self.model.offline_owner, "measurement_mode", False)
+        ):
+            raise ValueError("Decoder capture requires serving/device-route/BF16/caller/explicit-KV configuration.")
+        bank = V4DecoderGraphBank(self, self._v4_decoder_max_model_len)
+        self._v4_decoder_graph = bank
+        try:
+            torch.npu.synchronize()
+            self._check_v4_graph_memory("before_decoder_capture")
+            self._enable_v4_serving_batched()
+            bank.caller_stream = torch.npu.current_stream()
+            bank.capture_stream = torch.npu.Stream()
+            bank.capture_state = mutable_decoder_tensors(self.model)
+            bank.snapshot = DecoderStateSnapshot(bank.capture_state)
+            torch.npu.synchronize()
+            self._v4_decoder_preparing = True
+            with torch.npu.stream(bank.capture_stream):
+                for layer in self.model.offline_owner.layers.values():
+                    layer.check_resident_integrity()
+                    layer._v4_decoder_compute = DeviceRouteGraphCompute(layer, banks=create_device_route_banks(layer))
+                    layer._v4_decoder_graph_owner = bank
+                bank.computes = tuple(layer._v4_decoder_compute for layer in self.model.offline_owner.layers.values())
+                for position in range(bank.max_model_len):
+                    print(f"MODEL_V4_DECODER_CAPTURE position={position} stage=begin", flush=True)
+                    runner._dummy_run(
+                        1,
+                        uniform_decode=True,
+                        force_attention=True,
+                        is_graph_capturing=True,
+                        profile_seq_lens=position + 1,
+                        vq2a8_capture_position=position,
+                    )
+                    self._check_v4_graph_memory(f"decoder_position:{position}")
+                    print(f"MODEL_V4_DECODER_CAPTURE position={position} stage=done", flush=True)
+                torch.npu.synchronize()
+                bank.snapshot.restore()
+                torch.npu.synchronize()
+            bank.snapshot = None
+            bank.ready = True
+            self._v4_graphs_ready = True
+            self._v4_graph_enabled = True
+            self._v4_graph_replay_stream = "caller"
+        except BaseException:
+            bank.failed = True
+            self._v4_graphs_failed = True
+            raise
+        finally:
+            self._v4_decoder_preparing = False
+        report = self.v4_graph_report()
+        print("MODEL_V4_GRAPH_READY " + json.dumps(report), flush=True)
+        return report
+
     def _check_v4_graph_memory(self, stage):
         # KV is already allocated by the worker. The original reserve includes
         # KV, so preserve only its remainder; do not charge KV twice.
@@ -345,12 +441,14 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("V4 graph enabled must be a boolean.")
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph mode can only change on a healthy idle model.")
-        if enabled and (self._v4_decode_graph != "moe" or not self._v4_graphs_ready):
+        if enabled and (self._v4_decode_graph == "none" or not self._v4_graphs_ready):
             raise RuntimeError("Call prepare_v4_graphs before enabling V4 MoE graphs.")
         if self._v4_decode_graph == "moe":
             torch.npu.synchronize()
             for layer in self.model.offline_owner.layers.values():
                 layer.set_v4_graph_enabled(enabled)
+        elif self._v4_decode_graph == "decoder":
+            torch.npu.synchronize()
         self._v4_graph_enabled = enabled
         return self.v4_graph_report()
 
@@ -362,6 +460,10 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         """
         if policy not in ("owner", "caller"):
             raise ValueError("V4 graph replay stream must be owner or caller.")
+        if self._v4_decode_graph == "decoder":
+            if policy != "caller" or not self._v4_graphs_ready:
+                raise ValueError("Decoder graphs require their captured caller replay policy.")
+            return self.v4_graph_report()
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph replay stream can only change on a healthy idle model.")
         if self._v4_decode_graph != "moe" or not self._v4_graphs_ready:
@@ -383,16 +485,27 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         return {
             "requested_graph_mode": self._v4_decode_graph,
             "compute_backend": getattr(self, "_v4_compute_backend", "v1"),
-            "effective_graph_mode": "moe" if self._v4_graph_enabled else "none",
+            "activation_reorder": getattr(self, "_v4_activation_reorder", "scalar"),
+            "activation_preparation": getattr(self, "_v4_activation_preparation", "rowwise"),
+            "effective_graph_mode": self._v4_decode_graph if self._v4_graph_enabled else "none",
             "requested_replay_stream_policy": self._v4_requested_replay_stream,
             "replay_stream_policy": self._v4_graph_replay_stream,
-            "graph_scope": "V4_TP1_B1_MOE_DECODE1_ONLY",
+            "graph_scope": (
+                "V4_TP1_B1_DECODER_POSITION_SPECIALIZED"
+                if self._v4_decode_graph == "decoder"
+                else "V4_TP1_B1_MOE_DECODE1_ONLY"
+            ),
             "baseline_mode": (
-                "moe_graph_owner" if self._v4_requested_replay_stream == "caller" else "device_route_decode_eager"
+                "moe_graph_owner"
+                if self._v4_decode_graph == "moe" and self._v4_requested_replay_stream == "caller"
+                else "device_route_decode_eager"
             ),
             "ready": self._v4_graphs_ready,
             "failed": self._v4_graphs_failed,
             "full_model_graph_verified": False,
+            "decoder": (
+                self._v4_decoder_graph.report() if getattr(self, "_v4_decoder_graph", None) is not None else None
+            ),
             "preparation_memory": dict(self._v4_graph_memory),
             "lowest_free_bytes": min((sample["free_bytes"] for sample in self._v4_graph_memory.values()), default=None),
             "per_layer": {
@@ -447,7 +560,9 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if v3 and optimization not in (None, "batched", "v3"):
             raise ValueError("V3 preserves the fixed resident arithmetic path; other presets require separate gates.")
         v4 = any(getattr(layer, "execution_policy", None) == "ascendc_v4" for layer in owner.layers.values())
-        graph_prepared = getattr(self, "_v4_decode_graph", "none") == "moe"
+        graph_prepared = getattr(self, "_v4_decode_graph", "none") in ("moe", "decoder")
+        if getattr(self, "_v4_decode_graph", "none") == "decoder" and not measurement:
+            raise ValueError("Decoder graph correctness uses the dedicated real-model probe, not Python trace capture.")
         if graph_prepared and (not self._v4_graphs_ready or self._v4_graphs_failed):
             raise RuntimeError("Prepare healthy V4 MoE graphs before configuring a performance probe.")
         if graph_prepared and (optimization != "device_route_decode" or profile):
@@ -542,7 +657,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "forwards": getattr(self, "_measurement_forwards", 0),
             "graph": self.v4_graph_report()["per_layer"] if getattr(self, "_v4_decode_graph", "none") == "moe" else {},
             "graph_status": self.v4_graph_report()
-            if getattr(self, "_v4_decode_graph", "none") == "moe"
+            if getattr(self, "_v4_decode_graph", "none") != "none"
             else {"effective_graph_mode": "none"},
             "native_counter_scope": "eager_python_submissions_only; graph replays are reported separately",
             "cache": owner.cache_report(),
@@ -582,6 +697,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph model is failed or already executing; no eager fallback.")
         context = get_forward_context()
+        if self._v4_decode_graph == "decoder" and self._v4_decoder_preparing:
+            position = getattr(context, "vq2a8_capture_position", None)
+            if type(position) is not int or intermediate_tensors is not None or inputs_embeds is not None:
+                raise ValueError("Decoder capture requires explicit startup position and unembedded TP1 inputs.")
+            return self._v4_decoder_graph.capture(position, input_ids, positions, context, self._v4_decoder_compute)
         # Only execute_model supplies this scheduler-derived marker. Dummy
         # runs (including nonempty attention metadata) deliberately omit it.
         phase = getattr(context, "vq2a8_request_phase", "profile")
@@ -592,6 +712,13 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         is_decode = phase == "decode" and not getattr(context, "in_profile_run", False)
         self._v4_graph_forward_active = True
         try:
+            if self._v4_decode_graph == "decoder" and is_decode and self._v4_graph_enabled:
+                if intermediate_tensors is not None or inputs_embeds is not None:
+                    raise ValueError("Decoder replay accepts only TP1 token IDs, not intermediate tensors/embeddings.")
+                hidden, valid = self._v4_decoder_graph.replay(input_ids, positions, context)
+                self._measurement_valid = valid if self._measurement_valid is None else self._measurement_valid & valid
+                self._measurement_forwards += 1
+                return hidden
             for layer in self.model.offline_owner.layers.values():
                 layer.set_v4_graph_phase(is_decode)
             return self._forward_without_v4_graph_phase(input_ids, positions, intermediate_tensors, inputs_embeds)
@@ -622,7 +749,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("A profiling/dummy attention path cannot count as real model execution.")
         if getattr(self.model.offline_owner, "measurement_mode", False):
             context = get_forward_context()
-            if self._v4_decode_graph == "moe":
+            if self._v4_decode_graph != "none":
                 real_attention = getattr(context, "vq2a8_request_phase", "profile") in (
                     "prefill",
                     "decode",
@@ -690,12 +817,12 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 # well as MoE validity, before the sampler can accept tokens.
                 flags.append(self._measurement_valid)
                 if not bool(torch.stack(flags).all()):
-                    if self._v4_decode_graph == "moe":
+                    if self._v4_decode_graph != "none":
                         self._v4_graphs_failed = True
                     raise ValueError("V4 device-route forward failed validity checks; no output tokens are accepted.")
             return logits
         if flags and not bool(torch.stack(flags).all()):
-            if self._v4_decode_graph == "moe":
+            if self._v4_decode_graph != "none":
                 self._v4_graphs_failed = True
             raise ValueError("V4 device-route forward failed validity checks; no output tokens are accepted.")
         print(f"MODEL stage=logits_start rows={hidden_states.shape[0]}", flush=True)

@@ -208,8 +208,11 @@ def configure_runtime(runtime, preset, *, profile=False):
     from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
     from vllm_ascend.quantization.vq2a8_activation_fast import BatchedFWHTPreparation, PreparationGraph
 
+    preparation_factory = getattr(runtime, "make_v4_preparation", RowwiseVQ2A8Preparation)
     if not hasattr(runtime, "_baseline_preparation"):
-        runtime._baseline_preparation = getattr(runtime, "_row_preparation", RowwiseVQ2A8Preparation())
+        runtime._baseline_preparation = getattr(runtime, "_row_preparation", None)
+        if runtime._baseline_preparation is None:
+            runtime._baseline_preparation = preparation_factory()
         runtime._optimization_states = {}
     if preset is None:
         runtime._optimization = None
@@ -229,7 +232,7 @@ def configure_runtime(runtime, preset, *, profile=False):
             if options.prepare_graph:
                 preparation = PreparationGraph(preparation)
         else:
-            preparation = RowwiseVQ2A8Preparation(compact=True, validity=state.retain)
+            preparation = preparation_factory(compact=True, validity=state.retain)
         runtime._optimization_states[preset] = (state, preparation)
     state, preparation = runtime._optimization_states[preset]
     state.valid, state.profile = None, profile

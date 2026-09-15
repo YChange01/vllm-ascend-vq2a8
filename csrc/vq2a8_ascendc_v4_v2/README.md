@@ -8,6 +8,10 @@ source provenance and rights remain documented in
 derived arithmetic sources. The new V4 adapter and integration code carry their
 own SPDX headers.
 
+The Python runtime also supports an optional
+[CPU preconverted expert artifact](../../docs/vq2a8_v4_v2_prepacked.md).
+It persists the current compressed payload layout and requires no native ABI change.
+
 ## Boundary
 
 - Separate library: `libvq2a8_ascendc_v4_v2.so`.
@@ -51,6 +55,23 @@ The first gather implementation uses scalar byte reads/writes split across
 route/row/K chunks, deliberately isolated from the arithmetic pipeline. This is
 a correctness-first adapter, NOT evidence of a speedup. Profile its cost
 separately, particularly for multi-token prefill.
+
+`project_vectorized(...)` has the same input/output contract, but replaces only
+the activation gather with contiguous DMA and vector gathers in UB. The default
+`project(...)` remains scalar. `prepare_vectorized(...)` exposes reordered FP8
+bytes and route validity for diagnostics; bytes for invalid routes are undefined
+and must not be inspected. `activation_reorder_version()` returns 1 for this
+optional interface, without changing the baseline bank ABI.
+
+The optional `activation_sign(...)` and `activation_quantize(...)` operators
+fuse activation pointwise/reduction/validity work around the original one-row
+RHT and bias GEMMs. They do not replace those GEMMs or change the expert layout.
+`activation_preparation_version()` returns 1. Native FP8 rounding must pass the
+independent fused-preparation validator; compilation is not numerical evidence.
+
+See [the three-optimization guide](../../docs/vq2a8_v4_perf3.md) for separate
+build, activation validators, short-context decoder graph validation and A/B
+serving commands. Every new option is disabled by default.
 
 Per-call scratch is reordered activation R*M*K bytes and descriptors R*72 bytes,
 in addition to output R*M*N*2 and validity R*4. Scratch uses the Torch allocator;
