@@ -98,8 +98,13 @@ std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, cons
   RecordInputStream(bias, stream);
   RecordInputStream(packed, stream);
   RecordInputStream(table, stream);
+  // Resolve on the caller, BEFORE enqueueing the handler. NPUStream::stream()
+  // drains the host task queue; invoking it from that queue's consumer makes
+  // the running handler wait for itself. Keep the raw handle and all owners
+  // captured, as in the working V4 grouped projection path.
+  const auto launchStream = stream.stream();
   at_npu::native::OpCommand::RunOpApi(
-      "Vq2a8AscendCV4V2GroupedProjection", [stream, blocks, descriptors, jobs, nTiles, x, scale, bias, packed, table, output]() -> int {
+      "Vq2a8AscendCV4V2GroupedProjection", [launchStream, blocks, descriptors, jobs, nTiles, x, scale, bias, packed, table, output]() -> int {
     // Retain all tensor owners until the queued launch handler executes. The
     // allocator stream records also protect inputs created on another stream;
     // callers remain responsible for normal producer/consumer stream ordering.
@@ -109,7 +114,7 @@ std::vector<at::Tensor> GroupedProjection(const std::vector<at::Tensor>& x, cons
     (void)packed;
     (void)table;
     (void)output;
-    LaunchGrouped(stream.stream(), blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), nTiles);
+    LaunchGrouped(launchStream, blocks, descriptors.data_ptr(), static_cast<uint32_t>(jobs), nTiles);
     return 0;
   }, false);
   return output;

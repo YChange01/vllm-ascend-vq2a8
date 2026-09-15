@@ -99,6 +99,20 @@ def test_standalone_probe_is_separate_and_uses_safe_owner_callback():
     assert 'm.def("abi_version() -> int"' in source
 
 
+def test_grouped_launch_resolves_raw_stream_before_entering_the_task_queue():
+    source = (SOURCE / "grouped_binding.cpp").read_text()
+    body = function(source, "GroupedProjection")
+    before_enqueue, callback = body.split("at_npu::native::OpCommand::RunOpApi(", 1)
+    # NPUStream::stream() drains the host queue. Calling it in the callback
+    # waits for the very handler being executed, before any kernel is launched.
+    assert "const auto launchStream = stream.stream();" in before_enqueue
+    assert "RecordInputStream(x, stream);" in before_enqueue
+    assert "[launchStream, blocks, descriptors, jobs, nTiles, x, scale, bias, packed, table, output]" in callback
+    assert "LaunchGrouped(launchStream," in callback
+    assert ".stream(" not in callback
+    assert "getCurrentNPUStream(" not in callback
+
+
 @pytest.mark.parametrize(
     "routes,m,k", [(1, 1, 2048), (6, 1, 4096), (6, 15, 2048), (6, 16, 4096), (6, 17, 2048), (6, 32, 4096)]
 )

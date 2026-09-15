@@ -72,6 +72,18 @@ reporting PASS. A timeout/failure is not a valid performance measurement. Keep
 the printed report directory and the last stage; do not proceed to the full
 model after a failed stage. Synthetic PASS is not model/logit acceptance.
 
+If the first `kernel_k2048_g1_m1` stage reports BEGIN but never SUBMITTED,
+the custom operator call has not returned; the probe has not reached its
+explicit device synchronization. The initial standalone binding resolved
+`NPUStream::stream()` inside its queued callback. In torch_npu 2.10 that getter
+drains the host queue, so its consumer can wait for its own callback to finish.
+The binding now resolves the raw ACL stream on the caller before enqueueing,
+matching the retained V4 implementation. Rebuild the candidate library after
+updating; replacing Python files alone does not update a loaded native library.
+This fixes the host self-wait hazard, not proof that the v2 device pipeline
+passes. A subsequent SUBMITTED without PASS requires a separate investigation
+of device completion. Keep the ordinary asynchronous probe enabled.
+
 Also check the actual compressed gate/up and down weights of one expert before
 full-model startup. This reads only that expert and compares against an
 independent dense projection oracle; it does not start vLLM:
