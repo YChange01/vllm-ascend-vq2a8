@@ -166,6 +166,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._offline_root_verified = False
         self._v3_serving = options.get("v3_serving", False)
         self._v4_serving = options.get("v4_serving", False)
+        self._v4_compute_backend = options.get("v4_compute_backend", "v1")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -267,7 +268,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             configure_runtime(layer, preset, profile=False)
         self._v4_serving_batched_ready = True
         stage = "MODEL_V4_RUNTIME_PREPARED" if self._v4_decode_graph == "moe" else "MODEL_V4_SERVING_READY"
-        print(f"{stage} preset={preset} expert_payload_runtime_loading=False", flush=True)
+        print(
+            f"{stage} preset={preset} compute_backend={getattr(self, '_v4_compute_backend', 'v1')} "
+            "expert_payload_runtime_loading=False",
+            flush=True,
+        )
 
     def prepare_v4_graphs(self):
         """Prepare scratch MoE graphs after worker warmup, never by a request.
@@ -377,6 +382,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
     def v4_graph_report(self):
         return {
             "requested_graph_mode": self._v4_decode_graph,
+            "compute_backend": getattr(self, "_v4_compute_backend", "v1"),
             "effective_graph_mode": "moe" if self._v4_graph_enabled else "none",
             "requested_replay_stream_policy": self._v4_requested_replay_stream,
             "replay_stream_policy": self._v4_graph_replay_stream,
@@ -451,7 +457,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("device_route_decode requires V4 with v4_device_route_decode explicitly enabled.")
         if v4 and optimization not in (None, "batched", "device_route_decode"):
             raise ValueError(
-                "V4 preserves V1 arithmetic; only original/batched or opt-in device_route_decode is supported."
+                "V4 preserves its selected compute backend; "
+                "only original/batched or opt-in device_route_decode is supported."
             )
         if optimization is not None and not v3 and not device_route:
             OptimizationOptions.preset(optimization)

@@ -32,6 +32,11 @@ OFFLINE_RUNS = 2
 CACHE_EXECUTION_POLICIES = ("cached", "ascendc", "ascendc_v2", "ascendc_v3", "ascendc_v4")
 
 
+def _validate_v4_compute_backend(value, policy):
+    if value not in ("v1", "v2") or (value != "v1" and policy != "ascendc_v4"):
+        raise ValueError("v4_compute_backend requires v1|v2; v2 requires execution_policy=ascendc_v4.")
+
+
 def _validate_cache_memory_fraction(value, policy):
     if policy not in CACHE_EXECUTION_POLICIES:
         raise ValueError("cache_memory_fraction requires a cached or native AscendC execution policy.")
@@ -61,10 +66,12 @@ def offline_engine_options(
     v4_device_route_decode=False,
     v4_decode_graph="none",
     v4_graph_replay_stream="owner",
+    v4_compute_backend="v1",
     verbose_experts=False,
     tensor_parallel_size=1,
 ) -> dict:
     """A fixed, bounded bring-up plan, not a general serving configuration."""
+    _validate_v4_compute_backend(v4_compute_backend, execution_policy)
     if execution_policy not in ("ascendc", "ascendc_v4") and (
         ascendc_library is not None or ascendc_sha256 is not None
     ):
@@ -142,6 +149,7 @@ def offline_engine_options(
                 ),
                 **({"v3_serving": True} if v3_serving else {}),
                 **({"v4_serving": True} if v4_serving else {}),
+                **({"v4_compute_backend": v4_compute_backend} if v4_compute_backend != "v1" else {}),
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
                 **({"v4_decode_graph": v4_decode_graph} if v4_decode_graph != "none" else {}),
                 **({"v4_graph_replay_stream": v4_graph_replay_stream} if v4_decode_graph != "none" else {}),
@@ -200,6 +208,7 @@ def validate_offline_config(config) -> dict:
         "v4_device_route_decode",
         "v4_decode_graph",
         "v4_graph_replay_stream",
+        "v4_compute_backend",
         "v3_startup_trace",
         "verbose_experts",
     }
@@ -281,6 +290,9 @@ def validate_offline_config(config) -> dict:
             raise ValueError("AscendC requires the regression-tested library SHA256.")
     elif "ascendc_library" in options or "ascendc_sha256" in options:
         raise ValueError("Native library options require explicit execution_policy=ascendc or ascendc_v4.")
+    _validate_v4_compute_backend(options.get("v4_compute_backend", "v1"), options.get("execution_policy"))
+    if "v4_compute_backend" in options and options.get("execution_policy") != "ascendc_v4":
+        raise ValueError("v4_compute_backend requires execution_policy=ascendc_v4.")
     if options.get("execution_policy") == "ascendc_v4":
         if options.get("root_linear_mode", "bf16") != "bf16":
             raise ValueError("VQ2A8 v4 requires unchanged BF16 roots.")
@@ -446,15 +458,22 @@ class OfflineMoEOwner:
             _validate_tp2_root_geometry(self.root_config)
         self.native_library = None
         if options.get("execution_policy") in ("ascendc", "ascendc_v4"):
-            from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
-
             if device.type != "npu":
                 raise ValueError("AscendC offline execution requires an NPU, without fallback.")
-            self.native_library = load_pinned_library(options["ascendc_library"], options["ascendc_sha256"])
-            if options.get("v4_device_route_decode", False):
-                from vllm_ascend.quantization.vq2a8_v4_device_route import require_device_route_library
+            backend = options.get("v4_compute_backend", "v1")
+            _validate_v4_compute_backend(backend, options.get("execution_policy"))
+            if backend == "v2":
+                from vllm_ascend.quantization.vq2a8_v4_v2 import load_v4_v2_library
 
-                require_device_route_library()
+                self.native_library = load_v4_v2_library(options["ascendc_library"], options["ascendc_sha256"])
+            else:
+                from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
+
+                self.native_library = load_pinned_library(options["ascendc_library"], options["ascendc_sha256"])
+                if options.get("v4_device_route_decode", False):
+                    from vllm_ascend.quantization.vq2a8_v4_device_route import require_device_route_library
+
+                    require_device_route_library()
         elif options.get("execution_policy") == "ascendc_v2":
             from vllm_ascend.quantization.vq2a8_ascendc_v2 import load_pinned_library
 
@@ -528,6 +547,10 @@ class OfflineMoEOwner:
                 from vllm_ascend.quantization.vq2a8_execution_v4 import AscendCV4VQ2TP1MoE
 
                 runtime_classes["ascendc_v4"] = AscendCV4VQ2TP1MoE
+                if self.options.get("v4_compute_backend", "v1") == "v2":
+                    from vllm_ascend.quantization.vq2a8_v4_v2 import AscendCV4V2VQ2TP1MoE
+
+                    runtime_classes["ascendc_v4"] = AscendCV4V2VQ2TP1MoE
             if self.options.get("execution_policy") == "ascendc_v3":
                 if getattr(self, "tp_size", 1) == 2:
                     from vllm_ascend.quantization.vq2a8_execution_tp2 import AscendCV3VQ2TP2MoE
@@ -660,17 +683,17 @@ class OfflineMoEOwner:
         print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
 
     def _configure_v4_residency(self, budget):
-        """Preload V1 packed experts after all roots and before worker profiling.
-
-        V4 changes only expert residency. Keep the V1 startup token chunk,
-        preparation and native ABI; batched benchmarking is enabled later by
-        its normal between-request performance-probe control.
-        """
+        """Preload one selected packed layout before worker profiling."""
         from vllm_ascend.quantization.vq2a8_execution_v4 import packed_resident_plan
 
         if not self.layers or set(self.layers) != set(self.artifact.layers):
             raise ValueError("V4 requires all artifact layers before full-residency planning.")
-        plan = packed_resident_plan([layer.layer for layer in self.layers.values()], budget["budget_bytes"])
+        planner = packed_resident_plan
+        if self.options.get("v4_compute_backend", "v1") == "v2":
+            from vllm_ascend.quantization.vq2a8_v4_v2 import v4_v2_resident_plan
+
+            planner = v4_v2_resident_plan
+        plan = planner([layer.layer for layer in self.layers.values()], budget["budget_bytes"])
         self.cache_plan = {**budget, **plan, "preload_complete": False}
         print("MODEL_CACHE_PLAN " + json.dumps(self.cache_plan), flush=True)
         started = time.perf_counter()
@@ -721,7 +744,7 @@ class OfflineMoEOwner:
                     "planned_bytes": plan["planned_bytes"],
                     "preload_elapsed_s": self.cache_plan["preload_elapsed_s"],
                     "expert_payload_runtime_loading": False,
-                    "native_abi": "v1",
+                    "native_abi": "v4_v2_abi1" if self.options.get("v4_compute_backend", "v1") == "v2" else "v1",
                 }
             ),
             flush=True,

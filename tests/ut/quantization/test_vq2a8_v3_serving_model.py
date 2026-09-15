@@ -19,7 +19,12 @@ REPO = Path(__file__).resolve().parents[3]
 def _offline_functions():
     source = REPO / "vllm_ascend/quantization/vq2a8_offline.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    methods = {"offline_engine_options", "validate_offline_config", "_validate_cache_memory_fraction"}
+    methods = {
+        "offline_engine_options",
+        "validate_offline_config",
+        "_validate_cache_memory_fraction",
+        "_validate_v4_compute_backend",
+    }
     body = [
         node
         for node in tree.body

@@ -82,6 +82,11 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
     """Preload V1 packed experts once; all subsequent expert accesses are hits."""
 
     execution_policy = "ascendc_v4"
+    v4_compute_backend = "v1"
+
+    @staticmethod
+    def residency_plan(layers, budget_bytes):
+        return packed_resident_plan(layers, budget_bytes)
 
     def __init__(self, *args, **kwargs):
         # In particular, do not configure a batched profile here. vLLM startup
@@ -139,7 +144,7 @@ class AscendCV4VQ2TP1MoE(AscendCVQ2TP1MoE):
             raise RuntimeError("V4 residency must initialize once from an empty cache.")
         if self.artifact.manifest.get("format") != VQ2_DIRECT_TP1_FORMAT:
             raise ValueError("V4 requires the V1 direct-TP1 artifact; packed-zN is not supported.")
-        plan = packed_resident_plan([self.layer], budget_bytes)
+        plan = self.residency_plan([self.layer], budget_bytes)
         self._resident_plan = plan["layer_plans"][self.layer_index]
         self._resident_started = True
         self.cache_experts = len(self.layer.expert_ids)

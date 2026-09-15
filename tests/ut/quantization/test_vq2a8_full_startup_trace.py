@@ -7,13 +7,13 @@ import builtins
 import importlib.util
 import json
 import math
-import re
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
+import regex as re
 import torch
 
 from tools import serve_vq2a8_v3 as server
@@ -50,7 +50,7 @@ def validation_function():
     # exercising the production config validator without importing vLLM.
     source = REPO / "vllm_ascend/quantization/vq2a8_offline.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
-    names = {"validate_offline_config", "_validate_cache_memory_fraction"}
+    names = {"validate_offline_config", "_validate_cache_memory_fraction", "_validate_v4_compute_backend"}
     body = [
         node
         for node in tree.body

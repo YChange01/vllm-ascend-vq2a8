@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Start standard vLLM HTTP serving with V4 TP1 full-resident V1-packed experts.
+"""Start vLLM HTTP serving with V4 TP1 full residency and a selected compute backend.
 
 No build, repack, version audit, acceptance receipt or numerical preflight.
 Confirm the selected NPU is available before starting this persistent server.
@@ -32,6 +32,12 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", type=Path, default=Path("/home/g00872988/vq2a8"))
     parser.add_argument("--library", type=Path, default=REPO / "build/vq2a8-ascendc-v023-v1/libvq2a8_ascendc.so")
+    parser.add_argument(
+        "--compute-backend",
+        choices=("v1", "v2"),
+        default="v1",
+        help="V4 compute kernel: v1 preserves the baseline; v2 needs libvq2a8_ascendc_v4_v2.so (not old v2/v3)",
+    )
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -101,7 +107,13 @@ def build_command(args):
     if not model.is_dir() or not artifact.is_dir():
         raise ValueError("Model and its standard experts_vq_ascend_v2 direct TP1 artifact must be directories.")
     if library.suffix != ".so" or not library.is_file():
-        raise ValueError("--library must be the existing V1 libvq2a8_ascendc .so, not a V3 library.")
+        raise ValueError("--library must be an existing native .so file for the selected V4 compute backend.")
+    if args.compute_backend == "v2" and library.name != "libvq2a8_ascendc_v4_v2.so":
+        raise ValueError(
+            "--compute-backend v2 requires libvq2a8_ascendc_v4_v2.so; old V2/V3 libraries are not compatible."
+        )
+    if args.compute_backend == "v1" and library.name == "libvq2a8_ascendc_v4_v2.so":
+        raise ValueError("Select --compute-backend v2 for libvq2a8_ascendc_v4_v2.so.")
     # Pin the file used by the runtime, without requiring a build manifest or
     # an acceptance receipt. Actual ABI/weight/device checks remain in loader.
     sha256 = hashlib.sha256(library.read_bytes()).hexdigest()
@@ -125,6 +137,8 @@ def build_command(args):
     }
     if args.device_route_decode:
         additional["vq2a8_offline"]["v4_device_route_decode"] = True
+    if args.compute_backend != "v1":
+        additional["vq2a8_offline"]["v4_compute_backend"] = args.compute_backend
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
@@ -223,6 +237,7 @@ def main(argv=None):
             print(
                 f"Starting vllm serve at http://{args.host}:{args.port} "
                 f"(V4 TP1, device selector {args.physical_npu}, "
+                f"compute_backend={args.compute_backend}, "
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
                 "Confirm this card is available; no other jobs are stopped.",

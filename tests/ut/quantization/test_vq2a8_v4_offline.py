@@ -428,7 +428,7 @@ def test_v4_probe_rejects_other_math_or_graph_paths_before_changing_state(monkey
     layer.execution_policy = "ascendc_v4"
     model = NS(_offline_loaded=True, _offline_root_mode="bf16", model=NS(offline_owner=NS(layers={0: layer})))
     monkeypatch.setattr(torch, "npu", NS(synchronize=lambda: pytest.fail("invalid preset")), raising=False)
-    with pytest.raises(ValueError, match="V4 preserves V1 arithmetic"):
+    with pytest.raises(ValueError, match="V4 preserves its selected compute backend"):
         configure(model, measurement=True, compact=True, optimization=preset)
     assert not hasattr(layer, "_optimization")
 

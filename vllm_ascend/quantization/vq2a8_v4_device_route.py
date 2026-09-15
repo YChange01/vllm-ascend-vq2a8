@@ -60,6 +60,9 @@ def create_device_route_banks(runtime):
     Payload producer readiness must be established by the caller first.
     """
     runtime._require_ready()
+    alternate_factory = getattr(runtime, "_create_device_route_banks", None)
+    if alternate_factory is not None:
+        return alternate_factory()
     if runtime.device.type != "npu":
         raise ValueError("V4 device routing requires NPU; no CPU fallback.")
     bank_type = require_device_route_library()
@@ -416,6 +419,7 @@ class DeviceRouteGraphCompute:
             geometries[kind] = [spec.rows, spec.columns, spec.rht_true_columns, spec.rht_block_size]
         self.signature = {
             "layer": getattr(runtime, "layer_index", None),
+            "compute_backend": getattr(runtime, "v4_compute_backend", "v1"),
             "top_k": self.config.top_k,
             "hidden_size": self.config.hidden_size,
             "hash_route": self.root.get("gate.tid2eid") is not None,
@@ -433,6 +437,7 @@ class DeviceRouteGraphCompute:
         config = runtime.config
         return (
             id(runtime),
+            getattr(runtime, "v4_compute_backend", "v1"),
             id(config),
             (
                 config.top_k,
