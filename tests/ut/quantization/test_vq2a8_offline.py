@@ -48,6 +48,125 @@ def test_plan_preserves_model_type_and_selects_only_explicit_offline_architectur
     assert plan["additional_config"]["vq2a8_offline"]["verbose_experts"] is False
 
 
+def decoder_candidate_plan(tmp_path, **overrides):
+    options = {
+        "execution_policy": "ascendc_v4",
+        "ascendc_library": tmp_path / "libvq2a8_ascendc_v4_v2.so",
+        "ascendc_sha256": "a" * 64,
+        "v4_compute_backend": "v2",
+        "v4_device_route_decode": True,
+        "v4_decode_graph": "decoder",
+        "v4_graph_replay_stream": "caller",
+    }
+    options.update(overrides)
+    return offline_engine_options(tmp_path / "model", tmp_path / "artifact", **options)
+
+
+def config_from_decoder_plan(plan):
+    cfg = config()
+    cfg.additional_config = plan["additional_config"]
+    cfg.model_config.max_model_len = plan["max_model_len"]
+    cfg.scheduler_config.max_num_batched_tokens = plan["max_num_batched_tokens"]
+    cfg.cache_config.kv_cache_memory_bytes = plan["kv_cache_memory_bytes"]
+    return cfg
+
+
+def test_decoder_candidate_defaults_leave_new_options_absent(tmp_path):
+    plan = decoder_candidate_plan(tmp_path)
+    options = validate_offline_config(config_from_decoder_plan(plan))
+    assert not {"v4_activation_preparation", "v4_decoder_metadata_mode", "v4_host_profile"} & options.keys()
+    assert plan["enforce_eager"] and plan["max_model_len"] == 16
+
+
+@pytest.mark.parametrize("preparation", ("rowwise", "rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+@pytest.mark.parametrize("host_profile", (False, True))
+def test_decoder_candidate_config_round_trips(tmp_path, preparation, metadata_mode, host_profile):
+    plan = decoder_candidate_plan(
+        tmp_path,
+        v4_activation_preparation=preparation,
+        v4_decoder_metadata_mode=metadata_mode,
+        v4_host_profile=host_profile,
+    )
+    options = validate_offline_config(config_from_decoder_plan(plan))
+    assert options.get("v4_activation_preparation", "rowwise") == preparation
+    assert options.get("v4_decoder_metadata_mode", "recursive") == metadata_mode
+    assert options.get("v4_host_profile", False) is host_profile
+    assert plan["enforce_eager"] and plan["tensor_parallel_size"] == plan["max_num_seqs"] == 1
+    assert options["root_linear_mode"] == "bf16" and options["cache_experts"] == 256
+    assert plan["kv_cache_memory_bytes"] == 1024**3 and options["cache_reserve_gib"] == 16
+
+
+@pytest.mark.parametrize(
+    "key,bad",
+    [
+        ("v4_decoder_metadata_mode", None),
+        ("v4_decoder_metadata_mode", True),
+        ("v4_decoder_metadata_mode", "unsafe"),
+        ("v4_host_profile", None),
+        ("v4_host_profile", 0),
+        ("v4_host_profile", 1),
+        ("v4_host_profile", "false"),
+    ],
+)
+def test_decoder_host_option_types_fail_at_both_config_entrypoints(tmp_path, key, bad):
+    with pytest.raises(ValueError, match=key):
+        decoder_candidate_plan(tmp_path, **{key: bad})
+    cfg = config_from_decoder_plan(decoder_candidate_plan(tmp_path))
+    cfg.additional_config["vq2a8_offline"][key] = bad
+    with pytest.raises(ValueError, match=key):
+        validate_offline_config(cfg)
+
+
+@pytest.mark.parametrize("host_options", ({"v4_decoder_metadata_mode": "planned"}, {"v4_host_profile": True}))
+@pytest.mark.parametrize("graph_mode", ("none", "moe"))
+def test_decoder_host_options_require_decoder_at_both_config_entrypoints(tmp_path, host_options, graph_mode):
+    with pytest.raises(ValueError, match="decoder"):
+        decoder_candidate_plan(tmp_path, v4_decode_graph=graph_mode, v4_graph_replay_stream="owner", **host_options)
+    cfg = config_from_decoder_plan(decoder_candidate_plan(tmp_path))
+    cfg.additional_config["vq2a8_offline"].update(
+        v4_decode_graph=graph_mode, v4_graph_replay_stream="owner", **host_options
+    )
+    with pytest.raises(ValueError, match="decoder"):
+        validate_offline_config(cfg)
+
+
+@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("backend,device_route", (("v1", False), ("v1", True), ("v2", False)))
+def test_packed_activation_requires_v2_device_route_at_both_config_entrypoints(
+    tmp_path, preparation, backend, device_route
+):
+    invalid = {
+        "v4_activation_preparation": preparation,
+        "v4_compute_backend": backend,
+        "v4_device_route_decode": device_route,
+        "v4_decode_graph": "none",
+        "v4_graph_replay_stream": "owner",
+    }
+    with pytest.raises(ValueError, match="activation|device_route"):
+        decoder_candidate_plan(tmp_path, **invalid)
+    cfg = config_from_decoder_plan(decoder_candidate_plan(tmp_path))
+    cfg.additional_config["vq2a8_offline"].update(invalid)
+    with pytest.raises(ValueError, match="activation|device_route"):
+        validate_offline_config(cfg)
+
+
+@pytest.mark.parametrize(
+    "host_options",
+    (
+        {"v4_decoder_metadata_mode": "recursive"},
+        {"v4_decoder_metadata_mode": "planned"},
+        {"v4_host_profile": False},
+        {"v4_host_profile": True},
+    ),
+)
+def test_explicit_v4_host_keys_cannot_leak_into_non_v4_direct_config(host_options):
+    cfg = config()
+    cfg.additional_config["vq2a8_offline"].update(host_options)
+    with pytest.raises(ValueError, match="V4|v4_host_profile"):
+        validate_offline_config(cfg)
+
+
 @pytest.mark.parametrize("verbose_experts", [False, True, None, 1, "false"])
 def test_expert_verbosity_is_an_explicit_boolean(verbose_experts):
     cfg = config()

@@ -178,6 +178,10 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
+        self._v4_decoder_metadata_mode = options.get("v4_decoder_metadata_mode", "recursive")
+        self._v4_host_profile = options.get("v4_host_profile", False)
+        self._v4_host_recorder = None
+        self._v4_host_runner = None
         self._v4_requested_replay_stream = options.get("v4_graph_replay_stream", "owner")
         self._v4_graph_replay_stream = "owner"
         self._v4_graphs_ready = False
@@ -297,7 +301,21 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._v4_decode_graph == "none":
             return self.v4_graph_report()
         if self._v4_decode_graph == "decoder":
-            return self._prepare_v4_decoder_graphs(runner)
+            self._prepare_v4_decoder_graphs(runner)
+            if getattr(self, "_v4_host_profile", False):
+                from vllm_ascend.quantization.vq2a8_host_profile import attach_host_profile, wrap_host_call
+
+                if self._v4_host_recorder is None:
+                    if runner is None:
+                        raise ValueError("Host profiling requires the decoder's model runner on first installation.")
+                    recorder = attach_host_profile(runner)
+                    self.compute_logits = wrap_host_call(recorder, "compute_logits", self.compute_logits)
+                    self._v4_host_recorder = recorder
+                    self._v4_host_runner = runner
+                    self._v4_decoder_graph.host_profiler = recorder
+                elif runner is not None and runner is not self._v4_host_runner:
+                    raise ValueError("Host profiling cannot be rebound to a different model runner.")
+            return self.v4_graph_report()
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph preparation requires a healthy idle model.")
         if self._v4_graphs_ready:
@@ -368,7 +386,11 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             or not getattr(self.model.offline_owner, "measurement_mode", False)
         ):
             raise ValueError("Decoder capture requires serving/device-route/BF16/caller/explicit-KV configuration.")
-        bank = V4DecoderGraphBank(self, self._v4_decoder_max_model_len)
+        bank = V4DecoderGraphBank(
+            self,
+            self._v4_decoder_max_model_len,
+            metadata_mode=getattr(self, "_v4_decoder_metadata_mode", "recursive"),
+        )
         self._v4_decoder_graph = bank
         try:
             torch.npu.synchronize()
@@ -487,6 +509,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "compute_backend": getattr(self, "_v4_compute_backend", "v1"),
             "activation_reorder": getattr(self, "_v4_activation_reorder", "scalar"),
             "activation_preparation": getattr(self, "_v4_activation_preparation", "rowwise"),
+            "decoder_metadata_mode": getattr(self, "_v4_decoder_metadata_mode", "recursive"),
+            "host_profile": self._v4_host_recorder.report() if getattr(self, "_v4_host_recorder", None) else None,
             "effective_graph_mode": self._v4_decode_graph if self._v4_graph_enabled else "none",
             "requested_replay_stream_policy": self._v4_requested_replay_stream,
             "replay_stream_policy": self._v4_graph_replay_stream,

@@ -38,7 +38,13 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--compute-backend", choices=("v1", "v2"), default="v2")
     parser.add_argument("--activation-reorder", choices=("scalar", "vectorized"), default="scalar")
-    parser.add_argument("--activation-preparation", choices=("rowwise", "fused"), default="rowwise")
+    parser.add_argument(
+        "--activation-preparation", choices=("rowwise", "rowwise_packed", "sign_fused", "fused"), default="rowwise"
+    )
+    parser.add_argument("--decoder-metadata-mode", choices=("recursive", "planned"), default="recursive")
+    parser.add_argument(
+        "--host-profile", action="store_true", help="CPU-only ranges/counters; never a timing benchmark"
+    )
     parser.add_argument("--kv-cache-mib", type=int, default=256)
     parser.add_argument("--reserve-gib", type=float, default=3.0)
     parser.add_argument("--engine-memory-fraction", type=float, default=0.9)
@@ -122,6 +128,8 @@ def run_model(args):
         v4_activation_preparation=args.activation_preparation,
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
+        v4_decoder_metadata_mode=args.decoder_metadata_mode,
+        v4_host_profile=args.host_profile,
     )
     options.update(
         max_model_len=16,
@@ -190,6 +198,8 @@ def main(argv=None):
                     ),
                     "activation_reorder": args.activation_reorder,
                     "activation_preparation": args.activation_preparation,
+                    "decoder_metadata_mode": args.decoder_metadata_mode,
+                    "host_profile": args.host_profile,
                     "device_execution": False,
                     "startup_capture_positions": list(range(16)),
                 }

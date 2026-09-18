@@ -316,18 +316,23 @@ class DeviceRouteDecodeState(FastMoEState):
             self.stats["device_select_calls"] += 1
         # Slot count is static host metadata, not device route data. Each row
         # still performs the original one-row RHT/bias GEMV and FP8 conversion.
-        requests = [
-            (
-                hidden[i : i + 1],
-                {"weight_scale": weight_scale[i], "weight_bias": weight_bias[i], "rht_sign": signs[i]},
-                spec,
-            )
-            for i in range(slots.numel())
-        ]
         with self.scope("preparation"):
-            prepared = runtime._row_preparation.many(requests)
+            if getattr(runtime, "v4_activation_preparation", "rowwise") in ("rowwise_packed", "sign_fused"):
+                quantized, scale, bias = runtime._row_preparation.packed(
+                    hidden, weight_scale, weight_bias, signs, spec, validity=self.retain
+                )
+            else:
+                requests = [
+                    (
+                        hidden[i : i + 1],
+                        {"weight_scale": weight_scale[i], "weight_bias": weight_bias[i], "rht_sign": signs[i]},
+                        spec,
+                    )
+                    for i in range(slots.numel())
+                ]
+                prepared = runtime._row_preparation.many(requests)
+                quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
             self.stats["preparation_calls"] += 1
-        quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
         with self.scope("native_projection"):
             project = getattr(runtime, "project_v4_prepared", None)
             output, valid = (
@@ -482,16 +487,21 @@ class DeviceRouteGraphCompute:
         bank, spec = self.banks[kind]
         weight_scale, weight_bias, signs, valid = bank.select(slots)
         retain((valid != 0).all())
-        requests = [
-            (
-                hidden[i : i + 1],
-                {"weight_scale": weight_scale[i], "weight_bias": weight_bias[i], "rht_sign": signs[i]},
-                spec,
+        if getattr(self.runtime, "v4_activation_preparation", "rowwise") in ("rowwise_packed", "sign_fused"):
+            quantized, scale, bias = self.preparations[kind].packed(
+                hidden, weight_scale, weight_bias, signs, spec, validity=retain
             )
-            for i in range(slots.numel())
-        ]
-        prepared = self.preparations[kind].many(requests, validity=retain)
-        quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
+        else:
+            requests = [
+                (
+                    hidden[i : i + 1],
+                    {"weight_scale": weight_scale[i], "weight_bias": weight_bias[i], "rht_sign": signs[i]},
+                    spec,
+                )
+                for i in range(slots.numel())
+            ]
+            prepared = self.preparations[kind].many(requests, validity=retain)
+            quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
         project = getattr(self.runtime, "project_v4_prepared", None)
         output, valid = (
             bank.project(quantized, scale, bias, slots)

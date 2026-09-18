@@ -25,6 +25,7 @@ def _offline_functions():
         "_validate_cache_memory_fraction",
         "_validate_v4_compute_backend",
         "_validate_v4_activation_options",
+        "_validate_v4_host_options",
     }
     body = [
         node

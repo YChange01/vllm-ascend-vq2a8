@@ -566,6 +566,103 @@ def test_graph_preparation_is_explicit_scratch_only_and_ready_after_all_layers(g
         layer.prepare_v4_graph.assert_called_once_with()
 
 
+@pytest.fixture
+def host_profile_model():
+    """Exercise real startup wrapping; decoder capture itself is a CPU stub."""
+    model, owner, _, _ = isolated_model()
+    owner.measurement_mode = True
+    model._measurement_valid = None
+    model._v4_decode_graph = "decoder"
+    model._v4_host_profile = True
+    captures = []
+
+    def prepare(runner):
+        if not model._v4_graphs_ready:
+            assert model._v4_host_recorder is None
+            captures.append(runner)
+            model._v4_decoder_graph = NS(report=lambda: {"ready": True})
+            model._v4_graphs_ready = True
+
+    class Runner:
+        def execute_model(self, hidden):
+            return model.compute_logits(hidden)
+
+    model._prepare_v4_decoder_graphs = prepare
+    return model, Runner(), captures
+
+
+def test_decoder_host_profile_installs_once_after_capture_and_reuses_same_recorder(host_profile_model, capsys):
+    model, runner, captures = host_profile_model
+    original_logits = model.compute_logits
+    report = model.prepare_v4_graphs(runner=runner)
+    recorder = model._v4_host_recorder
+    logits_wrapper, runner_wrapper = model.compute_logits, runner.execute_model
+    assert captures == [runner]
+    assert model._v4_host_runner is runner
+    assert runner._vq2a8_host_profile_recorder is recorder
+    assert model._v4_decoder_graph.host_profiler is recorder
+    assert logits_wrapper.__wrapped__ == original_logits
+    assert report["host_profile"]["phases"] == {}
+
+    hidden = torch.ones(1, 2)
+    assert runner.execute_model(hidden) is model.logits_result
+    model.prepare_v4_graphs(runner=runner)
+    repeated_report = model.prepare_v4_graphs()
+    assert model.compute_logits is logits_wrapper and runner.execute_model is runner_wrapper
+    assert model._v4_host_recorder is recorder and captures == [runner]
+    assert repeated_report["host_profile"]["phases"]["compute_logits"]["calls"] == 1
+    assert runner.execute_model(hidden) is model.logits_result
+    phases = recorder.report()["phases"]
+    assert phases["execute_model"]["calls"] == phases["compute_logits"]["calls"] == 2
+    assert len(model.logits_calls) == 2
+    assert not capsys.readouterr().out
+
+
+def test_decoder_host_profile_rejects_rebinding_without_wrapping_replacement(host_profile_model):
+    model, runner, captures = host_profile_model
+    model.prepare_v4_graphs(runner=runner)
+    recorder, wrapper = model._v4_host_recorder, model.compute_logits
+    replacement = NS(execute_model=Mock())
+    with pytest.raises(ValueError, match="cannot be rebound"):
+        model.prepare_v4_graphs(runner=replacement)
+    assert not hasattr(replacement, "_vq2a8_host_profile_recorder")
+    assert model._v4_host_recorder is recorder and model._v4_host_runner is runner
+    assert model._v4_decoder_graph.host_profiler is recorder and model.compute_logits is wrapper
+    assert captures == [runner]
+
+
+def test_decoder_host_profile_requires_runner_only_on_first_installation(host_profile_model):
+    model, runner, _ = host_profile_model
+    model._prepare_v4_decoder_graphs(runner)
+    with pytest.raises(ValueError, match="first installation"):
+        model.prepare_v4_graphs()
+    assert model._v4_host_recorder is None
+    model.prepare_v4_graphs(runner=runner)
+    assert model.prepare_v4_graphs()["host_profile"]["phases"] == {}
+
+
+def test_decoder_disabled_host_profile_leaves_runner_and_logits_unwrapped(host_profile_model):
+    model, runner, captures = host_profile_model
+    model._v4_host_profile = False
+    logits_function, runner_function = model.compute_logits.__func__, runner.execute_model.__func__
+    report = model.prepare_v4_graphs(runner=runner)
+    assert report["host_profile"] is None and model._v4_host_recorder is None
+    assert model.compute_logits.__func__ is logits_function and runner.execute_model.__func__ is runner_function
+    assert not hasattr(runner, "_vq2a8_host_profile_recorder")
+    assert not hasattr(model._v4_decoder_graph, "host_profiler")
+    assert captures == [runner]
+
+
+def test_decoder_host_logits_wrapper_preserves_execution_failure(host_profile_model):
+    model, runner, _ = host_profile_model
+    model.prepare_v4_graphs(runner=runner)
+    model.logits_result = None
+    with pytest.raises(ValueError, match="Missing model logits"):
+        runner.execute_model(torch.ones(1, 2))
+    phases = model._v4_host_recorder.report()["phases"]
+    assert phases["execute_model"]["calls"] == phases["compute_logits"]["calls"] == 1
+
+
 def test_graph_dummy_nonempty_metadata_never_prepares_or_marks_real_forward(graph_model):
     model, owner, context, selected = graph_model
     context.attn_metadata = {"capture_dummy": NS(num_decodes=1, num_prefills=0)}

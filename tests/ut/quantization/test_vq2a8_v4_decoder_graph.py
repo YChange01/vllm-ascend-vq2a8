@@ -4,6 +4,7 @@
 
 import ast
 from contextlib import contextmanager
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from tools.validate_vq2a8_v4_decoder_graph import CASES, compare_outputs, parse_
 from vllm_ascend.quantization.vq2a8_v4_decoder_graph import (
     DecoderMetadataBuffers,
     DecoderStateSnapshot,
+    PlannedDecoderMetadataBuffers,
     V4DecoderGraphBank,
     decode_position,
     mutable_decoder_tensors,
@@ -75,41 +77,45 @@ def test_position_requires_consistent_cpu_metadata_and_range():
         decode_position(mixed, 16)
 
 
-def test_metadata_clones_owners_rejects_constants_and_unknown_backend_fields():
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_metadata_clones_owners_rejects_constants_and_unknown_backend_fields(buffers):
     source = metadata()
-    owner = DecoderMetadataBuffers(source)
+    owner = buffers(source)
     assert owner.tree["layer"].decode.block_table is not source["layer"].decode.block_table
     owner.update(metadata())
     changed = metadata(4)
     with pytest.raises(ValueError):
         owner.update(changed)
     with pytest.raises(TypeError, match="Unsupported"):
-        DecoderMetadataBuffers({"future_event": object()})
+        buffers({"future_event": object()})
 
 
-def test_immutable_rope_owner_is_not_copied_and_replacement_is_rejected():
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_immutable_rope_owner_is_not_copied_and_replacement_is_rejected(buffers):
     @dataclass
     class Rotary:
         full_compress_cos: torch.Tensor
 
     tensor = torch.ones(8, 4)
-    owner = DecoderMetadataBuffers(Rotary(tensor))
+    owner = buffers(Rotary(tensor))
     assert owner.tree.full_compress_cos is tensor
     owner.update(Rotary(tensor))
     with pytest.raises(ValueError, match="immutable"):
         owner.update(Rotary(tensor.clone()))
 
 
-def test_changed_alias_topology_is_rejected_before_copy():
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_changed_alias_topology_is_rejected_before_copy(buffers):
     tensor = torch.tensor([1])
-    owner = DecoderMetadataBuffers({"x": tensor, "y": tensor})
+    owner = buffers({"x": tensor, "y": tensor})
     assert owner.tree["x"] is owner.tree["y"]
     with pytest.raises(ValueError, match="alias topology"):
         owner.update({"x": tensor.clone(), "y": tensor.clone()})
     owner.update({"x": tensor, "y": tensor})
 
 
-def test_explicit_rope_proxy_retains_layer_lookup_and_rejects_selector_change():
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_explicit_rope_proxy_retains_layer_lookup_and_rejects_selector_change(buffers):
     # Load the actual backend proxy class without its torch_npu imports.
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/rope_dsv4.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -122,13 +128,166 @@ def test_explicit_rope_proxy_retains_layer_lookup_and_rejects_selector_change():
     RopeDataProxy = scope["RopeDataProxy"]
     data = {"config": {"default": (torch.ones(1, 4), torch.zeros(1, 4))}}
     proxy = RopeDataProxy(data)
-    owner = DecoderMetadataBuffers({"cos": proxy})
+    owner = buffers({"cos": proxy})
     assert owner.tree["cos"] is not proxy
     assert torch.equal(owner.tree["cos"]["layer0"], proxy["layer0"])
     assert owner.tree["cos"]["layer0"].data_ptr() != proxy["layer0"].data_ptr()
     owner.update({"cos": proxy})
     with pytest.raises(ValueError, match="selector"):
         owner.update({"cos": RopeDataProxy(data, is_cos=False)})
+
+
+class MetadataDeviceTensor(torch.Tensor):
+    """CPU storage with a non-CPU tag, solely to exercise the copy protocol."""
+
+    @property
+    def device(self):
+        return torch.device("cuda:0")
+
+
+def device_metadata(value):
+    return torch.Tensor._make_subclass(MetadataDeviceTensor, torch.tensor(value), False)
+
+
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_metadata_checks_complete_before_any_copy_and_refreshes_each_request(buffers):
+    source = {"dynamic": device_metadata([1]), "constant": 3}
+    owner = buffers(source)
+    target = owner.tree["dynamic"]
+    for value in (9, 2, 17):
+        source["dynamic"].fill_(value)
+        owner.update(source)
+        assert target.tolist() == [value]
+    assert owner.copies == 3
+    source["dynamic"].fill_(99)
+    source["constant"] = 4
+    with pytest.raises(ValueError, match="constant"):
+        owner.update(source)
+    assert target.tolist() == [17] and owner.copies == 3
+    source["constant"] = 3
+    owner.update(source)
+    assert target.tolist() == [99] and owner.copies == 4
+
+
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+def test_metadata_alias_divergence_rejected_before_device_copy(buffers):
+    tensor = device_metadata([1])
+    owner = buffers({"x": tensor, "y": tensor})
+    tensor.fill_(7)
+    with pytest.raises(ValueError, match="alias topology"):
+        owner.update({"x": tensor, "y": tensor.clone()})
+    assert owner.tree["x"].tolist() == [1] and owner.copies == 0
+    owner.update({"x": tensor, "y": tensor.view_as(tensor)})
+    assert owner.tree["x"].tolist() == [7] and owner.copies == 1
+
+
+@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "replacement,match",
+    (
+        ({"x": [torch.tensor([1])], "extra": 0}, "keys"),
+        ({"x": (torch.tensor([1]),)}, "type"),
+        ({"x": [torch.tensor([1]), 2]}, "length"),
+        ({"x": [torch.tensor([1.0])]}, "tensor contract"),
+        ({"x": [torch.tensor([[1]])]}, "tensor contract"),
+        ({"x": [torch.tensor([2])]}, "CPU metadata"),
+        ({"x": [object()]}, "tensor contract"),
+    ),
+)
+def test_metadata_closed_schema_rejects_changed_structure_and_cpu_values(buffers, replacement, match):
+    owner = buffers({"x": [torch.tensor([1])]})
+    with pytest.raises(ValueError, match=match):
+        owner.update(replacement)
+    assert owner.copies == 0
+
+
+@pytest.mark.parametrize("replacement", (True, 1.0, "1", None))
+def test_planned_constants_preserve_exact_types(replacement):
+    owner = PlannedDecoderMetadataBuffers({"constant": 1})
+    with pytest.raises(ValueError, match="type"):
+        owner.update({"constant": replacement})
+
+
+def test_planned_shared_dataclasses_are_compiled_once_and_replacements_are_checked():
+    shared = metadata()["layer"]
+    source = {str(i): shared for i in range(43)}
+    owner = PlannedDecoderMetadataBuffers(source)
+    single = PlannedDecoderMetadataBuffers({"0": shared})
+    assert len(owner._nodes) == len(single._nodes)
+    assert all(value is owner.tree["0"] for value in owner.tree.values())
+    assert owner.tree["0"] is not shared
+    for _ in range(3):
+        replacement = metadata()["layer"]
+        current = {str(i): replacement for i in range(43)}
+        owner.update(current)
+        # A distinct dataclass is legal if the required constants and tensor
+        # alias topology still agree. Do not skip its validation by target id.
+        current["42"] = copy(replacement)
+        owner.update(current)
+        current["42"].num_prefills = 1
+        with pytest.raises(ValueError, match="constant"):
+            owner.update(current)
+
+
+def test_planned_shared_objects_copy_once_without_reusing_validation_between_requests():
+    tensor = device_metadata([1])
+    source = {str(i): {"dynamic": tensor} for i in range(43)}
+    owner = PlannedDecoderMetadataBuffers(source)
+    for value in (10, 20, 30):
+        shared = {"dynamic": device_metadata([value])}
+        owner.update({str(i): shared for i in range(43)})
+        assert owner.tree["0"]["dynamic"].tolist() == [value]
+    assert owner.copies == 3
+
+
+def test_planned_container_memo_preserves_immutable_field_context():
+    @dataclass
+    class Fields:
+        mutable: list
+        full_compress_cos: list
+
+    tensor = device_metadata([1])
+    source = [tensor]
+    owner = PlannedDecoderMetadataBuffers(Fields(source, source))
+    assert owner.tree.mutable[0] is not tensor
+    assert owner.tree.full_compress_cos[0] is tensor
+    with pytest.raises(ValueError, match="immutable"):
+        owner.update(Fields(source, [tensor.clone()]))
+    assert owner.copies == 0
+
+
+def test_planned_replay_uses_compiled_dataclass_fields(monkeypatch):
+    from vllm_ascend.quantization import vq2a8_v4_decoder_graph as graph_module
+
+    owner = PlannedDecoderMetadataBuffers(metadata())
+
+    def unexpected_reflection(_):
+        raise AssertionError("replay must not rediscover dataclass fields")
+
+    monkeypatch.setattr(graph_module, "fields", unexpected_reflection)
+    owner.update(metadata())
+
+
+def test_planned_rejects_dataclass_schema_changes(monkeypatch):
+    owner = PlannedDecoderMetadataBuffers(metadata())
+    monkeypatch.setitem(Metadata.__dataclass_fields__, "future_field", Metadata.__dataclass_fields__["decode"])
+    with pytest.raises(ValueError, match="dataclass fields"):
+        owner.update(metadata())
+
+
+def test_planned_rejects_captured_buffer_storage_changes():
+    owner = PlannedDecoderMetadataBuffers({"x": device_metadata([1])})
+    owner.tree["x"].resize_(1024)
+    with pytest.raises(ValueError, match="tensor contract"):
+        owner.update({"x": device_metadata([1])})
+    assert owner.copies == 0
+
+
+def test_planned_metadata_rejects_cycles():
+    source = {}
+    source["cycle"] = source
+    with pytest.raises(TypeError, match="Cyclic"):
+        PlannedDecoderMetadataBuffers(source)
 
 
 def test_mutable_state_includes_unregistered_nested_kv_and_shared_buffers():
@@ -194,9 +353,9 @@ class Backend:
             self.capturing = None
 
 
-def make_bank():
+def make_bank(metadata_mode="recursive"):
     backend = Backend()
-    bank = V4DecoderGraphBank(object(), 16, backend=backend)
+    bank = V4DecoderGraphBank(object(), 16, backend=backend, metadata_mode=metadata_mode)
     bank.capture_stream = bank.caller_stream = backend.current
     cache = torch.tensor([99.0])
     bank.snapshot = DecoderStateSnapshot((cache,))
@@ -216,8 +375,9 @@ def make_bank():
     return bank, backend, cache, context
 
 
-def test_capture_restores_state_and_replay_refreshes_token_outputs_validity_and_escapes():
-    bank, backend, cache, context = make_bank()
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+def test_capture_restores_state_and_replay_refreshes_token_outputs_validity_and_escapes(metadata_mode):
+    bank, backend, cache, context = make_bank(metadata_mode)
     assert torch.equal(cache, torch.tensor([99.0]))
     first, valid1 = bank.replay(torch.tensor([10]), torch.tensor([3]), context)
     invalid, invalid_flag = bank.replay(torch.tensor([-1]), torch.tensor([3]), context)
@@ -229,6 +389,43 @@ def test_capture_restores_state_and_replay_refreshes_token_outputs_validity_and_
     assert first.data_ptr() != invalid.data_ptr() != last.data_ptr()
     assert context.attn_metadata["layer"].decode.seq_lens_list == [4]
     assert backend.capturing is None
+    expected = PlannedDecoderMetadataBuffers if metadata_mode == "planned" else DecoderMetadataBuffers
+    assert type(bank.entries[3]["metadata"]) is expected
+    assert bank.report()["metadata_mode"] == metadata_mode
+
+
+def test_decoder_bank_rejects_unknown_metadata_mode():
+    with pytest.raises(ValueError, match="metadata mode"):
+        V4DecoderGraphBank(object(), 16, backend=Backend(), metadata_mode="unsafe")
+
+
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+def test_host_ranges_cover_replay_without_fences_or_changing_results(metadata_mode):
+    from vllm_ascend.quantization.vq2a8_host_profile import HostProfileRecorder
+
+    bank, backend, _, context = make_bank(metadata_mode)
+    scopes = []
+
+    @contextmanager
+    def scope(name):
+        scopes.append(name)
+        yield
+
+    bank.host_profiler = HostProfileRecorder(range_factory=scope)
+    # Startup fences were allowed; replay instrumentation must not add any.
+    backend.fail_sync = True
+    actual, valid = bank.replay(torch.tensor([10]), torch.tensor([3]), context)
+    assert actual.tolist() == [[13, 13]] and bool(valid)
+    expected = (
+        "decoder_position",
+        "runtime_contract",
+        "metadata_update",
+        "decoder_copy_inputs",
+        "decoder_replay_submit",
+        "decoder_copy_outputs",
+    )
+    assert scopes == ["vq2a8::host::" + name for name in expected]
+    assert set(bank.host_profiler.report()["phases"]) == set(expected)
 
 
 def test_replay_failure_latches_but_close_fences_and_releases():

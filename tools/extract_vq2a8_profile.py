@@ -570,6 +570,34 @@ def host_scope_samples(events, bounds, pid, tid, top):
     return ranked(samples, top)
 
 
+def host_phase_summary(events, bounds):
+    """Aggregate explicit host annotations, clipped to a selected window.
+
+    These spans are inclusive and can enclose blocking device waits. Keep
+    them separate from cpu_op exclusive spans and device task coverage.
+    """
+    groups = {}
+    for event in events:
+        name = str(event.get("name", ""))
+        if not name.startswith("vq2a8::host::"):
+            continue
+        span = event_span(event)
+        duration = overlap(span, bounds) if span else 0
+        if not duration:
+            continue
+        key = (str(event.get("pid")), str(event.get("tid")), name)
+        row = groups.setdefault(
+            key, {"pid": key[0], "tid": key[1], "name": name, "count": 0, "clipped_wall_ms": 0.0, "crossing_spans": 0}
+        )
+        row["count"] += 1
+        row["clipped_wall_ms"] += duration / 1000
+        row["crossing_spans"] += int(span[0] < bounds[0] or span[1] > bounds[1])
+    result = sorted(groups.values(), key=lambda row: row["clipped_wall_ms"], reverse=True)
+    for row in result:
+        row["clipped_wall_ms"] = round(row["clipped_wall_ms"], 6)
+    return result
+
+
 def build_report(profile, output, args):
     trace = profile / "trace_view.json"
     if not trace.is_file():
@@ -654,6 +682,7 @@ def build_report(profile, output, args):
                     "cpu_lanes": cpu_exclusive(events, bounds, args.top),
                     "native_api_inclusive_top": api_top(events, bounds, args.top),
                     "host_matmul_samples": host_matmul_samples(events, bounds),
+                    "host_phases_inclusive": host_phase_summary(events, bounds),
                     "host_scope_samples": host_scope_samples(
                         events, bounds, scalar["pid"] if scalar else None, cycle["graph_api"]["tid"], args.top
                     ),
@@ -768,6 +797,8 @@ def render_text(report):
             emit("API_INCLUSIVE_NOT_ADDITIVE", row)
         for row in section["host_scope_samples"]:
             emit("HOST_SCOPE_NOT_ADDITIVE", row)
+        for row in section["host_phases_inclusive"]:
+            emit("HOST_PHASE_INCLUSIVE_NOT_ADDITIVE", row)
         # One copy of samples suffices; child windows overlap the full interval.
         if section["name"] == "full_replay_interval":
             for row in section["host_matmul_samples"]:

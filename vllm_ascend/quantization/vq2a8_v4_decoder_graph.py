@@ -9,9 +9,9 @@ but restores *all* KV/compressor/indexer state after every trial. No request is
 used for warmup or capture, and no per-layer graph replay is nested inside it.
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy
-from dataclasses import fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
 from threading import Lock
 
@@ -136,6 +136,162 @@ class DecoderMetadataBuffers:
             raise ValueError(f"Decoder metadata constant changed for this position: {name}.")
 
 
+@dataclass(frozen=True)
+class _MetadataPlanNode:
+    kind: str
+    target: object
+    name: str
+    contract: object
+    children: tuple = ()
+
+
+class PlannedDecoderMetadataBuffers:
+    """Startup-compiled metadata DAG, with closed, transactional replay checks.
+
+    Shared containers are cloned once and their structure is compiled into
+    indexed nodes. Replay does not discover dataclass fields or rebuild a tree.
+    A per-update (plan node, source identity) memo skips repeated shared paths,
+    but separately validates distinct replacement objects. No source reference
+    or validation result is retained across requests. Tensor aliases retain the
+    recursive implementation's exact-storage-view rule.
+    """
+
+    def __init__(self, metadata):
+        self._nodes = []
+        self._memo = {}
+        self._compiling = set()
+        self._aliases = {}
+        self._root = self._compile(metadata, "")
+        self.tree = self._nodes[self._root].target
+        self._nodes = tuple(self._nodes)
+        # Startup source identities are not meaningful for subsequent requests.
+        del self._memo, self._compiling, self._aliases
+        self.copies = 0
+
+    def _compile(self, value, name):
+        # The same container under mutable and immutable field contexts must
+        # not accidentally share a plan with different tensor ownership rules.
+        key = (id(value), name in IMMUTABLE_METADATA_FIELDS)
+        if key in self._compiling:
+            raise TypeError("Cyclic decoder metadata is unsupported.")
+        if key in self._memo:
+            return self._memo[key]
+        index = len(self._nodes)
+        self._nodes.append(None)
+        self._memo[key] = index
+        self._compiling.add(key)
+
+        if isinstance(value, torch.Tensor):
+            contract = _tensor_contract(value)
+            if name in IMMUTABLE_METADATA_FIELDS:
+                target = value
+                kind = "immutable_tensor"
+            else:
+                identity = (value.data_ptr(), contract)
+                if identity not in self._aliases:
+                    self._aliases[identity] = value.clone()
+                target = self._aliases[identity]
+                kind = "tensor"
+            node = _MetadataPlanNode(kind, target, name, (contract, target.data_ptr()))
+        elif _is_rope_proxy(value):
+            if value.idx not in (0, 1) or not isinstance(value._data, dict):
+                raise ValueError("Invalid DSA rotary proxy selector/data contract.")
+            child = self._compile(value._data, name)
+            target = copy(value)
+            target._data = self._nodes[child].target
+            node = _MetadataPlanNode("proxy", target, name, (type(value), value.idx), (("_data", child),))
+        elif is_dataclass(value) and not isinstance(value, type):
+            target = copy(value)
+            children = []
+            for field in fields(value):
+                child = self._compile(getattr(value, field.name), field.name)
+                children.append((field.name, child))
+                setattr(target, field.name, self._nodes[child].target)
+            node = _MetadataPlanNode(
+                "dataclass", target, name, (type(value), frozenset(value.__dataclass_fields__)), tuple(children)
+            )
+        elif isinstance(value, dict):
+            children = tuple((key, self._compile(item, name)) for key, item in value.items())
+            target = {key: self._nodes[child].target for key, child in children}
+            node = _MetadataPlanNode("dict", target, name, (type(value), frozenset(value)), children)
+        elif isinstance(value, (list, tuple)):
+            children = tuple((i, self._compile(item, name)) for i, item in enumerate(value))
+            target = type(value)(self._nodes[child].target for _, child in children)
+            node = _MetadataPlanNode("sequence", target, name, (type(value), len(value)), children)
+        elif value is None or isinstance(value, (str, int, float, bool, Enum)):
+            node = _MetadataPlanNode("constant", value, name, type(value))
+        else:
+            raise TypeError(f"Unsupported decoder metadata field {name}: {type(value).__name__}.")
+        self._nodes[index] = node
+        self._compiling.remove(key)
+        return index
+
+    def update(self, metadata):
+        pending = [(self._root, metadata)]
+        checked = set()
+        targets = {}
+        while pending:
+            index, source = pending.pop()
+            visit = (index, id(source))
+            if visit in checked:
+                continue
+            checked.add(visit)
+            node = self._nodes[index]
+            kind, target, name = node.kind, node.target, node.name
+            if kind in ("tensor", "immutable_tensor"):
+                expected, pointer = node.contract
+                if (
+                    not isinstance(source, torch.Tensor)
+                    or _tensor_contract(source) != expected
+                    or _tensor_contract(target) != expected
+                    or target.data_ptr() != pointer
+                ):
+                    raise ValueError(f"Decoder metadata tensor contract changed: {name}.")
+                source_view = (source.data_ptr(), expected)
+                if kind == "immutable_tensor":
+                    if source_view[0] != pointer:
+                        raise ValueError(f"Decoder immutable metadata storage changed: {name}.")
+                    continue
+                identity = id(target)
+                previous = targets.get(identity)
+                if previous is not None:
+                    if previous[2] != source_view:
+                        raise ValueError("Decoder metadata alias topology changed; an input would otherwise be frozen.")
+                    continue
+                if target.device.type == "cpu" and not torch.equal(target, source):
+                    raise ValueError(f"Decoder CPU metadata values changed for this position: {name}.")
+                targets[identity] = (target, source, source_view)
+            elif kind == "constant":
+                if type(source) is not node.contract:
+                    raise ValueError(f"Decoder metadata type changed: {name}.")
+                if source != target:
+                    raise ValueError(f"Decoder metadata constant changed for this position: {name}.")
+            elif kind in ("proxy", "dataclass"):
+                if type(source) is not node.contract[0]:
+                    raise ValueError(f"Decoder metadata type changed: {name}.")
+                if kind == "proxy" and source.idx != node.contract[1]:
+                    raise ValueError("Decoder rotary proxy cosine/sine selector changed.")
+                if kind == "dataclass" and source.__dataclass_fields__.keys() != node.contract[1]:
+                    raise ValueError(f"Decoder metadata dataclass fields changed: {name}.")
+                pending.extend((child, getattr(source, key)) for key, child in reversed(node.children))
+            else:
+                expected_type, structure = node.contract
+                if type(source) is not expected_type:
+                    raise ValueError(f"Decoder metadata type changed: {name}.")
+                if kind == "dict" and source.keys() != structure:
+                    raise ValueError(f"Decoder metadata keys changed: {name}.")
+                if kind == "sequence" and len(source) != structure:
+                    raise ValueError(f"Decoder metadata length changed: {name}.")
+                pending.extend((child, source[key]) for key, child in reversed(node.children))
+
+        # No device inputs are modified unless the entire structure, constants,
+        # live sources, and alias topology have passed validation.
+        for target, source, _ in targets.values():
+            if target.device.type != "cpu":
+                target.copy_(source)
+                self.copies += 1
+
+
 def decode_position(metadata, max_model_len):
     """Use existing scheduler-built CPU lengths, never positions.item()."""
     if not isinstance(metadata, dict) or not metadata:
@@ -209,11 +365,14 @@ class DecoderStateSnapshot:
 class V4DecoderGraphBank:
     """Single owner stream, independent per-position pools, fixed caller replay."""
 
-    def __init__(self, model, max_model_len, *, backend=None):
+    def __init__(self, model, max_model_len, *, backend=None, metadata_mode="recursive"):
         if type(max_model_len) is not int or not 1 <= max_model_len <= MAX_DECODER_GRAPH_CONTEXT:
             raise ValueError("Decoder graph context must be an integer in 1..16.")
+        if metadata_mode not in ("recursive", "planned"):
+            raise ValueError("Decoder metadata mode must be recursive or planned.")
         self.model = model
         self.max_model_len = max_model_len
+        self.metadata_mode = metadata_mode
         self.backend = torch.npu if backend is None else backend
         self.entries = {}
         self.failed = False
@@ -226,6 +385,12 @@ class V4DecoderGraphBank:
         self.capture_state = ()
         self.computes = ()
         self.closed = False
+        # Installed only after startup capture. This records host scopes, not
+        # device elapsed time, and never inserts a stream/event fence.
+        self.host_profiler = None
+
+    def _host_phase(self, name):
+        return nullcontext() if self.host_profiler is None else self.host_profiler.phase(name)
 
     @contextmanager
     def exclusive(self):
@@ -257,7 +422,8 @@ class V4DecoderGraphBank:
             self._inputs(input_ids, positions)
             if decode_position(context.attn_metadata, self.max_model_len) != position:
                 raise ValueError("Startup metadata position differs from its graph key.")
-            metadata = DecoderMetadataBuffers(context.attn_metadata)
+            buffers = PlannedDecoderMetadataBuffers if self.metadata_mode == "planned" else DecoderMetadataBuffers
+            metadata = buffers(context.attn_metadata)
             tokens = input_ids.clone()
             static_positions = positions.clone()
             original = context.attn_metadata
@@ -316,22 +482,28 @@ class V4DecoderGraphBank:
                 raise RuntimeError("Decoder graph replay cannot be nested in another graph.")
             if self.backend.current_stream().npu_stream != self.caller_stream.npu_stream:
                 raise RuntimeError("Decoder graph caller stream changed.")
-            position = decode_position(context.attn_metadata, self.max_model_len)
+            with self._host_phase("decoder_position"):
+                position = decode_position(context.attn_metadata, self.max_model_len)
             entry = self.entries[position]
             if input_ids.device != entry["tokens"].device or positions.device != entry["positions"].device:
                 raise ValueError("Decoder graph inputs changed devices.")
             if tuple(_tensor_contract(value) for value in entry["outputs"]) != entry["output_contract"]:
                 raise ValueError("Decoder graph output buffers changed.")
-            for compute in self.computes:
-                compute.check_runtime_contract(compute.runtime)
-            entry["metadata"].update(context.attn_metadata)
-            entry["tokens"].copy_(input_ids)
-            entry["positions"].copy_(positions)
-            entry["graph"].replay()
+            with self._host_phase("runtime_contract"):
+                for compute in self.computes:
+                    compute.check_runtime_contract(compute.runtime)
+            with self._host_phase("metadata_update"):
+                entry["metadata"].update(context.attn_metadata)
+            with self._host_phase("decoder_copy_inputs"):
+                entry["tokens"].copy_(input_ids)
+                entry["positions"].copy_(positions)
+            with self._host_phase("decoder_replay_submit"):
+                entry["graph"].replay()
             # External consumers cannot retain pool outputs across another
             # replay. Only two escapes per whole decoder, not 43 per-layer sets.
             hidden, valid = entry["outputs"]
-            output = hidden.clone(), valid.clone()
+            with self._host_phase("decoder_copy_outputs"):
+                output = hidden.clone(), valid.clone()
             self.replays += 1
             return output
 
@@ -367,6 +539,7 @@ class V4DecoderGraphBank:
             "positions": sorted(self.entries),
             "independent_position_pools": True,
             "live_attention_metadata": True,
+            "metadata_mode": self.metadata_mode,
             "metadata_tensor_copies": sum(entry["metadata"].copies for entry in self.entries.values()),
             "startup_state_restored": self.ready,
             "nested_moe_graphs": False,

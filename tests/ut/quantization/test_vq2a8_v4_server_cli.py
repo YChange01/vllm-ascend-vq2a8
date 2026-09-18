@@ -37,6 +37,106 @@ def test_v4_server_defaults_are_single_card_small_eager_and_v1_library():
     assert args.device_route_decode is False
     assert args.decode_graph == "none"
     assert args.graph_replay_stream == "owner"
+    assert args.activation_preparation == "rowwise"
+    assert args.activation_reorder == "scalar"
+    assert args.decoder_metadata_mode == "recursive"
+    assert args.host_profile is False
+    assert args.profile_dir is None
+
+
+def test_optional_profile_directory_uses_vllm_profiler_config_without_making_directory(tmp_path):
+    argv, _, _ = assets(tmp_path)
+    directory = tmp_path / "profiling with spaces"
+    baseline = server.build_command(server.parse_args(argv))
+    assert "--profiler-config" not in baseline
+    candidate = server.build_command(server.parse_args(argv + ["--profile-dir", str(directory)]))
+    assert candidate[: len(baseline)] == baseline
+    assert json.loads(value(candidate, "--profiler-config")) == {
+        "profiler": "torch",
+        "torch_profiler_dir": str(directory.resolve()),
+        "torch_profiler_with_stack": False,
+    }
+    assert not directory.exists()
+
+
+@pytest.mark.parametrize("preparation", ("rowwise", "rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+@pytest.mark.parametrize("host_profile", (False, True))
+def test_decoder_optimization_options_round_trip_without_changing_engine_contract(
+    tmp_path, preparation, metadata_mode, host_profile
+):
+    argv, _, library = assets(tmp_path)
+    candidate_library = library.with_name("libvq2a8_ascendc_v4_v2.so")
+    candidate_library.write_bytes(library.read_bytes())
+    argv[3] = str(candidate_library)
+    argv += [
+        "--compute-backend",
+        "v2",
+        "--device-route-decode",
+        "--decode-graph",
+        "decoder",
+        "--graph-replay-stream",
+        "caller",
+        "--max-model-len",
+        "16",
+        "--activation-preparation",
+        preparation,
+        "--decoder-metadata-mode",
+        metadata_mode,
+    ]
+    if host_profile:
+        argv.append("--host-profile")
+    command = server.build_command(server.parse_args(argv))
+    options = json.loads(value(command, "--additional-config"))["vq2a8_offline"]
+    assert options.get("v4_activation_preparation", "rowwise") == preparation
+    assert options.get("v4_decoder_metadata_mode", "recursive") == metadata_mode
+    assert options.get("v4_host_profile", False) is host_profile
+    assert ("v4_activation_preparation" in options) == (preparation != "rowwise")
+    assert ("v4_decoder_metadata_mode" in options) == (metadata_mode != "recursive")
+    assert ("v4_host_profile" in options) == host_profile
+    assert options["v4_compute_backend"] == "v2"
+    assert options["v4_device_route_decode"] is True
+    assert options["v4_decode_graph"] == "decoder"
+    assert options["v4_graph_replay_stream"] == "caller"
+    assert options["ascendc_library"] == str(candidate_library.resolve())
+    assert options["root_linear_mode"] == "bf16" and options["cache_experts"] == 256
+    assert "--enforce-eager" in command
+    assert value(command, "--max-num-seqs") == value(command, "--tensor-parallel-size") == "1"
+    assert json.loads(value(command, "--compilation-config")) == {"mode": 0, "cudagraph_mode": "NONE"}
+
+
+@pytest.mark.parametrize("option", (["--decoder-metadata-mode", "planned"], ["--host-profile"]))
+@pytest.mark.parametrize("graph_mode", ("none", "moe"))
+def test_decoder_host_options_reject_non_decoder_modes(option, graph_mode):
+    with pytest.raises(SystemExit) as exc:
+        server.parse_args(["--device-route-decode", "--decode-graph", graph_mode, *option])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("backend,device_route", (("v1", False), ("v1", True), ("v2", False)))
+def test_packed_preparation_requires_v2_and_device_route_at_cli(preparation, backend, device_route):
+    argv = ["--compute-backend", backend, "--activation-preparation", preparation]
+    if device_route:
+        argv.append("--device-route-decode")
+    with pytest.raises(SystemExit) as exc:
+        server.parse_args(argv)
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused"))
+def test_packed_preparation_can_be_tested_without_enabling_graphs(preparation):
+    args = server.parse_args(
+        ["--compute-backend", "v2", "--device-route-decode", "--activation-preparation", preparation]
+    )
+    assert args.decode_graph == "none" and args.activation_preparation == preparation
+
+
+@pytest.mark.parametrize("argv", (["--decoder-metadata-mode", "unsafe"], ["--host-profile", "false"]))
+def test_decoder_host_options_reject_invalid_values(argv):
+    with pytest.raises(SystemExit) as exc:
+        server.parse_args(argv)
+    assert exc.value.code == 2
 
 
 @pytest.mark.parametrize("policy", ["owner", "caller"])

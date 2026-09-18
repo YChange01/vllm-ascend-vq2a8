@@ -58,6 +58,13 @@ The text includes:
 5. `GLOBAL_MATMUL_MIXED_PHASES`, `HOST_MATMUL_SAMPLE`: global shape distribution
    and existing host argument/stack excerpts. Missing shapes/stacks cannot be
    recovered if the capture never recorded them.
+6. `HOST_PHASE_INCLUSIVE_NOT_ADDITIVE`: explicit `vq2a8::host::*` annotations
+   when the service was launched with `--host-profile`. Each span is clipped
+   to the selected window, grouped by PID/TID/name, and remains inclusive.
+   A parent phase and its children must not be added as independent costs.
+   Old traces without these annotations remain supported; they cannot acquire
+   missing Python scopes after collection. See
+   [host-path optimization and validation](vq2a8_v4_host_path.md).
 
 Start by pasting the whole text. If too long, first send `INVENTORY` through
 `LONG_SCALAR`, and the `post_scalar_to_next_graph` window. Then send the other

@@ -41,6 +41,20 @@ def fixture_events():
 
 
 class ExtractTests(unittest.TestCase):
+    def test_host_phases_are_clipped_inclusive_and_kept_separate_by_lane(self):
+        events = [
+            event("vq2a8::host::execute_model", 0, 10000, cat="user_annotation"),
+            event("vq2a8::host::metadata_update", 2000, 3000, cat="user_annotation"),
+            event("vq2a8::host::metadata_update", 3000, 1000, tid=11),
+            event("aten::copy_", 3000, 100),
+            event("vq2a8::host::outside", 11000, 1000),
+        ]
+        rows = extract.host_phase_summary(events, (1000, 6000))
+        self.assertEqual(len(rows), 3)
+        self.assertEqual([row["clipped_wall_ms"] for row in rows], [5, 3, 1])
+        self.assertEqual([row["crossing_spans"] for row in rows], [1, 0, 0])
+        self.assertEqual([row["tid"] for row in rows], ["10", "10", "11"])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)

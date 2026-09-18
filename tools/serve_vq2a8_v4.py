@@ -53,9 +53,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--activation-preparation",
-        choices=("rowwise", "fused"),
+        choices=("rowwise", "rowwise_packed", "sign_fused", "fused"),
         default="rowwise",
-        help="V4 v2 preparation: original rowwise or fused sign/quantization with unchanged RHT/bias GEMMs",
+        help="V4 v2: rowwise baseline, packed decode, sign-only fusion, or legacy full fusion (separate acceptance)",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -94,6 +94,22 @@ def parse_args(argv=None):
         default="owner",
         help="MoE graph replay stream: owner preserves the baseline; caller removes per-layer event bridges",
     )
+    parser.add_argument(
+        "--decoder-metadata-mode",
+        choices=("recursive", "planned"),
+        default="recursive",
+        help="Decoder metadata: recursive baseline or opt-in shared-subtree update plan",
+    )
+    parser.add_argument(
+        "--host-profile",
+        action="store_true",
+        help="Diagnostic CPU ranges/counters without device fences; disable for latency benchmarks",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        help="Opt-in torch-NPU profiler export directory, controlled by /start_profile and /stop_profile",
+    )
     args = parser.parse_args(argv)
     if args.decode_graph != "none" and not args.device_route_decode:
         parser.error("--decode-graph moe/decoder requires --device-route-decode.")
@@ -103,6 +119,12 @@ def parse_args(argv=None):
         args.graph_replay_stream != "caller" or args.max_model_len > DECODER_GRAPH_MAX_CONTEXT
     ):
         parser.error("--decode-graph decoder requires --graph-replay-stream caller and --max-model-len <=16.")
+    if args.decoder_metadata_mode != "recursive" and args.decode_graph != "decoder":
+        parser.error("--decoder-metadata-mode planned requires --decode-graph decoder.")
+    if args.host_profile and args.decode_graph != "decoder":
+        parser.error("--host-profile requires --decode-graph decoder.")
+    if args.activation_preparation in ("rowwise_packed", "sign_fused") and not args.device_route_decode:
+        parser.error("Packed decode preparation requires --device-route-decode; prefill keeps rowwise arithmetic.")
     if (
         args.activation_reorder != "scalar" or args.activation_preparation != "rowwise"
     ) and args.compute_backend != "v2":
@@ -172,8 +194,12 @@ def build_command(args):
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
+    if args.decoder_metadata_mode != "recursive":
+        additional["vq2a8_offline"]["v4_decoder_metadata_mode"] = args.decoder_metadata_mode
+    if args.host_profile:
+        additional["vq2a8_offline"]["v4_host_profile"] = True
     overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
-    return [
+    command = [
         sys.executable,
         "-m",
         "vllm.entrypoints.cli.main",
@@ -225,6 +251,20 @@ def build_command(args):
         "--additional-config",
         json.dumps(additional),
     ]
+    if args.profile_dir is not None:
+        command.extend(
+            [
+                "--profiler-config",
+                json.dumps(
+                    {
+                        "profiler": "torch",
+                        "torch_profiler_dir": str(args.profile_dir.resolve()),
+                        "torch_profiler_with_stack": False,
+                    }
+                ),
+            ]
+        )
+    return command
 
 
 def server_environment(args, environ=None):
@@ -271,6 +311,7 @@ def main(argv=None):
                 f"activation_reorder={args.activation_reorder}, activation_preparation={args.activation_preparation}, "
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
+                f"metadata_mode={args.decoder_metadata_mode}, host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
             )
