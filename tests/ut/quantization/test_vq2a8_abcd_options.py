@@ -190,7 +190,11 @@ def test_model_receipt_cannot_hide_a_missing_or_different_candidate(location, na
         status="PASS",
         hardware_execution_verified=True,
         **modes,
-        cases=[{} for _ in range(probe.REUSE_ROUNDS * len(probe.CASES))],
+        cases=[
+            {"round": round_id, "prompt": prompt, "output": output}
+            for round_id in range(probe.REUSE_ROUNDS)
+            for prompt, output in probe.CASES
+        ],
         graph={**modes, "decoder": {"replays": probe.REUSE_ROUNDS * sum(n - 1 for _, n in probe.CASES)}},
     )
     probe.validate_receipt(args, receipt)

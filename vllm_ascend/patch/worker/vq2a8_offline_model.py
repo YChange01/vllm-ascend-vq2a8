@@ -184,6 +184,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
         self._v4_decoder_metadata_mode = options.get("v4_decoder_metadata_mode", "recursive")
+        self._v4_decoder_input_mode = options.get("v4_decoder_input_mode", "general")
         self._v4_host_profile = options.get("v4_host_profile", False)
         self._v4_host_recorder = None
         self._v4_host_runner = None
@@ -325,6 +326,28 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                     self._v4_decoder_graph.host_profiler = recorder
                 elif runner is not None and runner is not self._v4_host_runner:
                     raise ValueError("Host profiling cannot be rebound to a different model runner.")
+            # Install outside the profiler wrapper so detach can restore the
+            # exact original method. Capture still uses unmodified inputs.
+            if getattr(self, "_v4_decoder_input_mode", "general") != "general":
+                bank = self._v4_decoder_graph
+                try:
+                    if bank.decoder_input_adapter is None:
+                        if runner is None:
+                            raise ValueError("Packed decoder inputs require the startup model runner.")
+                        from vllm_ascend.quantization.vq2a8_decoder_input_plan import install_decoder_input_plan
+
+                        bank.decoder_input_adapter = install_decoder_input_plan(
+                            runner, mode=self._v4_decoder_input_mode
+                        )
+                        print("MODEL_V4_GRAPH_READY " + json.dumps(self.v4_graph_report()), flush=True)
+                    elif runner is not None and runner is not bank.decoder_input_adapter.runner:
+                        raise ValueError("Packed decoder inputs cannot be rebound to a different model runner.")
+                except BaseException:
+                    bank.failed = True
+                    bank.ready = False
+                    self._v4_graphs_ready = False
+                    self._v4_graphs_failed = True
+                    raise
             return self.v4_graph_report()
         if self._v4_graphs_failed or self._v4_graph_forward_active:
             raise RuntimeError("V4 graph preparation requires a healthy idle model.")
@@ -418,6 +441,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                     layer._v4_decoder_compute = DeviceRouteGraphCompute(layer, banks=create_device_route_banks(layer))
                     layer._v4_decoder_graph_owner = bank
                 bank.computes = tuple(layer._v4_decoder_compute for layer in self.model.offline_owner.layers.values())
+                bank.prepare_runtime_guard()
                 for position in range(bank.max_model_len):
                     print(f"MODEL_V4_DECODER_CAPTURE position={position} stage=begin", flush=True)
                     runner._dummy_run(
@@ -452,7 +476,12 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         finally:
             self._v4_decoder_preparing = False
         report = self.v4_graph_report()
-        print("MODEL_V4_GRAPH_READY " + json.dumps(report), flush=True)
+        stage = (
+            "MODEL_V4_GRAPH_CAPTURE_READY"
+            if getattr(self, "_v4_decoder_input_mode", "general") != "general"
+            else "MODEL_V4_GRAPH_READY"
+        )
+        print(stage + " " + json.dumps(report), flush=True)
         return report
 
     def _check_v4_graph_memory(self, stage):
@@ -473,6 +502,15 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 f"V4 MoE graph memory guard failed at {stage}: free={free}, required={minimum_free}; "
                 "KV, reserve and expert residency are not reduced automatically."
             )
+
+    def set_v4_decoder_input_enabled(self, enabled):
+        """Validation-only toggle: reference requests must retain general inputs."""
+        if type(enabled) is not bool or self._v4_graph_forward_active or self._v4_graphs_failed:
+            raise ValueError("Decoder input toggle requires an idle healthy model and boolean mode.")
+        bank = getattr(self, "_v4_decoder_graph", None)
+        adapter = getattr(bank, "decoder_input_adapter", None)
+        if adapter is not None:
+            adapter.set_enabled(enabled)
 
     def set_v4_position_template_verification(self, enabled):
         """Acceptance-only shadow builder comparison, never enabled by serving."""
@@ -544,6 +582,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "select_sign": getattr(self, "_v4_select_sign", "separate"),
             "activation_tail": getattr(self, "_v4_activation_tail", "torch"),
             "decoder_metadata_mode": getattr(self, "_v4_decoder_metadata_mode", "recursive"),
+            "decoder_input_mode": getattr(self, "_v4_decoder_input_mode", "general"),
             "host_profile": self._v4_host_recorder.report() if getattr(self, "_v4_host_recorder", None) else None,
             "effective_graph_mode": self._v4_decode_graph if self._v4_graph_enabled else "none",
             "requested_replay_stream_policy": self._v4_requested_replay_stream,

@@ -146,7 +146,8 @@ class ResidentBank : public torch::CustomClassHolder {
                               state->weight_bias, state->signs, state->experts, state->k, state->stream);
   }
 
-  template <bool Vectorized = false, bool PrepareOnly = false, bool NormalizedTail = false>
+  template <bool Vectorized = false, bool PrepareOnly = false, bool NormalizedTail = false,
+            bool RowReuse = false>
   Tensors Project(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
     const auto state = state_;
     const c10_npu::OptionalNPUGuard guard(state->table.device());
@@ -157,6 +158,7 @@ class ResidentBank : public torch::CustomClassHolder {
     CheckTensor(scale, state->table, at::kFloat, x.dim() - 1, "activation_scale", 4);
     CheckTensor(bias, state->table, at::kFloat, x.dim() - 1, "bias_correction", 4);
     const int64_t routes = ids.numel(), m = x.dim() == 2 ? 1 : x.size(1);
+    if constexpr (RowReuse) TORCH_CHECK(m == 1, "Row-reuse reorder requires M=1");
     TORCH_CHECK(ValidDimensions(m, state->n, state->k) && x.size(0) == routes && x.size(-1) == state->k &&
                     scale.size(0) == routes && bias.size(0) == routes && scale.numel() == routes * m &&
                     bias.numel() == routes * m, "projection requires matching [R,M,K], [R,M], R<=6, M1..32");
@@ -167,19 +169,25 @@ class ResidentBank : public torch::CustomClassHolder {
     auto descriptors = at::empty({routes, kJobWords}, state->table.options());
     auto valid = at::empty({routes}, state->table.options().dtype(at::kInt));
     const uint32_t blocks = std::min(state->aic_cores, static_cast<uint32_t>(routes) * state->n / kN);
-    const uint32_t prepareBlocks = std::min(state->aiv_cores, static_cast<uint32_t>(routes * m) *
-                                                           std::max(state->n, state->k) / kSelectColumns);
+    const uint32_t prepareWork = RowReuse ? static_cast<uint32_t>(routes) :
+        static_cast<uint32_t>(routes * m) * std::max(state->n, state->k) / kSelectColumns;
+    const uint32_t prepareBlocks = std::min(state->aiv_cores, prepareWork);
     RecordInputs({x, scale, bias, ids}, c10_npu::getCurrentNPUStream());
     // Safe V4 ownership pattern. RunOpApi releases Tensor-owning callbacks
     // outside the legacy enqueue slot lock. Keep strong owners AND stream
     // records; dropping Python handles must not recycle any indirect pointer.
     at_npu::native::OpCommand::RunOpApi(
+        RowReuse ? "Vq2a8AscendCV4V2RowReuseReorder" :
         NormalizedTail ? "Vq2a8AscendCV4V2TailReorder" :
         PrepareOnly ? "Vq2a8AscendCV4V2PrepareVectorizedProbe" :
             (Vectorized ? "Vq2a8AscendCV4V2ProjectionVectorized" : "Vq2a8AscendCV4V2Projection"),
         [state, x, scale, bias, ids, reordered, descriptors, output, valid, routes, m, blocks, prepareBlocks]() -> int {
           if constexpr (NormalizedTail) {
             LaunchResidentPrepareTail(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
+                x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
+                output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
+          } else if constexpr (RowReuse) {
+            LaunchResidentPrepareRowReuse(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
                 x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
                 output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
           } else if constexpr (Vectorized) {
@@ -196,7 +204,7 @@ class ResidentBank : public torch::CustomClassHolder {
           }
           return 0;
         }, false);
-    if constexpr (PrepareOnly && NormalizedTail) return {reordered, valid, descriptors, output};
+    if constexpr (PrepareOnly && (NormalizedTail || RowReuse)) return {reordered, valid, descriptors, output};
     if constexpr (PrepareOnly) return {reordered, valid};
     return {output, valid};
   }
@@ -204,6 +212,17 @@ class ResidentBank : public torch::CustomClassHolder {
   Tensors ProjectVectorized(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
                            const at::Tensor& ids) {
     return Project<true>(x, scale, bias, ids);
+  }
+
+  Tensors ProjectRowReuse(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                          const at::Tensor& ids) {
+    return Project<true, false, false, true>(x, scale, bias, ids);
+  }
+
+  // Four diagnostic outputs expose descriptor/invalid-output contracts too.
+  Tensors PrepareRowReuse(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                          const at::Tensor& ids) {
+    return Project<true, true, false, true>(x, scale, bias, ids);
   }
 
   Tensors ProjectTail(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
@@ -243,6 +262,7 @@ TORCH_LIBRARY_FRAGMENT(vq2a8_ascendc_v4_v2, m) {
     return vq2a8_ascendc_v4_v2::kActivationReorderVersion;
   });
   m.def("activation_tail_reorder_version() -> int", []() -> int64_t { return 1; });
+  m.def("activation_reorder_row_reuse_version() -> int", []() -> int64_t { return 1; });
   m.class_<vq2a8_ascendc_v4_v2::ResidentBank>("ResidentBank")
       .def(torch::init<Tensors, Tensors, Tensors, Tensors, Tensors, Tensors>())
       .def("select", &vq2a8_ascendc_v4_v2::ResidentBank::Select)
@@ -250,6 +270,8 @@ TORCH_LIBRARY_FRAGMENT(vq2a8_ascendc_v4_v2, m) {
       .def("project", &vq2a8_ascendc_v4_v2::ResidentBank::Project<false>)
       .def("project_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectVectorized)
       .def("prepare_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareVectorized)
+      .def("project_row_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectRowReuse)
+      .def("prepare_row_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareRowReuse)
       .def("project_tail", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectTail)
       .def("prepare_tail", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareTail)
       .def("metadata", &vq2a8_ascendc_v4_v2::ResidentBank::Metadata);

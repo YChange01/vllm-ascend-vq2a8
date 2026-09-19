@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 import torch
 
-RUNTIME_GUARD_MODES = ("signature", "planned")
+RUNTIME_GUARD_MODES = ("signature", "planned", "native")
 RUNTIME_FIELDS = (
     ("v4_compute_backend", "v1"),
     ("v4_activation_preparation", "rowwise"),
@@ -112,7 +112,7 @@ class PlannedRuntimeGuard:
         self.roots = tuple((name, _TensorPlan.compile(tensor, f"root.{name}")) for name, tensor in runtime.root.items())
         self.lookup = _TensorPlan.compile(self.banks["lookup"], "banks.lookup")
 
-    def check(self, runtime):
+    def _check_host(self, runtime):
         # No sorted(), signature reconstruction, or cross-invocation validation
         # memo. Retained owners also prevent id reuse from hiding replacements.
         if (
@@ -137,6 +137,95 @@ class PlannedRuntimeGuard:
         root = runtime.root
         if not isinstance(root, dict) or root.keys() != self.root_keys:
             _changed("root keys")
+        return root
+
+    def check(self, runtime):
+        root = self._check_host(runtime)
         for name, plan in self.roots:
             plan.check(root[name])
         self.lookup.check(self.banks.get("lookup"))
+
+
+def native_runtime_guard_factory(*, native_ops=None, native_factory=None):
+    """Require the independent host-only ABI; never fall back to Python."""
+    native_ops = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
+    try:
+        version = native_ops.runtime_guard_version()
+    except (AttributeError, RuntimeError) as error:
+        raise RuntimeError("Native runtime guard ABI missing; no fallback.") from error
+    if type(version) is not int or version != 1:
+        raise RuntimeError(f"Native runtime guard requires independent ABI 1, got {version!r}.")
+    if native_factory is None:
+        native_factory = torch.classes.vq2a8_ascendc_v4_v2.RuntimeTensorGuard
+    return native_factory
+
+
+class NativeRuntimeGuard(PlannedRuntimeGuard):
+    """Live host structure checks plus compiled, strongly owned tensor checks.
+
+    Python checks object identity as well as live container/scalar/geometry
+    fields. C++ receives the current tensors, not a captured owner list, and
+    compares their metadata with immutable startup snapshots on every call.
+    In-place tensor payload changes remain outside this metadata-only contract.
+    """
+
+    def __init__(self, runtime, *, native_ops=None, native_factory=None):
+        super().__init__(runtime)
+        self.native_factory = native_runtime_guard_factory(native_ops=native_ops, native_factory=native_factory)
+        plans = tuple(plan for _, plan in self.roots) + (self.lookup,)
+        self.native_plan = self.native_factory([plan.owner for plan in plans], [plan.label for plan in plans])
+
+    def collect(self, runtime, tensors):
+        """Append checked live fields; no metadata properties or device reads."""
+        try:
+            root = self._check_host(runtime)
+            for name, plan in self.roots:
+                tensor = root[name]
+                if tensor is not plan.owner:
+                    _changed(plan.label)
+                tensors.append(tensor)
+            lookup = runtime._device_route_banks.get("lookup")
+            if lookup is not self.lookup.owner:
+                _changed("banks.lookup")
+            tensors.append(lookup)
+        except (AttributeError, KeyError, TypeError) as error:
+            raise RuntimeError(CONTRACT_ERROR) from error
+
+    def check(self, runtime):
+        tensors = []
+        self.collect(runtime, tensors)
+        self.native_plan.check(tensors)
+
+
+class NativeRuntimeGuardBatch:
+    """One C++ metadata call per decoder replay, with no cached pass results."""
+
+    def __init__(self, computes):
+        self.computes = tuple(computes)
+        if not self.computes:
+            raise ValueError("Native runtime guard batch requires captured computes.")
+        self.plans = tuple(getattr(compute, "_runtime_guard_plan", None) for compute in self.computes)
+        if any(
+            getattr(compute, "_runtime_guard_mode", None) != "native" or not isinstance(plan, NativeRuntimeGuard)
+            for compute, plan in zip(self.computes, self.plans)
+        ):
+            raise ValueError("Native decoder runtime guard requires native plans for every captured layer.")
+        self.native_plan = self.plans[0].native_factory([], [])
+        for plan in self.plans:
+            # Copy the existing C++ snapshots, not current metadata: mutation
+            # between per-layer construction and aggregation must still fail.
+            self.native_plan.append(plan.native_plan)
+
+    def check(self, computes):
+        if len(computes) != len(self.computes):
+            _changed("decoder compute count")
+        tensors = []
+        for current, captured, plan in zip(computes, self.computes, self.plans):
+            if (
+                current is not captured
+                or current._runtime_guard_plan is not plan
+                or current._runtime_guard_mode != "native"
+            ):
+                _changed("decoder compute/guard owner")
+            plan.collect(current.runtime, tensors)
+        self.native_plan.check(tensors)

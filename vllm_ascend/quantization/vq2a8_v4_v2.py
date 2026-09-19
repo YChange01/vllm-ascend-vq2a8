@@ -68,10 +68,12 @@ def require_v4_v2_features(
     route_mapping="torch",
     select_sign="separate",
     activation_tail="torch",
+    runtime_guard="signature",
+    decoder_input_mode="general",
     native_ops=None,
 ):
     """Check only explicitly selected native extensions before weight loading."""
-    if reorder not in ("scalar", "vectorized") or preparation not in (
+    if reorder not in ("scalar", "vectorized", "row_reuse") or preparation not in (
         "rowwise",
         "rowwise_packed",
         "sign_fused",
@@ -87,12 +89,19 @@ def require_v4_v2_features(
         raise ValueError("Fused validity requires native sign preparation.")
     if route_mapping not in ("torch", "fused"):
         raise ValueError("V4 v2 route mapping requires torch|fused.")
+    if decoder_input_mode not in ("general", "b1_packed"):
+        raise ValueError("Decoder input mode requires general|b1_packed.")
     validate_candidates(
-        select_sign=select_sign, activation_tail=activation_tail, preparation=preparation, reorder=reorder
+        runtime_guard=runtime_guard,
+        select_sign=select_sign,
+        activation_tail=activation_tail,
+        preparation=preparation,
+        reorder=reorder,
     )
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
-        (reorder == "vectorized", "activation_reorder_version"),
+        (reorder in ("vectorized", "row_reuse"), "activation_reorder_version"),
+        (reorder == "row_reuse", "activation_reorder_row_reuse_version"),
         (
             preparation in ("fused", "sign_fused", "sign_fused_strided", "sign_fused_direct"),
             "activation_preparation_version",
@@ -103,6 +112,8 @@ def require_v4_v2_features(
         (route_mapping == "fused", "route_mapping_version"),
         (select_sign == "fused", "select_sign_version"),
         (activation_tail == "fused_reorder", "activation_tail_reorder_version"),
+        (runtime_guard == "native", "runtime_guard_version"),
+        (decoder_input_mode == "b1_packed", "decoder_input_plan_version"),
     ):
         if selected:
             try:
@@ -255,8 +266,8 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         v4_activation_tail="torch",
         **kwargs,
     ):
-        if v4_activation_reorder not in ("scalar", "vectorized"):
-            raise ValueError("V4 v2 activation reorder requires scalar|vectorized.")
+        if v4_activation_reorder not in ("scalar", "vectorized", "row_reuse"):
+            raise ValueError("V4 v2 activation reorder requires scalar|vectorized|row_reuse.")
         if v4_activation_preparation not in (
             "rowwise",
             "rowwise_packed",
@@ -314,8 +325,16 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         return RowwiseVQ2A8Preparation(compact=compact, validity=validity)
 
     def project_v4_prepared(self, bank, quantized, scale, bias, slots):
-        """Static host option; never read route IDs or copy expert payloads."""
-        project = bank.project_vectorized if self.v4_activation_reorder == "vectorized" else bank.project
+        """F changes M=1 only; M>1 explicitly retains vectorized prefill.
+
+        Shape dispatch is host metadata, not route-ID reads or payload copies.
+        A missing row-reuse ABI/method always fails; it never selects a fallback.
+        """
+        if self.v4_activation_reorder == "row_reuse":
+            rows = 1 if quantized.ndim == 2 else quantized.shape[1]
+            project = bank.project_row_reuse if rows == 1 else bank.project_vectorized
+        else:
+            project = bank.project_vectorized if self.v4_activation_reorder == "vectorized" else bank.project
         return project(quantized, scale, bias, slots)
 
     def project_v4_normalized(self, bank, normalized, scale, bias, slots):
@@ -415,8 +434,10 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             if any((s.rows, s.columns, s.rht_true_columns, s.rht_block_size) != geometry for _, s in entries):
                 raise ValueError("V4 v2 resident bank requires matching expert geometry.")
             bank = bank_type(*[[payload[field] for payload, _ in entries] for field in V4_V2_FIELDS])
-            if self.v4_activation_reorder == "vectorized" and not hasattr(bank, "project_vectorized"):
+            if self.v4_activation_reorder in ("vectorized", "row_reuse") and not hasattr(bank, "project_vectorized"):
                 raise RuntimeError("Rebuild the V4 v2 library for vectorized activation reorder; no scalar fallback.")
+            if self.v4_activation_reorder == "row_reuse" and not hasattr(bank, "project_row_reuse"):
+                raise RuntimeError("Rebuild the V4 v2 library for row-reuse activation reorder; no fallback.")
             if bank.metadata()[3] != len(ids) * V4_V2_BANK_WORDS * 8:
                 raise RuntimeError("V4 v2 native bank metadata differs from the residency plan.")
             banks[kind] = (bank, spec)
@@ -519,6 +540,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "preload_host_validate_s": self.timing.get("host_validate_s", 0.0),
             "preload_h2d_s": self.timing.get("h2d_s", 0.0),
             "activation_reorder": self.v4_activation_reorder,
+            "activation_reorder_row_reuse_scope": "m1_only_m_gt1_vectorized"
+            if self.v4_activation_reorder == "row_reuse"
+            else None,
             "activation_preparation": self.v4_activation_preparation,
             "validity_mode": self.v4_validity_mode,
             "route_mapping": self.v4_route_mapping,

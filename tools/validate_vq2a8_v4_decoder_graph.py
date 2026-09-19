@@ -38,7 +38,7 @@ def parse_args(argv=None):
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--compute-backend", choices=("v1", "v2"), default="v2")
-    parser.add_argument("--activation-reorder", choices=("scalar", "vectorized"), default="scalar")
+    parser.add_argument("--activation-reorder", choices=("scalar", "vectorized", "row_reuse"), default="scalar")
     parser.add_argument(
         "--activation-preparation",
         choices=("rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct", "fused"),
@@ -90,11 +90,17 @@ def parse_args(argv=None):
 
 
 def graph_switch(worker, enabled):
-    return worker.get_model().set_v4_graph_enabled(enabled)
+    model = worker.get_model()
+    model.set_v4_decoder_input_enabled(enabled)
+    return model.set_v4_graph_enabled(enabled)
 
 
 def graph_report(worker):
     return worker.get_model().v4_graph_report()
+
+
+def input_switch(worker, enabled):
+    worker.get_model().set_v4_decoder_input_enabled(enabled)
 
 
 def set_template_verification(worker, enabled):
@@ -149,6 +155,46 @@ def verify_template_serving_path(llm, prompt, params, reference, unwrap):
     return error
 
 
+def verify_input_serving_path(llm, prompt, params, reference, unwrap, template=False):
+    """Use the same decoder graph for general -> packed -> general requests.
+
+    Disable template shadow calls: their side effects must not repair a broken
+    candidate. Each request changes/reuses live KV rows through normal vLLM.
+    """
+    rows, maximum_error = [], 0.0
+    if template:
+        unwrap(llm.collective_rpc(set_template_verification, args=(False,)))
+    try:
+        for name, enabled in (("general_before", False), ("packed", True), ("general_after", False)):
+            unwrap(llm.collective_rpc(input_switch, args=(enabled,)))
+            before = unwrap(llm.collective_rpc(graph_report))["decoder"]
+            actual = llm.generate([{"prompt_token_ids": prompt}], params, use_tqdm=False)[0].outputs[0]
+            after = unwrap(llm.collective_rpc(graph_report))["decoder"]
+            delta = after["replays"] - before["replays"]
+            counters = {
+                key: after["decoder_input"][key] - before["decoder_input"][key]
+                for key in ("fastpath_calls", "packed_uploads", "grouped_slot_calls")
+            }
+            if delta != len(reference.token_ids) - 1 or any(
+                value != (delta if enabled else 0) for value in counters.values()
+            ):
+                raise AssertionError("Input serving-path gate did not execute the requested general/packed path.")
+            if template:
+                skips = (
+                    after["position_template"]["original_builder_skips"]
+                    - before["position_template"]["original_builder_skips"]
+                )
+                if skips != delta:
+                    raise AssertionError("Input serving-path gate unexpectedly executed the shadow builder.")
+            maximum_error = max(maximum_error, compare_outputs(reference, actual))
+            rows.append({"mode": name, "replays": delta, **counters, "template_shadow_enabled": False})
+    finally:
+        unwrap(llm.collective_rpc(input_switch, args=(True,)))
+        if template:
+            unwrap(llm.collective_rpc(set_template_verification, args=(True,)))
+    return maximum_error, rows
+
+
 def run_model(args):
     import torch
     import torch_npu  # noqa: F401
@@ -186,6 +232,7 @@ def run_model(args):
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
+        v4_decoder_input_mode=args.decoder_input_mode,
         v4_host_profile=args.host_profile,
     )
     options.update(
@@ -224,6 +271,15 @@ def run_model(args):
                 if delta != output_length - 1 or len(candidate.token_ids) != output_length:
                     raise AssertionError("The requested output count or actual decoder replay count differs.")
                 error = compare_outputs(reference, candidate)
+                input_hits = 0
+                input_comparison = []
+                if args.decoder_input_mode == "b1_packed":
+                    input_hits = (
+                        after["decoder"]["decoder_input"]["fastpath_calls"]
+                        - before["decoder"]["decoder_input"]["fastpath_calls"]
+                    )
+                    if input_hits < 1:
+                        raise AssertionError("Packed decoder input candidate was requested but never executed.")
                 if args.decoder_metadata_mode == "position_template":
                     # The shadow builder could conceal a missing side effect.
                     # Also exercise actual serving behavior without calling it.
@@ -231,8 +287,26 @@ def run_model(args):
                         error = max(
                             error, verify_template_serving_path(llm, prompt, params, reference, single_worker_result)
                         )
+                if args.decoder_input_mode == "b1_packed":
+                    with stage(f"round{round_id}_p{prompt_length}_o{output_length}_input_general_packed_general"):
+                        input_error, input_comparison = verify_input_serving_path(
+                            llm,
+                            prompt,
+                            params,
+                            reference,
+                            single_worker_result,
+                            template=args.decoder_metadata_mode == "position_template",
+                        )
+                        error = max(error, input_error)
                 rows.append(
-                    {"round": round_id, "prompt": prompt_length, "output": output_length, "max_logprob_error": error}
+                    {
+                        "round": round_id,
+                        "prompt": prompt_length,
+                        "output": output_length,
+                        "max_logprob_error": error,
+                        "input_fastpath_calls": input_hits,
+                        "input_serving_comparison": input_comparison,
+                    }
                 )
     report = single_worker_result(llm.collective_rpc(graph_report))
     if args.decoder_metadata_mode == "position_template":
@@ -249,6 +323,8 @@ def run_model(args):
         "runtime_guard": args.runtime_guard,
         "select_sign": args.select_sign,
         "activation_tail": args.activation_tail,
+        "activation_reorder": args.activation_reorder,
+        "decoder_input_mode": args.decoder_input_mode,
         "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
     }
@@ -259,9 +335,12 @@ def run_model(args):
 
 def validate_receipt(args, receipt):
     """A successful subprocess must prove the requested modes and all replays."""
-    expected_replays = REUSE_ROUNDS * sum(count - 1 for _, count in CASES)
+    case_replays = REUSE_ROUNDS * sum(count - 1 for _, count in CASES)
+    expected_replays = case_replays
     if args.decoder_metadata_mode == "position_template":
         expected_replays *= 2  # Shadow equivalence plus actual producer-skip path.
+    if getattr(args, "decoder_input_mode", "general") == "b1_packed":
+        expected_replays += 3 * case_replays
     if (
         receipt.get("status") != "PASS"
         or receipt.get("hardware_execution_verified") is not True
@@ -271,12 +350,60 @@ def validate_receipt(args, receipt):
             receipt.get(name) != getattr(args, name) or receipt.get("graph", {}).get(name) != getattr(args, name)
             for name in ("runtime_guard", "select_sign", "activation_tail", "validity_mode")
         )
-        or len(receipt.get("cases", [])) != REUSE_ROUNDS * len(CASES)
+        or [(row.get("round"), row.get("prompt"), row.get("output")) for row in receipt.get("cases", [])]
+        != [(round_id, prompt, output) for round_id in range(REUSE_ROUNDS) for prompt, output in CASES]
         or receipt.get("graph", {}).get("decoder", {}).get("replays") != expected_replays
     ):
         raise ValueError("Device probe receipt does not confirm all requested modes and real decoder replays.")
     if args.decoder_metadata_mode == "position_template":
         require_template_evidence(receipt.get("graph", {}))
+    if args.runtime_guard == "native":
+        native_calls = receipt.get("graph", {}).get("decoder", {}).get("runtime_guard_native_calls")
+        if type(native_calls) is not int or native_calls != expected_replays:
+            raise ValueError("Missing one native runtime guard check per decoder replay.")
+    input_mode = getattr(args, "decoder_input_mode", "general")
+    if input_mode != "general":
+        inputs = receipt.get("graph", {}).get("decoder", {}).get("decoder_input") or {}
+        if (
+            receipt.get("decoder_input_mode") != input_mode
+            or receipt.get("graph", {}).get("decoder_input_mode") != input_mode
+            or inputs.get("mode") != input_mode
+            or inputs.get("enabled") is not True
+            or inputs.get("scope") != "block_table_upload_and_grouped_slot_mapping"
+            or inputs.get("general_prepare_inputs_preserved") is not True
+            or inputs.get("dynamic_rows_cached") is not False
+            or inputs.get("packed_uploads", 0) < 1
+            or inputs.get("grouped_slot_calls", 0) < 1
+            or any(
+                type(row.get("input_fastpath_calls")) is not int or row["input_fastpath_calls"] < 1
+                for row in receipt.get("cases", [])
+            )
+        ):
+            raise ValueError("Missing executed packed decoder input evidence against general-input reference.")
+        for row in receipt["cases"]:
+            comparisons = row.get("input_serving_comparison", [])
+            if len(comparisons) != 3:
+                raise ValueError("Missing general/packed/general serving comparisons.")
+            for evidence, (name, enabled) in zip(
+                comparisons, (("general_before", False), ("packed", True), ("general_after", False))
+            ):
+                expected = row["output"] - 1
+                if (
+                    evidence.get("mode") != name
+                    or evidence.get("replays") != expected
+                    or evidence.get("template_shadow_enabled") is not False
+                    or any(
+                        type(evidence.get(key)) is not int or evidence[key] != (expected if enabled else 0)
+                        for key in ("fastpath_calls", "packed_uploads", "grouped_slot_calls")
+                    )
+                ):
+                    raise ValueError("Incomplete general/packed/general serving-path evidence.")
+    if getattr(args, "activation_reorder", "scalar") == "row_reuse":
+        if (
+            receipt.get("activation_reorder") != "row_reuse"
+            or receipt.get("graph", {}).get("activation_reorder") != "row_reuse"
+        ):
+            raise ValueError("Missing requested row_reuse activation reorder evidence.")
 
 
 def main(argv=None):
@@ -301,6 +428,7 @@ def main(argv=None):
                     "select_sign": args.select_sign,
                     "activation_tail": args.activation_tail,
                     "decoder_metadata_mode": args.decoder_metadata_mode,
+                    "decoder_input_mode": args.decoder_input_mode,
                     "host_profile": args.host_profile,
                     "device_execution": False,
                     "startup_capture_positions": list(range(16)),

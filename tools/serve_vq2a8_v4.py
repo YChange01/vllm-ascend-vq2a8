@@ -47,9 +47,9 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument(
         "--activation-reorder",
-        choices=("scalar", "vectorized"),
+        choices=("scalar", "vectorized", "row_reuse"),
         default="scalar",
-        help="V4 v2 FP8-byte reorder: scalar baseline or opt-in UB vector gather (requires rebuilt library)",
+        help="V4 v2 FP8-byte reorder: scalar, vectorized, or experimental M1 row_reuse (new library required)",
     )
     parser.add_argument(
         "--activation-preparation",
@@ -58,7 +58,8 @@ def parse_args(argv=None):
         help="V4 v2 activation candidate; strided/direct require a new library and separate numerical acceptance",
     )
     parser.add_argument("--validity-mode", choices=("torch", "fused", "fused_vectorized"), default="torch")
-    parser.add_argument("--runtime-guard", choices=("signature", "planned"), default="signature")
+    parser.add_argument("--runtime-guard", choices=("signature", "planned", "native"), default="signature")
+    parser.add_argument("--decoder-input-mode", choices=("general", "b1_packed"), default="general")
     parser.add_argument("--select-sign", choices=("separate", "fused"), default="separate")
     parser.add_argument("--activation-tail", choices=("torch", "fused_reorder"), default="torch")
     parser.add_argument(
@@ -121,12 +122,17 @@ def parse_args(argv=None):
         help="Opt-in torch-NPU profiler export directory, controlled by /start_profile and /stop_profile",
     )
     args = parser.parse_args(argv)
-    if (args.runtime_guard != "signature" or args.select_sign != "separate" or args.activation_tail != "torch") and (
-        args.compute_backend != "v2" or not args.device_route_decode
-    ):
+    if (
+        args.runtime_guard != "signature"
+        or args.select_sign != "separate"
+        or args.activation_tail != "torch"
+        or args.decoder_input_mode != "general"
+    ) and (args.compute_backend != "v2" or not args.device_route_decode):
         parser.error("ABCD candidates require V4 v2 device-route decode.")
-    if args.runtime_guard == "planned" and args.decode_graph == "none":
+    if args.runtime_guard in ("planned", "native") and args.decode_graph == "none":
         parser.error("Planned runtime guard requires MoE or decoder graphs.")
+    if args.decoder_input_mode != "general" and args.decode_graph != "decoder":
+        parser.error("Packed decoder input requires --decode-graph decoder.")
     if (
         args.select_sign == "fused" or args.activation_tail == "fused_reorder"
     ) and args.activation_preparation != "sign_fused_direct":
@@ -236,6 +242,8 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
     if args.decoder_metadata_mode != "recursive":
         additional["vq2a8_offline"]["v4_decoder_metadata_mode"] = args.decoder_metadata_mode
+    if args.decoder_input_mode != "general":
+        additional["vq2a8_offline"]["v4_decoder_input_mode"] = args.decoder_input_mode
     if args.host_profile:
         additional["vq2a8_offline"]["v4_host_profile"] = True
     overrides = {"architectures": ["VQ2A8TP1OfflineForCausalLM"], "quantization_config": None}
@@ -354,7 +362,7 @@ def main(argv=None):
                 f"metadata_mode={args.decoder_metadata_mode}, validity_mode={args.validity_mode}, "
                 f"route_mapping={args.route_mapping}, "
                 f"runtime_guard={args.runtime_guard}, select_sign={args.select_sign}, "
-                f"activation_tail={args.activation_tail}, "
+                f"activation_tail={args.activation_tail}, decoder_input_mode={args.decoder_input_mode}, "
                 f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,

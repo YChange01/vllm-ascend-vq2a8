@@ -513,7 +513,11 @@ class DeviceRouteGraphCompute:
 
     def __init__(self, runtime, *, banks=None):
         # Startup-only import keeps the optional plan out of eager routing.
-        from vllm_ascend.quantization.vq2a8_runtime_guard import RUNTIME_GUARD_MODES, PlannedRuntimeGuard
+        from vllm_ascend.quantization.vq2a8_runtime_guard import (
+            RUNTIME_GUARD_MODES,
+            NativeRuntimeGuard,
+            PlannedRuntimeGuard,
+        )
 
         if getattr(runtime, "execution_policy", None) != "ascendc_v4":
             raise ValueError("V4 graph compute requires the V4 resident runtime.")
@@ -528,7 +532,7 @@ class DeviceRouteGraphCompute:
         self.config = runtime.config
         self._runtime_guard_mode = getattr(runtime, "v4_runtime_guard", "signature")
         if self._runtime_guard_mode not in RUNTIME_GUARD_MODES:
-            raise ValueError("V4 runtime guard must be signature or planned.")
+            raise ValueError("V4 runtime guard must be signature or planned or native.")
         self._layer_validity = _make_layer_validity(runtime)
         self._route_mapping = _make_route_mapping(runtime)
         self.preparations = {}
@@ -559,7 +563,13 @@ class DeviceRouteGraphCompute:
             "projection_geometry": geometries,
         }
         self._runtime_contract = self._contract(runtime)
-        self._runtime_guard_plan = PlannedRuntimeGuard(runtime) if self._runtime_guard_mode == "planned" else None
+        self._runtime_guard_plan = (
+            NativeRuntimeGuard(runtime)
+            if self._runtime_guard_mode == "native"
+            else PlannedRuntimeGuard(runtime)
+            if self._runtime_guard_mode == "planned"
+            else None
+        )
 
     @staticmethod
     def _contract(runtime):

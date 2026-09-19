@@ -41,8 +41,8 @@ def _validate_v4_compute_backend(value, policy):
 
 
 def _validate_v4_activation_options(reorder, preparation, backend, policy):
-    if reorder not in ("scalar", "vectorized"):
-        raise ValueError("v4_activation_reorder requires scalar|vectorized.")
+    if reorder not in ("scalar", "vectorized", "row_reuse"):
+        raise ValueError("v4_activation_reorder requires scalar|vectorized|row_reuse.")
     if preparation not in (
         "rowwise",
         "rowwise_packed",
@@ -122,6 +122,7 @@ def offline_engine_options(
     v4_select_sign="separate",
     v4_activation_tail="torch",
     v4_decoder_metadata_mode="recursive",
+    v4_decoder_input_mode="general",
     v4_host_profile=False,
     verbose_experts=False,
     tensor_parallel_size=1,
@@ -140,6 +141,7 @@ def offline_engine_options(
         v4_runtime_guard,
         v4_select_sign,
         v4_activation_tail,
+        decoder_input_mode=v4_decoder_input_mode,
         backend=v4_compute_backend,
         policy=execution_policy,
         preparation=v4_activation_preparation,
@@ -246,6 +248,7 @@ def offline_engine_options(
                 **({"v4_runtime_guard": v4_runtime_guard} if v4_runtime_guard != "signature" else {}),
                 **({"v4_select_sign": v4_select_sign} if v4_select_sign != "separate" else {}),
                 **({"v4_activation_tail": v4_activation_tail} if v4_activation_tail != "torch" else {}),
+                **({"v4_decoder_input_mode": v4_decoder_input_mode} if v4_decoder_input_mode != "general" else {}),
                 **(
                     {"v4_decoder_metadata_mode": v4_decoder_metadata_mode}
                     if v4_decoder_metadata_mode != "recursive"
@@ -318,6 +321,7 @@ def validate_offline_config(config) -> dict:
         "v4_select_sign",
         "v4_activation_tail",
         "v4_decoder_metadata_mode",
+        "v4_decoder_input_mode",
         "v4_host_profile",
         "v3_startup_trace",
         "verbose_experts",
@@ -405,6 +409,7 @@ def validate_offline_config(config) -> dict:
         options.get("v4_runtime_guard", "signature"),
         options.get("v4_select_sign", "separate"),
         options.get("v4_activation_tail", "torch"),
+        decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
         backend=options.get("v4_compute_backend", "v1"),
         policy=options.get("execution_policy"),
         preparation=options.get("v4_activation_preparation", "rowwise"),
@@ -501,7 +506,7 @@ def validate_offline_config(config) -> dict:
         options.get("execution_policy"),
     )
     if options.get("execution_policy") != "ascendc_v4" and any(
-        key in options for key in ("v4_decoder_metadata_mode", "v4_host_profile")
+        key in options for key in ("v4_decoder_metadata_mode", "v4_decoder_input_mode", "v4_host_profile")
     ):
         raise ValueError("V4 host options require execution_policy=ascendc_v4.")
     if options.get("v4_activation_preparation") in (
@@ -647,6 +652,8 @@ class OfflineMoEOwner:
                     route_mapping=options.get("v4_route_mapping", "torch"),
                     select_sign=options.get("v4_select_sign", "separate"),
                     activation_tail=options.get("v4_activation_tail", "torch"),
+                    runtime_guard=options.get("v4_runtime_guard", "signature"),
+                    decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
                 )
             else:
                 from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library

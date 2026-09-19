@@ -19,7 +19,7 @@ __aicore__ inline void PrepareFence() {
 // Baseline activation bytes are reordered AFTER original RHT/FP8 preparation.
 // The opt-in normalized tail starts AFTER the original FP32 division instead.
 // Compressed expert weights never move; all paths use separate entry points.
-template <bool Vectorized = false, bool NormalizedTail = false>
+template <bool Vectorized = false, bool NormalizedTail = false, bool RowReuse = false>
 class ResidentPrepareKernel {
  public:
   __aicore__ inline void Init(GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias,
@@ -66,6 +66,10 @@ class ResidentPrepareKernel {
   }
 
   __aicore__ inline void Process() {
+    if constexpr (RowReuse) {
+      ProcessRowReuse();
+      return;
+    }
     const uint32_t chunks = (n_ > k_ ? n_ : k_) / kSelectColumns;
     for (uint32_t work = GetBlockIdx(); work < routes_ * m_ * chunks; work += GetBlockNum()) {
       const uint32_t route = work / (m_ * chunks);
@@ -104,6 +108,40 @@ class ResidentPrepareKernel {
   }
 
  private:
+  // Candidate F is a pure FP8-byte permutation, M=1 only at the binding.
+  // Assign a full route row to one AIV, retaining its K-byte input in UB
+  // across all 256-column chunks. This removes the baseline's 8/16 repeated
+  // row DMAs, but trades away chunk-level parallelism; benchmark separately.
+  __aicore__ inline void ProcessRowReuse() {
+    for (uint32_t route = GetBlockIdx(); route < routes_; route += GetBlockNum()) {
+      const int64_t expert = ids_.GetValue(route);
+      const bool valid = ValidResidentSlot(expert, experts_);
+      if (valid) {
+        // Validate the full signed int64 before narrowing or dereferencing.
+        const uint32_t entry = static_cast<uint32_t>(expert) * kBankWords;
+        GlobalTensor<int64_t> order;
+        order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(bank_.GetValue(entry + kBankOrder)));
+        const uint64_t rowBase = uint64_t(route) * k_;
+        DataCopy(inputUb_.Get<uint8_t>(), x_[rowBase], k_);
+        // GatherVectorized fences MTE2->V after loading the first order chunk.
+        for (uint32_t column = 0; column < k_; column += kSelectColumns) {
+          GatherVectorized(order, rowBase, column);
+        }
+      } else {
+        // Match the original contract: invalid reordered bytes are unspecified,
+        // every invalid output is poisoned, and its descriptor is all zero.
+        Duplicate(outputUb_.Get<uint16_t>(), kInvalidBf16, kSelectColumns);
+        PrepareFence<HardEvent::V_MTE3>();
+        for (uint32_t column = 0; column < n_; column += kSelectColumns) {
+          DataCopy(output_[uint64_t(route) * n_ + column], outputUb_.Get<uint16_t>(), kSelectColumns);
+        }
+        PrepareFence<HardEvent::MTE3_V>();
+        PrepareFence<HardEvent::MTE3_S>();
+      }
+      WriteDescriptor(route, expert, valid);
+    }
+  }
+
   // Candidate D starts AFTER the original Torch RealDiv. Reordering commutes
   // with elementwise clamp/cast, but not with RHT or scale reductions. Keep
   // those upstream computations unchanged. All indirect orders are validated
@@ -155,7 +193,7 @@ class ResidentPrepareKernel {
     // One contiguous DMA per activation row and per 256-entry order segment,
     // replacing 512 scalar GM loads. K is small enough to keep the entire
     // activation row in UB (maximum 4096 bytes); no decoded weights in GM.
-    DataCopy(input, x_[rowBase], k_);
+    if constexpr (!RowReuse) DataCopy(input, x_[rowBase], k_);
     DataCopy(orderWords, order[column], kSelectColumns);
     PrepareFence<HardEvent::MTE2_V>();
     Gather(orderOffsets, orderWords.ReinterpretCast<uint32_t>(),
@@ -245,7 +283,28 @@ extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_tail(
   kernel.Process();
 }
 
+extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_row_reuse(
+    GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR reordered,
+    GM_ADDR descriptors, GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes,
+    uint32_t m, uint32_t n, uint32_t k) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::ResidentPrepareKernel<true, false, true> kernel;
+  kernel.Init(bank, routeIds, x, scale, bias, reordered, descriptors, output, valid, experts, routes, m, n, k);
+  kernel.Process();
+}
+
 namespace vq2a8_ascendc_v4_v2 {
+void LaunchResidentPrepareRowReuse(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
+                                 void* scale, void* bias, void* reordered, void* descriptors,
+                                 void* output, void* valid, uint32_t experts, uint32_t routes,
+                                 uint32_t m, uint32_t n, uint32_t k) {
+  vq2a8_ascendc_v4_v2_prepare_row_reuse<<<blocks, nullptr, stream>>>(
+      static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds), static_cast<GM_ADDR>(x),
+      static_cast<GM_ADDR>(scale), static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(reordered),
+      static_cast<GM_ADDR>(descriptors), static_cast<GM_ADDR>(output), static_cast<GM_ADDR>(valid),
+      experts, routes, m, n, k);
+}
+
 void LaunchResidentPrepareTail(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
                               void* scale, void* bias, void* reordered, void* descriptors,
                               void* output, void* valid, uint32_t experts, uint32_t routes,

@@ -56,6 +56,13 @@ def source_hashes(source=SOURCE):
         "activation_diagnostic_kernel.cpp",
         "activation_diagnostic_binding.cpp",
         "activation_diagnostic_launch.h",
+        "runtime_guard_binding.cpp",
+        "input_plan_kernel.cpp",
+        "input_plan_binding.cpp",
+        "input_plan_launch.h",
+        "bias_dot_probe_kernel.cpp",
+        "bias_dot_probe_binding.cpp",
+        "bias_dot_probe_launch.h",
         "layout.h",
         "launch.h",
     )

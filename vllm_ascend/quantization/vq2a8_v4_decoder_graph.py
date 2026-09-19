@@ -534,14 +534,26 @@ class V4DecoderGraphBank:
         self.snapshot = None
         self.capture_state = ()
         self.computes = ()
+        self._runtime_guard_batch = None
+        self.runtime_guard_native_calls = 0
         self.closed = False
         # Installed only after startup capture. This records host scopes, not
         # device elapsed time, and never inserts a stream/event fence.
         self.host_profiler = None
         self.position_template_adapter = None
+        self.decoder_input_adapter = None
 
     def _host_phase(self, name):
         return nullcontext() if self.host_profiler is None else self.host_profiler.phase(name)
+
+    def prepare_runtime_guard(self):
+        """Aggregate captured tensor snapshots once, before enabling replay."""
+        if self.ready or self.closed or self.failed:
+            raise RuntimeError("Decoder runtime guard aggregation is startup-only.")
+        if any(getattr(compute, "_runtime_guard_mode", None) == "native" for compute in self.computes):
+            from vllm_ascend.quantization.vq2a8_runtime_guard import NativeRuntimeGuardBatch
+
+            self._runtime_guard_batch = NativeRuntimeGuardBatch(self.computes)
 
     @contextmanager
     def exclusive(self):
@@ -651,8 +663,14 @@ class V4DecoderGraphBank:
             if tuple(_tensor_contract(value) for value in entry["outputs"]) != entry["output_contract"]:
                 raise ValueError("Decoder graph output buffers changed.")
             with self._host_phase("runtime_contract"):
-                for compute in self.computes:
-                    compute.check_runtime_contract(compute.runtime)
+                if self._runtime_guard_batch is not None:
+                    self._runtime_guard_batch.check(self.computes)
+                    self.runtime_guard_native_calls += 1
+                else:
+                    if any(getattr(compute, "_runtime_guard_mode", None) == "native" for compute in self.computes):
+                        raise RuntimeError("Native decoder runtime guard was not aggregated at startup.")
+                    for compute in self.computes:
+                        compute.check_runtime_contract(compute.runtime)
             with self._host_phase("metadata_update"):
                 entry["metadata"].update(context.attn_metadata)
             with self._host_phase("decoder_copy_inputs"):
@@ -684,8 +702,12 @@ class V4DecoderGraphBank:
             if self.position_template_adapter is not None:
                 self.position_template_adapter.detach()
                 self.position_template_adapter = None
+            if self.decoder_input_adapter is not None:
+                self.decoder_input_adapter.detach()
+                self.decoder_input_adapter = None
             self.snapshot = None
             self.capture_state = self.computes = ()
+            self._runtime_guard_batch = None
             self.model = None
             self.closed = True
         except BaseException:
@@ -708,6 +730,8 @@ class V4DecoderGraphBank:
             "position_template": (
                 self.position_template_adapter.report() if self.position_template_adapter is not None else None
             ),
+            "decoder_input": self.decoder_input_adapter.report() if self.decoder_input_adapter is not None else None,
+            "runtime_guard_native_calls": self.runtime_guard_native_calls,
             "startup_state_restored": self.ready,
             "nested_moe_graphs": False,
             "ready": self.ready,
