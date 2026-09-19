@@ -180,6 +180,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_runtime_guard = options.get("v4_runtime_guard", "signature")
         self._v4_select_sign = options.get("v4_select_sign", "separate")
         self._v4_activation_tail = options.get("v4_activation_tail", "torch")
+        self._v4_b1_schedule = options.get("v4_b1_schedule", "baseline")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -298,6 +299,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             f"runtime_guard={getattr(self, '_v4_runtime_guard', 'signature')} "
             f"select_sign={getattr(self, '_v4_select_sign', 'separate')} "
             f"activation_tail={getattr(self, '_v4_activation_tail', 'torch')} "
+            f"b1_schedule={getattr(self, '_v4_b1_schedule', 'baseline')} "
             "expert_payload_runtime_loading=False",
             flush=True,
         )
@@ -581,6 +583,19 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "runtime_guard": getattr(self, "_v4_runtime_guard", "signature"),
             "select_sign": getattr(self, "_v4_select_sign", "separate"),
             "activation_tail": getattr(self, "_v4_activation_tail", "torch"),
+            "b1_schedule": getattr(self, "_v4_b1_schedule", "baseline"),
+            "projection_candidates": {
+                "scope": "graph_build_only_eager_and_prefill_vectorized",
+                "graph_build_calls": sum(
+                    getattr(layer, "v4_candidate_graph_build_calls", 0)
+                    for layer in self.model.offline_owner.layers.values()
+                ),
+                "reference_calls": sum(
+                    getattr(layer, "v4_candidate_reference_calls", 0)
+                    for layer in self.model.offline_owner.layers.values()
+                ),
+                "counters_prove_device_execution": False,
+            },
             "decoder_metadata_mode": getattr(self, "_v4_decoder_metadata_mode", "recursive"),
             "decoder_input_mode": getattr(self, "_v4_decoder_input_mode", "general"),
             "host_profile": self._v4_host_recorder.report() if getattr(self, "_v4_host_recorder", None) else None,

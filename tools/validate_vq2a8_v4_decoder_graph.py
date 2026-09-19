@@ -38,7 +38,11 @@ def parse_args(argv=None):
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--compute-backend", choices=("v1", "v2"), default="v2")
-    parser.add_argument("--activation-reorder", choices=("scalar", "vectorized", "row_reuse"), default="scalar")
+    parser.add_argument(
+        "--activation-reorder",
+        choices=("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4"),
+        default="scalar",
+    )
     parser.add_argument(
         "--activation-preparation",
         choices=("rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct", "fused"),
@@ -229,6 +233,7 @@ def run_model(args):
         v4_runtime_guard=args.runtime_guard,
         v4_select_sign=args.select_sign,
         v4_activation_tail=args.activation_tail,
+        v4_b1_schedule=args.b1_schedule,
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
@@ -324,6 +329,10 @@ def run_model(args):
         "select_sign": args.select_sign,
         "activation_tail": args.activation_tail,
         "activation_reorder": args.activation_reorder,
+        "b1_schedule": args.b1_schedule,
+        "projection_reference": "vectorized_baseline"
+        if args.activation_reorder in ("chunk_reuse2", "chunk_reuse4") or args.b1_schedule != "baseline"
+        else "selected_backend",
         "decoder_input_mode": args.decoder_input_mode,
         "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
@@ -404,6 +413,26 @@ def validate_receipt(args, receipt):
             or receipt.get("graph", {}).get("activation_reorder") != "row_reuse"
         ):
             raise ValueError("Missing requested row_reuse activation reorder evidence.")
+    if (
+        getattr(args, "activation_reorder", "scalar") in ("chunk_reuse2", "chunk_reuse4")
+        or getattr(args, "b1_schedule", "baseline") != "baseline"
+    ):
+        graph = receipt.get("graph", {})
+        evidence = graph.get("projection_candidates", {})
+        if (
+            receipt.get("activation_reorder") != args.activation_reorder
+            or graph.get("activation_reorder") != args.activation_reorder
+            or receipt.get("b1_schedule") != args.b1_schedule
+            or graph.get("b1_schedule") != args.b1_schedule
+            or receipt.get("projection_reference") != "vectorized_baseline"
+            or evidence.get("scope") != "graph_build_only_eager_and_prefill_vectorized"
+            or evidence.get("counters_prove_device_execution") is not False
+            or any(
+                type(evidence.get(key)) is not int or evidence[key] < 1
+                for key in ("graph_build_calls", "reference_calls")
+            )
+        ):
+            raise ValueError("Missing J/K graph candidate and independent vectorized reference evidence.")
 
 
 def main(argv=None):
@@ -421,6 +450,7 @@ def main(argv=None):
                         args.artifact if args.artifact is not None else args.model / "experts_vq_ascend_v2"
                     ),
                     "activation_reorder": args.activation_reorder,
+                    "b1_schedule": args.b1_schedule,
                     "activation_preparation": args.activation_preparation,
                     "validity_mode": args.validity_mode,
                     "route_mapping": args.route_mapping,

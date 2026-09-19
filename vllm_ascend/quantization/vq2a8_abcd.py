@@ -10,6 +10,7 @@ def add_candidate_arguments(parser):
     parser.add_argument("--select-sign", choices=("separate", "fused"), default="separate")
     parser.add_argument("--activation-tail", choices=("torch", "fused_reorder"), default="torch")
     parser.add_argument("--decoder-input-mode", choices=("general", "b1_packed"), default="general")
+    parser.add_argument("--b1-schedule", choices=("baseline", "tile_major"), default="baseline")
 
 
 def validate_candidates(
@@ -24,12 +25,14 @@ def validate_candidates(
     device_route=True,
     graph_mode=None,
     decoder_input_mode="general",
+    b1_schedule="baseline",
 ):
     for name, value, choices in (
         ("runtime_guard", runtime_guard, ("signature", "planned", "native")),
         ("select_sign", select_sign, ("separate", "fused")),
         ("activation_tail", activation_tail, ("torch", "fused_reorder")),
         ("decoder_input_mode", decoder_input_mode, ("general", "b1_packed")),
+        ("b1_schedule", b1_schedule, ("baseline", "tile_major")),
     ):
         if value not in choices:
             raise ValueError(f"Invalid v4_{name}={value!r}; require {choices}.")
@@ -38,6 +41,8 @@ def validate_candidates(
         or select_sign != "separate"
         or activation_tail != "torch"
         or decoder_input_mode != "general"
+        or b1_schedule != "baseline"
+        or reorder in ("chunk_reuse2", "chunk_reuse4")
     )
     if enabled and (backend != "v2" or policy != "ascendc_v4" or device_route is not True):
         raise ValueError("ABCD candidates require V4 v2 device-route decode.")
@@ -49,6 +54,11 @@ def validate_candidates(
         raise ValueError("Select/sign and tail candidates require sign_fused_direct preparation.")
     if activation_tail == "fused_reorder" and reorder != "vectorized":
         raise ValueError("Fused tail requires vectorized activation reorder.")
+    if b1_schedule != "baseline" or reorder in ("chunk_reuse2", "chunk_reuse4"):
+        if graph_mode not in (None, "decoder"):
+            raise ValueError("Chunk reuse and B1 schedule candidates require decoder graphs.")
+        if activation_tail != "torch" or reorder not in ("vectorized", "chunk_reuse2", "chunk_reuse4"):
+            raise ValueError("B1 candidates require Torch tail and vectorized/chunk_reuse2/chunk_reuse4 reorder.")
 
 
 def validate_candidate_args(args, *, graph_mode, device_route):
@@ -62,4 +72,5 @@ def validate_candidate_args(args, *, graph_mode, device_route):
         graph_mode=graph_mode,
         device_route=device_route,
         decoder_input_mode=getattr(args, "decoder_input_mode", "general"),
+        b1_schedule=getattr(args, "b1_schedule", "baseline"),
     )

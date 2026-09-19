@@ -63,6 +63,11 @@ def source_hashes(source=SOURCE):
         "bias_dot_probe_kernel.cpp",
         "bias_dot_probe_binding.cpp",
         "bias_dot_probe_launch.h",
+        "swiglu_select_sign_kernel.cpp",
+        "swiglu_select_sign_binding.cpp",
+        "swiglu_select_sign_binding.h",
+        "swiglu_select_sign_launch.h",
+        "b1_schedule.h",
         "layout.h",
         "launch.h",
     )

@@ -47,9 +47,9 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument(
         "--activation-reorder",
-        choices=("scalar", "vectorized", "row_reuse"),
+        choices=("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4"),
         default="scalar",
-        help="V4 v2 FP8-byte reorder: scalar, vectorized, or experimental M1 row_reuse (new library required)",
+        help="V4 v2 FP8-byte reorder; chunk_reuse2/4 are decoder-graph-only candidates (new library required)",
     )
     parser.add_argument(
         "--activation-preparation",
@@ -62,6 +62,7 @@ def parse_args(argv=None):
     parser.add_argument("--decoder-input-mode", choices=("general", "b1_packed"), default="general")
     parser.add_argument("--select-sign", choices=("separate", "fused"), default="separate")
     parser.add_argument("--activation-tail", choices=("torch", "fused_reorder"), default="torch")
+    parser.add_argument("--b1-schedule", choices=("baseline", "tile_major"), default="baseline")
     parser.add_argument(
         "--route-mapping",
         choices=("torch", "fused"),
@@ -122,6 +123,17 @@ def parse_args(argv=None):
         help="Opt-in torch-NPU profiler export directory, controlled by /start_profile and /stop_profile",
     )
     args = parser.parse_args(argv)
+    if args.b1_schedule != "baseline" or args.activation_reorder in ("chunk_reuse2", "chunk_reuse4"):
+        # This launcher deliberately imports only the standard library.
+        # The worker repeats these contracts before loading the artifact.
+        if args.compute_backend != "v2" or not args.device_route_decode or args.decode_graph != "decoder":
+            parser.error("Chunk reuse and B1 schedule candidates require V4 v2 device-route decoder graphs.")
+        if args.activation_tail != "torch" or args.activation_reorder not in (
+            "vectorized",
+            "chunk_reuse2",
+            "chunk_reuse4",
+        ):
+            parser.error("B1 candidates require Torch tail and vectorized/chunk_reuse2/chunk_reuse4 reorder.")
     if (
         args.runtime_guard != "signature"
         or args.select_sign != "separate"
@@ -234,7 +246,12 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_validity_mode"] = args.validity_mode
     if args.route_mapping != "torch":
         additional["vq2a8_offline"]["v4_route_mapping"] = args.route_mapping
-    for name, default in (("runtime_guard", "signature"), ("select_sign", "separate"), ("activation_tail", "torch")):
+    for name, default in (
+        ("runtime_guard", "signature"),
+        ("select_sign", "separate"),
+        ("activation_tail", "torch"),
+        ("b1_schedule", "baseline"),
+    ):
         if getattr(args, name) != default:
             additional["vq2a8_offline"]["v4_" + name] = getattr(args, name)
     if args.decode_graph != "none":
@@ -363,6 +380,7 @@ def main(argv=None):
                 f"route_mapping={args.route_mapping}, "
                 f"runtime_guard={args.runtime_guard}, select_sign={args.select_sign}, "
                 f"activation_tail={args.activation_tail}, decoder_input_mode={args.decoder_input_mode}, "
+                f"b1_schedule={args.b1_schedule}, "
                 f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,

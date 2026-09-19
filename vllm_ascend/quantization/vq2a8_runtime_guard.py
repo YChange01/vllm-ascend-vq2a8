@@ -16,6 +16,7 @@ RUNTIME_FIELDS = (
     ("v4_compute_backend", "v1"),
     ("v4_activation_preparation", "rowwise"),
     ("v4_activation_reorder", "scalar"),
+    ("v4_b1_schedule", "baseline"),
     ("v4_validity_mode", "torch"),
     ("v4_route_mapping", "torch"),
     ("v4_select_sign", "separate"),

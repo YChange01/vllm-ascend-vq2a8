@@ -70,10 +70,11 @@ def require_v4_v2_features(
     activation_tail="torch",
     runtime_guard="signature",
     decoder_input_mode="general",
+    b1_schedule="baseline",
     native_ops=None,
 ):
     """Check only explicitly selected native extensions before weight loading."""
-    if reorder not in ("scalar", "vectorized", "row_reuse") or preparation not in (
+    if reorder not in ("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4") or preparation not in (
         "rowwise",
         "rowwise_packed",
         "sign_fused",
@@ -97,11 +98,14 @@ def require_v4_v2_features(
         activation_tail=activation_tail,
         preparation=preparation,
         reorder=reorder,
+        b1_schedule=b1_schedule,
     )
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
-        (reorder in ("vectorized", "row_reuse"), "activation_reorder_version"),
+        (reorder != "scalar", "activation_reorder_version"),
         (reorder == "row_reuse", "activation_reorder_row_reuse_version"),
+        (reorder in ("chunk_reuse2", "chunk_reuse4"), "activation_reorder_chunk_reuse_version"),
+        (b1_schedule == "tile_major", "b1_schedule_version"),
         (
             preparation in ("fused", "sign_fused", "sign_fused_strided", "sign_fused_direct"),
             "activation_preparation_version",
@@ -252,6 +256,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     v4_runtime_guard = "signature"
     v4_select_sign = "separate"
     v4_activation_tail = "torch"
+    v4_b1_schedule = "baseline"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
     def __init__(
@@ -264,10 +269,11 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         v4_runtime_guard="signature",
         v4_select_sign="separate",
         v4_activation_tail="torch",
+        v4_b1_schedule="baseline",
         **kwargs,
     ):
-        if v4_activation_reorder not in ("scalar", "vectorized", "row_reuse"):
-            raise ValueError("V4 v2 activation reorder requires scalar|vectorized|row_reuse.")
+        if v4_activation_reorder not in ("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4"):
+            raise ValueError("Invalid V4 v2 activation reorder.")
         if v4_activation_preparation not in (
             "rowwise",
             "rowwise_packed",
@@ -294,10 +300,14 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             v4_activation_tail,
             preparation=v4_activation_preparation,
             reorder=v4_activation_reorder,
+            b1_schedule=v4_b1_schedule,
         )
         self.v4_runtime_guard = v4_runtime_guard
         self.v4_select_sign = v4_select_sign
         self.v4_activation_tail = v4_activation_tail
+        self.v4_b1_schedule = v4_b1_schedule
+        self.v4_candidate_graph_build_calls = 0
+        self.v4_candidate_reference_calls = 0
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
@@ -330,12 +340,31 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         Shape dispatch is host metadata, not route-ID reads or payload copies.
         A missing row-reuse ABI/method always fails; it never selects a fallback.
         """
+        if (
+            self.v4_activation_reorder in ("chunk_reuse2", "chunk_reuse4")
+            or getattr(self, "v4_b1_schedule", "baseline") != "baseline"
+        ):
+            # New J/K never alter eager reference or prefill, even if M=1.
+            self.v4_candidate_reference_calls = getattr(self, "v4_candidate_reference_calls", 0) + 1
+            return bank.project_vectorized(quantized, scale, bias, slots)
         if self.v4_activation_reorder == "row_reuse":
             rows = 1 if quantized.ndim == 2 else quantized.shape[1]
             project = bank.project_row_reuse if rows == 1 else bank.project_vectorized
         else:
             project = bank.project_vectorized if self.v4_activation_reorder == "vectorized" else bank.project
         return project(quantized, scale, bias, slots)
+
+    def project_v4_graph_prepared(self, bank, quantized, scale, bias, slots):
+        """J/K only in graph construction; counters are not replay execution proof."""
+        chunks = {"chunk_reuse2": 2, "chunk_reuse4": 4}.get(self.v4_activation_reorder, 0)
+        schedule = int(getattr(self, "v4_b1_schedule", "baseline") == "tile_major")
+        if chunks or schedule:
+            rows = 1 if quantized.ndim == 2 else quantized.shape[1]
+            if rows != 1:
+                raise ValueError("J/K graph candidates require M=1; prefill must use the reference path.")
+            self.v4_candidate_graph_build_calls = getattr(self, "v4_candidate_graph_build_calls", 0) + 1
+            return bank.project_candidate(quantized, scale, bias, slots, chunks, schedule)
+        return self.project_v4_prepared(bank, quantized, scale, bias, slots)
 
     def project_v4_normalized(self, bank, normalized, scale, bias, slots):
         """Candidate D only; callers must explicitly retain Torch RealDiv."""
@@ -434,10 +463,14 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             if any((s.rows, s.columns, s.rht_true_columns, s.rht_block_size) != geometry for _, s in entries):
                 raise ValueError("V4 v2 resident bank requires matching expert geometry.")
             bank = bank_type(*[[payload[field] for payload, _ in entries] for field in V4_V2_FIELDS])
-            if self.v4_activation_reorder in ("vectorized", "row_reuse") and not hasattr(bank, "project_vectorized"):
+            if self.v4_activation_reorder != "scalar" and not hasattr(bank, "project_vectorized"):
                 raise RuntimeError("Rebuild the V4 v2 library for vectorized activation reorder; no scalar fallback.")
             if self.v4_activation_reorder == "row_reuse" and not hasattr(bank, "project_row_reuse"):
                 raise RuntimeError("Rebuild the V4 v2 library for row-reuse activation reorder; no fallback.")
+            if (
+                self.v4_activation_reorder in ("chunk_reuse2", "chunk_reuse4") or self.v4_b1_schedule != "baseline"
+            ) and not hasattr(bank, "project_candidate"):
+                raise RuntimeError("Rebuild the V4 v2 library for J/K candidates; no fallback.")
             if bank.metadata()[3] != len(ids) * V4_V2_BANK_WORDS * 8:
                 raise RuntimeError("V4 v2 native bank metadata differs from the residency plan.")
             banks[kind] = (bank, spec)
@@ -540,6 +573,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "preload_host_validate_s": self.timing.get("host_validate_s", 0.0),
             "preload_h2d_s": self.timing.get("h2d_s", 0.0),
             "activation_reorder": self.v4_activation_reorder,
+            "b1_schedule": self.v4_b1_schedule,
+            "candidate_graph_build_calls": self.v4_candidate_graph_build_calls,
+            "candidate_reference_calls": self.v4_candidate_reference_calls,
             "activation_reorder_row_reuse_scope": "m1_only_m_gt1_vectorized"
             if self.v4_activation_reorder == "row_reuse"
             else None,

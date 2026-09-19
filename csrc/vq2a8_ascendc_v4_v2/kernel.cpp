@@ -6,6 +6,9 @@
 #define VQ2_V2_LAYOUT_FN __aicore__ inline
 #include "layout.h"
 #undef VQ2_V2_LAYOUT_FN
+#define VQ2_B1_SCHEDULE_FN __aicore__ inline
+#include "b1_schedule.h"
+#undef VQ2_B1_SCHEDULE_FN
 
 #if defined(__MIX_CORE_AIC_RATION__) && __MIX_CORE_AIC_RATION__ == 1
   #error "VQ2A8 v2 requires native 1C:2V UB-to-L1, not TSCM GM compatibility"
@@ -50,6 +53,7 @@ class SlotEvents {
   event_t ids_[kBuffers];
 };
 
+template <bool B1TileMajor = false>
 class AscendCV2Projection {
  public:
   __aicore__ inline void Init() {
@@ -89,7 +93,10 @@ class AscendCV2Projection {
     }
     // Dynamic 1C:2V mapping on BOTH sides, including SKUs with fewer than 32 AIC.
     for (uint32_t work = core; work < jobs * nTiles; work += cores) {
-      const uint32_t base = work / nTiles * kJobWords;
+      // Compile-time opt-in. All three peers use the same permutation, even
+      // when an invalid descriptor is skipped. The baseline keeps work intact.
+      const uint32_t descriptorWork = B1TileMajor ? B1TileMajorWork(work, jobs, nTiles) : work;
+      const uint32_t base = descriptorWork / nTiles * kJobWords;
       m_ = records.GetValue(base + kRows);
       // Both AIC and its two AIV peers skip invalid routes before pointers/flags.
       if (m_ == 0) continue;
@@ -101,7 +108,7 @@ class AscendCV2Projection {
       output_.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(records.GetValue(base + kOutput)));
       n_ = records.GetValue(base + kColumns);
       k_ = records.GetValue(base + kReduction);
-      const uint32_t nBegin = (work % nTiles) * kN;
+      const uint32_t nBegin = (descriptorWork % nTiles) * kN;
       if ASCEND_IS_AIC {
         Cube();
       } else {
@@ -362,7 +369,15 @@ class AscendCV2Projection {
 extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_grouped(GM_ADDR descriptors, uint32_t jobs, uint32_t nTiles,
                                                                uint32_t cores) {
   KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-  vq2a8_ascendc_v4_v2::AscendCV2Projection kernel;
+  vq2a8_ascendc_v4_v2::AscendCV2Projection<> kernel;
+  kernel.Init();
+  kernel.Process(descriptors, jobs, nTiles, cores);
+}
+
+extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_grouped_b1_tile_major(
+    GM_ADDR descriptors, uint32_t jobs, uint32_t nTiles, uint32_t cores) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
+  vq2a8_ascendc_v4_v2::AscendCV2Projection<true> kernel;
   kernel.Init();
   kernel.Process(descriptors, jobs, nTiles, cores);
 }
@@ -370,5 +385,9 @@ extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_grouped(GM_ADDR descri
 namespace vq2a8_ascendc_v4_v2 {
 void LaunchGrouped(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t nTiles) {
   vq2a8_ascendc_v4_v2_grouped<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs, nTiles, blocks);
+}
+void LaunchGroupedB1(void* stream, uint32_t blocks, void* descriptors, uint32_t jobs, uint32_t nTiles) {
+  vq2a8_ascendc_v4_v2_grouped_b1_tile_major<<<blocks, nullptr, stream>>>(static_cast<GM_ADDR>(descriptors), jobs,
+                                                                     nTiles, blocks);
 }
 }  // namespace vq2a8_ascendc_v4_v2

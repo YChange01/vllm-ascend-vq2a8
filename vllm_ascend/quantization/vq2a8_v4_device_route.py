@@ -121,7 +121,18 @@ def _uses_projection_candidate(runtime):
     )
 
 
-def _candidate_projection(runtime, bank, spec, preparation, hidden, slots, retain, raw_statuses):
+def _graph_projector(runtime, baseline):
+    project = getattr(runtime, "project_v4_graph_prepared", None)
+    selected = (
+        getattr(runtime, "v4_activation_reorder", "scalar") in ("chunk_reuse2", "chunk_reuse4")
+        or getattr(runtime, "v4_b1_schedule", "baseline") != "baseline"
+    )
+    if selected and not callable(project):
+        raise RuntimeError("J/K requires explicit graph projection dispatch; no fallback.")
+    return baseline if project is None else project
+
+
+def _candidate_projection(runtime, bank, spec, preparation, hidden, slots, retain, raw_statuses, *, graph=False):
     """C/D keep selection, input and projection validity in the original order."""
     tail = getattr(runtime, "v4_activation_tail", "torch") == "fused_reorder"
     if getattr(runtime, "v4_select_sign", "separate") == "fused":
@@ -145,6 +156,8 @@ def _candidate_projection(runtime, bank, spec, preparation, hidden, slots, retai
             **({"raw_input_validity": raw_statuses.append} if raw_statuses is not None else {}),
         )
     project = runtime.project_v4_normalized if tail else runtime.project_v4_prepared
+    if graph and not tail:
+        project = _graph_projector(runtime, project)
     output, valid = project(bank, activation, scale, bias, slots)
     if raw_statuses is None:
         retain((valid != 0).all() & torch.isfinite(output).all())
@@ -548,6 +561,7 @@ class DeviceRouteGraphCompute:
             "compute_backend": getattr(runtime, "v4_compute_backend", "v1"),
             "activation_preparation": getattr(runtime, "v4_activation_preparation", "rowwise"),
             "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
+            "b1_schedule": getattr(runtime, "v4_b1_schedule", "baseline"),
             "validity_mode": getattr(runtime, "v4_validity_mode", "torch"),
             "route_mapping": getattr(runtime, "v4_route_mapping", "torch"),
             "select_sign": getattr(runtime, "v4_select_sign", "separate"),
@@ -580,6 +594,7 @@ class DeviceRouteGraphCompute:
             getattr(runtime, "v4_compute_backend", "v1"),
             getattr(runtime, "v4_activation_preparation", "rowwise"),
             getattr(runtime, "v4_activation_reorder", "scalar"),
+            getattr(runtime, "v4_b1_schedule", "baseline"),
             getattr(runtime, "v4_validity_mode", "torch"),
             getattr(runtime, "v4_route_mapping", "torch"),
             getattr(runtime, "v4_select_sign", "separate"),
@@ -647,7 +662,7 @@ class DeviceRouteGraphCompute:
         bank, spec = self.banks[kind]
         if _uses_projection_candidate(self.runtime):
             return _candidate_projection(
-                self.runtime, bank, spec, self.preparations[kind], hidden, slots, retain, raw_statuses
+                self.runtime, bank, spec, self.preparations[kind], hidden, slots, retain, raw_statuses, graph=True
             )
         weight_scale, weight_bias, signs, valid = bank.select(slots)
         if raw_statuses is None:
@@ -681,6 +696,7 @@ class DeviceRouteGraphCompute:
             prepared = self.preparations[kind].many(requests, validity=retain)
             quantized, scale, bias = (torch.cat(values).contiguous() for values in zip(*prepared))
         project = getattr(self.runtime, "project_v4_prepared", None)
+        project = _graph_projector(self.runtime, project)
         output, valid = (
             bank.project(quantized, scale, bias, slots)
             if project is None

@@ -19,6 +19,7 @@
 #include "launch.h"
 #include "resident_layout.h"
 #include "select_sign_binding.h"
+#include "swiglu_select_sign_binding.h"
 
 namespace vq2a8_ascendc_v4_v2 {
 namespace {
@@ -146,8 +147,17 @@ class ResidentBank : public torch::CustomClassHolder {
                               state->weight_bias, state->signs, state->experts, state->k, state->stream);
   }
 
+  Tensors SwigluSelectSign(const at::Tensor& gateUp, const at::Tensor& ids, double limit) {
+    const auto state = state_;
+    const c10_npu::OptionalNPUGuard guard(state->table.device());
+    CheckIds(ids);
+    return ResidentSwigluSelectSign(gateUp, ids, state->table, state->weight_scale,
+                                   state->weight_bias, state->signs, state->experts,
+                                   state->k, state->stream, limit);
+  }
+
   template <bool Vectorized = false, bool PrepareOnly = false, bool NormalizedTail = false,
-            bool RowReuse = false>
+            bool RowReuse = false, uint32_t ChunkReuse = 0, bool B1Schedule = false>
   Tensors Project(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
     const auto state = state_;
     const c10_npu::OptionalNPUGuard guard(state->table.device());
@@ -159,6 +169,11 @@ class ResidentBank : public torch::CustomClassHolder {
     CheckTensor(bias, state->table, at::kFloat, x.dim() - 1, "bias_correction", 4);
     const int64_t routes = ids.numel(), m = x.dim() == 2 ? 1 : x.size(1);
     if constexpr (RowReuse) TORCH_CHECK(m == 1, "Row-reuse reorder requires M=1");
+    if constexpr (ChunkReuse != 0 || B1Schedule) {
+      static_assert(Vectorized && !NormalizedTail && !RowReuse);
+      static_assert(ChunkReuse == 0 || ChunkReuse == 2 || ChunkReuse == 4);
+      TORCH_CHECK(m == 1, "Chunk-reuse/B1 schedule requires M=1");
+    }
     TORCH_CHECK(ValidDimensions(m, state->n, state->k) && x.size(0) == routes && x.size(-1) == state->k &&
                     scale.size(0) == routes && bias.size(0) == routes && scale.numel() == routes * m &&
                     bias.numel() == routes * m, "projection requires matching [R,M,K], [R,M], R<=6, M1..32");
@@ -170,13 +185,17 @@ class ResidentBank : public torch::CustomClassHolder {
     auto valid = at::empty({routes}, state->table.options().dtype(at::kInt));
     const uint32_t blocks = std::min(state->aic_cores, static_cast<uint32_t>(routes) * state->n / kN);
     const uint32_t prepareWork = RowReuse ? static_cast<uint32_t>(routes) :
-        static_cast<uint32_t>(routes * m) * std::max(state->n, state->k) / kSelectColumns;
+        static_cast<uint32_t>(routes * m) * std::max(state->n, state->k) /
+            (kSelectColumns * (ChunkReuse == 0 ? 1 : ChunkReuse));
     const uint32_t prepareBlocks = std::min(state->aiv_cores, prepareWork);
     RecordInputs({x, scale, bias, ids}, c10_npu::getCurrentNPUStream());
     // Safe V4 ownership pattern. RunOpApi releases Tensor-owning callbacks
     // outside the legacy enqueue slot lock. Keep strong owners AND stream
     // records; dropping Python handles must not recycle any indirect pointer.
     at_npu::native::OpCommand::RunOpApi(
+        ChunkReuse == 2 ? "Vq2a8AscendCV4V2ChunkReuse2" :
+        ChunkReuse == 4 ? "Vq2a8AscendCV4V2ChunkReuse4" :
+        B1Schedule ? "Vq2a8AscendCV4V2B1Schedule" :
         RowReuse ? "Vq2a8AscendCV4V2RowReuseReorder" :
         NormalizedTail ? "Vq2a8AscendCV4V2TailReorder" :
         PrepareOnly ? "Vq2a8AscendCV4V2PrepareVectorizedProbe" :
@@ -190,6 +209,10 @@ class ResidentBank : public torch::CustomClassHolder {
             LaunchResidentPrepareRowReuse(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
                 x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
                 output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
+          } else if constexpr (ChunkReuse != 0) {
+            LaunchResidentPrepareChunkReuse(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
+                x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
+                output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k, ChunkReuse);
           } else if constexpr (Vectorized) {
             LaunchResidentPrepareVectorized(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
                 x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
@@ -200,11 +223,17 @@ class ResidentBank : public torch::CustomClassHolder {
                                   output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
           }
           if constexpr (!PrepareOnly) {
-            LaunchGrouped(state->stream, blocks, descriptors.data_ptr(), routes, state->n / kN);
+            if constexpr (B1Schedule) {
+              LaunchGroupedB1(state->stream, blocks, descriptors.data_ptr(), routes, state->n / kN);
+            } else {
+              LaunchGrouped(state->stream, blocks, descriptors.data_ptr(), routes, state->n / kN);
+            }
           }
           return 0;
         }, false);
-    if constexpr (PrepareOnly && (NormalizedTail || RowReuse)) return {reordered, valid, descriptors, output};
+    if constexpr (PrepareOnly && (NormalizedTail || RowReuse || ChunkReuse != 0)) {
+      return {reordered, valid, descriptors, output};
+    }
     if constexpr (PrepareOnly) return {reordered, valid};
     return {output, valid};
   }
@@ -212,6 +241,33 @@ class ResidentBank : public torch::CustomClassHolder {
   Tensors ProjectVectorized(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
                            const at::Tensor& ids) {
     return Project<true>(x, scale, bias, ids);
+  }
+
+  Tensors ProjectChunkReuse(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                            const at::Tensor& ids, int64_t chunks) {
+    TORCH_CHECK(chunks == 2 || chunks == 4, "Chunk-reuse requires chunks=2 or 4");
+    if (chunks == 2) return Project<true, false, false, false, 2>(x, scale, bias, ids);
+    return Project<true, false, false, false, 4>(x, scale, bias, ids);
+  }
+
+  Tensors PrepareChunkReuse(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                            const at::Tensor& ids, int64_t chunks) {
+    TORCH_CHECK(chunks == 2 || chunks == 4, "Chunk-reuse requires chunks=2 or 4");
+    if (chunks == 2) return Project<true, true, false, false, 2>(x, scale, bias, ids);
+    return Project<true, true, false, false, 4>(x, scale, bias, ids);
+  }
+
+  Tensors ProjectCandidate(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
+                           const at::Tensor& ids, int64_t chunks, int64_t schedule) {
+    TORCH_CHECK(chunks == 0 || chunks == 2 || chunks == 4, "Candidate reorder chunks must be 0, 2 or 4");
+    TORCH_CHECK(schedule == 0 || schedule == 1, "Candidate schedule must be 0 or 1");
+    if (schedule == 0) {
+      if (chunks == 0) return Project<true>(x, scale, bias, ids);
+      return ProjectChunkReuse(x, scale, bias, ids, chunks);
+    }
+    if (chunks == 0) return Project<true, false, false, false, 0, true>(x, scale, bias, ids);
+    if (chunks == 2) return Project<true, false, false, false, 2, true>(x, scale, bias, ids);
+    return Project<true, false, false, false, 4, true>(x, scale, bias, ids);
   }
 
   Tensors ProjectRowReuse(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
@@ -263,15 +319,21 @@ TORCH_LIBRARY_FRAGMENT(vq2a8_ascendc_v4_v2, m) {
   });
   m.def("activation_tail_reorder_version() -> int", []() -> int64_t { return 1; });
   m.def("activation_reorder_row_reuse_version() -> int", []() -> int64_t { return 1; });
+  m.def("activation_reorder_chunk_reuse_version() -> int", []() -> int64_t { return 1; });
+  m.def("b1_schedule_version() -> int", []() -> int64_t { return 1; });
   m.class_<vq2a8_ascendc_v4_v2::ResidentBank>("ResidentBank")
       .def(torch::init<Tensors, Tensors, Tensors, Tensors, Tensors, Tensors>())
       .def("select", &vq2a8_ascendc_v4_v2::ResidentBank::Select)
       .def("select_sign", &vq2a8_ascendc_v4_v2::ResidentBank::SelectSign)
+      .def("swiglu_select_sign", &vq2a8_ascendc_v4_v2::ResidentBank::SwigluSelectSign)
       .def("project", &vq2a8_ascendc_v4_v2::ResidentBank::Project<false>)
       .def("project_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectVectorized)
       .def("prepare_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareVectorized)
       .def("project_row_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectRowReuse)
       .def("prepare_row_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareRowReuse)
+      .def("project_chunk_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectChunkReuse)
+      .def("prepare_chunk_reuse", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareChunkReuse)
+      .def("project_candidate", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectCandidate)
       .def("project_tail", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectTail)
       .def("prepare_tail", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareTail)
       .def("metadata", &vq2a8_ascendc_v4_v2::ResidentBank::Metadata);

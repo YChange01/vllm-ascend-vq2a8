@@ -19,7 +19,8 @@ __aicore__ inline void PrepareFence() {
 // Baseline activation bytes are reordered AFTER original RHT/FP8 preparation.
 // The opt-in normalized tail starts AFTER the original FP32 division instead.
 // Compressed expert weights never move; all paths use separate entry points.
-template <bool Vectorized = false, bool NormalizedTail = false, bool RowReuse = false>
+template <bool Vectorized = false, bool NormalizedTail = false, bool RowReuse = false,
+          uint32_t ChunkReuse = 0>
 class ResidentPrepareKernel {
  public:
   __aicore__ inline void Init(GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias,
@@ -66,6 +67,11 @@ class ResidentPrepareKernel {
   }
 
   __aicore__ inline void Process() {
+    if constexpr (ChunkReuse != 0) {
+      static_assert(Vectorized && !NormalizedTail && !RowReuse && (ChunkReuse == 2 || ChunkReuse == 4));
+      ProcessChunkReuse();
+      return;
+    }
     if constexpr (RowReuse) {
       ProcessRowReuse();
       return;
@@ -108,6 +114,40 @@ class ResidentPrepareKernel {
   }
 
  private:
+  // Candidate J: one work item owns only 2/4 adjacent 256-column chunks.
+  // Reload the K-byte row once per chunk group, retaining parallel work across
+  // route x chunk-group. Both supported widths and N4096 divide these groups.
+  // Arithmetic and the descriptor/invalid-output contract remain unchanged.
+  __aicore__ inline void ProcessChunkReuse() {
+    const uint32_t chunkGroups = (n_ > k_ ? n_ : k_) / (kSelectColumns * ChunkReuse);
+    for (uint32_t work = GetBlockIdx(); work < routes_ * chunkGroups; work += GetBlockNum()) {
+      const uint32_t route = work / chunkGroups;
+      const uint32_t firstColumn = (work % chunkGroups) * kSelectColumns * ChunkReuse;
+      const int64_t expert = ids_.GetValue(route);
+      const bool valid = ValidResidentSlot(expert, experts_);
+      if (valid && firstColumn < k_) {
+        const uint32_t entry = static_cast<uint32_t>(expert) * kBankWords;
+        GlobalTensor<int64_t> order;
+        order.SetGlobalBuffer(reinterpret_cast<__gm__ int64_t*>(bank_.GetValue(entry + kBankOrder)));
+        const uint64_t rowBase = uint64_t(route) * k_;
+        DataCopy(inputUb_.Get<uint8_t>(), x_[rowBase], k_);
+        for (uint32_t chunk = 0; chunk < ChunkReuse; ++chunk) {
+          GatherVectorized(order, rowBase, firstColumn + chunk * kSelectColumns);
+        }
+      } else if (!valid && firstColumn < n_) {
+        Duplicate(outputUb_.Get<uint16_t>(), kInvalidBf16, kSelectColumns);
+        PrepareFence<HardEvent::V_MTE3>();
+        for (uint32_t chunk = 0; chunk < ChunkReuse; ++chunk) {
+          DataCopy(output_[uint64_t(route) * n_ + firstColumn + chunk * kSelectColumns],
+                   outputUb_.Get<uint16_t>(), kSelectColumns);
+        }
+        PrepareFence<HardEvent::MTE3_V>();
+        PrepareFence<HardEvent::MTE3_S>();
+      }
+      if (firstColumn == 0) WriteDescriptor(route, expert, valid);
+    }
+  }
+
   // Candidate F is a pure FP8-byte permutation, M=1 only at the binding.
   // Assign a full route row to one AIV, retaining its K-byte input in UB
   // across all 256-column chunks. This removes the baseline's 8/16 repeated
@@ -193,7 +233,9 @@ class ResidentPrepareKernel {
     // One contiguous DMA per activation row and per 256-entry order segment,
     // replacing 512 scalar GM loads. K is small enough to keep the entire
     // activation row in UB (maximum 4096 bytes); no decoded weights in GM.
-    if constexpr (!RowReuse) DataCopy(input, x_[rowBase], k_);
+    if constexpr (ChunkReuse == 0) {
+      if constexpr (!RowReuse) DataCopy(input, x_[rowBase], k_);
+    }
     DataCopy(orderWords, order[column], kSelectColumns);
     PrepareFence<HardEvent::MTE2_V>();
     Gather(orderOffsets, orderWords.ReinterpretCast<uint32_t>(),
@@ -293,7 +335,47 @@ extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_row_reuse(
   kernel.Process();
 }
 
+extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_chunk_reuse2(
+    GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR reordered,
+    GM_ADDR descriptors, GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes,
+    uint32_t m, uint32_t n, uint32_t k) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::ResidentPrepareKernel<true, false, false, 2> kernel;
+  kernel.Init(bank, routeIds, x, scale, bias, reordered, descriptors, output, valid, experts, routes, m, n, k);
+  kernel.Process();
+}
+
+extern "C" __global__ __aicore__ void vq2a8_ascendc_v4_v2_prepare_chunk_reuse4(
+    GM_ADDR bank, GM_ADDR routeIds, GM_ADDR x, GM_ADDR scale, GM_ADDR bias, GM_ADDR reordered,
+    GM_ADDR descriptors, GM_ADDR output, GM_ADDR valid, uint32_t experts, uint32_t routes,
+    uint32_t m, uint32_t n, uint32_t k) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::ResidentPrepareKernel<true, false, false, 4> kernel;
+  kernel.Init(bank, routeIds, x, scale, bias, reordered, descriptors, output, valid, experts, routes, m, n, k);
+  kernel.Process();
+}
+
 namespace vq2a8_ascendc_v4_v2 {
+void LaunchResidentPrepareChunkReuse(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
+                                   void* scale, void* bias, void* reordered, void* descriptors,
+                                   void* output, void* valid, uint32_t experts, uint32_t routes,
+                                   uint32_t m, uint32_t n, uint32_t k, uint32_t chunks) {
+  // Host binding rejects every other value before enqueue.
+  if (chunks == 2) {
+    vq2a8_ascendc_v4_v2_prepare_chunk_reuse2<<<blocks, nullptr, stream>>>(
+        static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds), static_cast<GM_ADDR>(x),
+        static_cast<GM_ADDR>(scale), static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(reordered),
+        static_cast<GM_ADDR>(descriptors), static_cast<GM_ADDR>(output), static_cast<GM_ADDR>(valid),
+        experts, routes, m, n, k);
+  } else {
+    vq2a8_ascendc_v4_v2_prepare_chunk_reuse4<<<blocks, nullptr, stream>>>(
+        static_cast<GM_ADDR>(bank), static_cast<GM_ADDR>(routeIds), static_cast<GM_ADDR>(x),
+        static_cast<GM_ADDR>(scale), static_cast<GM_ADDR>(bias), static_cast<GM_ADDR>(reordered),
+        static_cast<GM_ADDR>(descriptors), static_cast<GM_ADDR>(output), static_cast<GM_ADDR>(valid),
+        experts, routes, m, n, k);
+  }
+}
+
 void LaunchResidentPrepareRowReuse(void* stream, uint32_t blocks, void* bank, void* routeIds, void* x,
                                  void* scale, void* bias, void* reordered, void* descriptors,
                                  void* output, void* valid, uint32_t experts, uint32_t routes,

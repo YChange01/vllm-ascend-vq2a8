@@ -41,8 +41,8 @@ def _validate_v4_compute_backend(value, policy):
 
 
 def _validate_v4_activation_options(reorder, preparation, backend, policy):
-    if reorder not in ("scalar", "vectorized", "row_reuse"):
-        raise ValueError("v4_activation_reorder requires scalar|vectorized|row_reuse.")
+    if reorder not in ("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4"):
+        raise ValueError("Invalid v4_activation_reorder.")
     if preparation not in (
         "rowwise",
         "rowwise_packed",
@@ -121,6 +121,7 @@ def offline_engine_options(
     v4_runtime_guard="signature",
     v4_select_sign="separate",
     v4_activation_tail="torch",
+    v4_b1_schedule="baseline",
     v4_decoder_metadata_mode="recursive",
     v4_decoder_input_mode="general",
     v4_host_profile=False,
@@ -142,6 +143,7 @@ def offline_engine_options(
         v4_select_sign,
         v4_activation_tail,
         decoder_input_mode=v4_decoder_input_mode,
+        b1_schedule=v4_b1_schedule,
         backend=v4_compute_backend,
         policy=execution_policy,
         preparation=v4_activation_preparation,
@@ -248,6 +250,7 @@ def offline_engine_options(
                 **({"v4_runtime_guard": v4_runtime_guard} if v4_runtime_guard != "signature" else {}),
                 **({"v4_select_sign": v4_select_sign} if v4_select_sign != "separate" else {}),
                 **({"v4_activation_tail": v4_activation_tail} if v4_activation_tail != "torch" else {}),
+                **({"v4_b1_schedule": v4_b1_schedule} if v4_b1_schedule != "baseline" else {}),
                 **({"v4_decoder_input_mode": v4_decoder_input_mode} if v4_decoder_input_mode != "general" else {}),
                 **(
                     {"v4_decoder_metadata_mode": v4_decoder_metadata_mode}
@@ -320,6 +323,7 @@ def validate_offline_config(config) -> dict:
         "v4_runtime_guard",
         "v4_select_sign",
         "v4_activation_tail",
+        "v4_b1_schedule",
         "v4_decoder_metadata_mode",
         "v4_decoder_input_mode",
         "v4_host_profile",
@@ -410,6 +414,7 @@ def validate_offline_config(config) -> dict:
         options.get("v4_select_sign", "separate"),
         options.get("v4_activation_tail", "torch"),
         decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
+        b1_schedule=options.get("v4_b1_schedule", "baseline"),
         backend=options.get("v4_compute_backend", "v1"),
         policy=options.get("execution_policy"),
         preparation=options.get("v4_activation_preparation", "rowwise"),
@@ -446,6 +451,7 @@ def validate_offline_config(config) -> dict:
             "v4_runtime_guard",
             "v4_select_sign",
             "v4_activation_tail",
+            "v4_b1_schedule",
         )
     ):
         raise ValueError("V4 activation options require execution_policy=ascendc_v4.")
@@ -652,6 +658,11 @@ class OfflineMoEOwner:
                     route_mapping=options.get("v4_route_mapping", "torch"),
                     select_sign=options.get("v4_select_sign", "separate"),
                     activation_tail=options.get("v4_activation_tail", "torch"),
+                    **(
+                        {"b1_schedule": options["v4_b1_schedule"]}
+                        if options.get("v4_b1_schedule", "baseline") != "baseline"
+                        else {}
+                    ),
                     runtime_guard=options.get("v4_runtime_guard", "signature"),
                     decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
                 )
@@ -789,6 +800,11 @@ class OfflineMoEOwner:
                         "v4_runtime_guard": self.options.get("v4_runtime_guard", "signature"),
                         "v4_select_sign": self.options.get("v4_select_sign", "separate"),
                         "v4_activation_tail": self.options.get("v4_activation_tail", "torch"),
+                        **(
+                            {"v4_b1_schedule": self.options["v4_b1_schedule"]}
+                            if self.options.get("v4_b1_schedule", "baseline") != "baseline"
+                            else {}
+                        ),
                     }
                     if self.options.get("execution_policy") == "ascendc_v4"
                     and self.options.get("v4_compute_backend", "v1") == "v2"
