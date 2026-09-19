@@ -162,6 +162,64 @@ def _check_schema(metadata, position):
                 raise ValueError(f"Position template requires A5 int32 B1 {name}.")
 
 
+def _compile_owned_metadata_checks(nodes):
+    """Guard captured owners directly, without constructing a source-copy DAG.
+
+    Every check still runs on every request. Owned containers may not be
+    replaced, even by same-schema objects: the captured graph retains the
+    original tensor addresses. CPU constants have independent payload snapshots;
+    device payloads remain read-only except for the explicit live copy bindings.
+    """
+    checks = []
+    tensors = set()
+    for node in nodes:
+        target, name, kind = node.target, node.name, node.kind
+        if kind in ("tensor", "immutable_tensor"):
+            if id(target) in tensors:
+                continue
+            tensors.add(id(target))
+            contract, pointer = node.contract
+            snapshot = target.detach().clone() if target.device.type == "cpu" else None
+
+            def check_tensor(target=target, name=name, contract=contract, pointer=pointer, snapshot=snapshot):
+                if _tensor_contract(target) != contract or target.data_ptr() != pointer:
+                    raise ValueError(f"Position template owned tensor contract changed: {name}.")
+                if snapshot is not None and not torch.equal(target, snapshot):
+                    raise ValueError(f"Position template owned CPU payload changed: {name}.")
+
+            checks.append(check_tensor)
+        elif kind != "constant":
+            expected_type, structure = node.contract
+            edges = tuple((key, nodes[index].target, nodes[index].kind == "constant") for key, index in node.children)
+
+            def check_container(
+                target=target, name=name, kind=kind, expected_type=expected_type, structure=structure, edges=edges
+            ):
+                if type(target) is not expected_type:
+                    raise ValueError(f"Position template owned container type changed: {name}.")
+                if kind == "dict" and target.keys() != structure:
+                    raise ValueError(f"Position template owned dictionary keys changed: {name}.")
+                if kind == "sequence" and len(target) != structure:
+                    raise ValueError(f"Position template owned sequence length changed: {name}.")
+                if kind == "dataclass" and target.__dataclass_fields__.keys() != structure:
+                    raise ValueError(f"Position template owned dataclass schema changed: {name}.")
+                if kind == "proxy" and target.idx != structure:
+                    raise ValueError("Position template owned rotary selector changed.")
+                attributes = kind in ("dataclass", "proxy")
+                for key, expected, constant in edges:
+                    actual = getattr(target, key) if attributes else target[key]
+                    if actual is expected:
+                        continue
+                    if constant:
+                        if type(actual) is not type(expected) or actual != expected:
+                            raise ValueError(f"Position template owned constant changed: {name}.{key}.")
+                    else:
+                        raise ValueError(f"Position template owned object/alias changed: {name}.{key}.")
+
+            checks.append(check_container)
+    return tuple(checks)
+
+
 class PositionTemplateRequest(dict):
     """One-use request envelope; sources stay alive through queued copies."""
 
@@ -179,6 +237,8 @@ class PositionTemplateBuffers(FastPlannedDecoderMetadataBuffers):
         self.position = decode_position(metadata, MAX_DECODER_GRAPH_CONTEXT)
         _check_schema(metadata, self.position)
         super().__init__(metadata)
+        self._owned_tree = self.tree
+        self._owned_checks = _compile_owned_metadata_checks(self._nodes)
         self.bindings = None
         self.requests = 0
         self.baseline_device_targets = len(
@@ -251,11 +311,13 @@ class PositionTemplateBuffers(FastPlannedDecoderMetadataBuffers):
             raise ValueError("Position template requires its own fresh request envelope.")
         if metadata.keys() != self.tree.keys() or any(metadata[key] is not value for key, value in self.tree.items()):
             raise ValueError("Position template request tree was replaced.")
-        # The compiled closed plan checks static types/constants, pointers,
-        # layouts and aliases before writes. Static payload contents are owned
-        # by this entry and read-only to the captured decoder.
-        targets = {}
-        self._validate(self.tree, [object()] * len(self._nodes), {}, targets)
+        if self.tree is not self._owned_tree:
+            raise ValueError("Position template owned root was replaced.")
+        # Validate every captured owner and structural edge before any write.
+        # No cross-request validation memo, source-view dictionary, copy-target
+        # collection, or CPU tensor self-comparison is needed for owned data.
+        for check in self._owned_checks:
+            check()
         pending = []
         for target, key, expected in self.bindings:
             source = metadata.sources[key]

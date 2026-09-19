@@ -3,6 +3,7 @@
 """CPU protocol tests; payload/real-model equivalence still needs NPU gates."""
 
 import ast
+from copy import copy
 from dataclasses import field, make_dataclass
 from enum import Enum
 from pathlib import Path
@@ -156,6 +157,121 @@ def test_all_validation_precedes_every_copy(failure):
     torch.testing.assert_close(owner.tree["layer0"].decode.block_table, old)
     assert owner.copies == 0
     assert not request.consumed
+
+
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "tensor_same_contract",
+        "tensor_set",
+        "tensor_resize",
+        "tensor_stride",
+        "cpu_payload",
+        "cpu_query_starts",
+        "root_replaced",
+        "dataclass_replaced",
+        "dataclass_type",
+        "dataclass_schema",
+        "dict_replaced",
+        "dict_keys",
+        "sequence_replaced",
+        "sequence_length",
+        "sequence_constant_type",
+        "proxy_replaced",
+        "proxy_selector",
+        "alias_split",
+        "alias_merge",
+    ),
+)
+def test_owned_metadata_guards_reject_mutations_before_any_live_copy(failure):
+    owner, sources = bound_owner()
+    request = owner.request(sources)
+    root = owner.tree["layer0"]
+    decode = root.decode
+    before = decode.block_table.clone()
+    if failure == "tensor_same_contract":
+        decode.sas_metadata = decode.sas_metadata.clone() + 1
+    elif failure == "tensor_set":
+        decode.sas_metadata.set_(decode.sas_metadata.clone())
+    elif failure == "tensor_resize":
+        decode.sas_metadata.resize_(1023)
+    elif failure == "tensor_stride":
+        decode.sas_metadata.as_strided_((1024,), (0,))
+    elif failure == "cpu_payload":
+        root.query_lens[0] = 2
+    elif failure == "cpu_query_starts":
+        decode.query_start_loc_cpu[1] = 2
+    elif failure == "root_replaced":
+        owner.tree = dict(owner.tree)
+    elif failure == "dataclass_replaced":
+        root.decode = copy(decode)
+    elif failure == "dataclass_type":
+        decode.__class__ = schema("AscendDSADecodeMetadata", DECODE_FIELDS)
+    elif failure == "dataclass_schema":
+        decode.__dataclass_fields__ = {**decode.__dataclass_fields__, "unexpected": object()}
+    elif failure == "dict_replaced":
+        root.cos._data = dict(root.cos._data)
+    elif failure == "dict_keys":
+        root.cos._data["unexpected"] = None
+    elif failure == "sequence_replaced":
+        decode.seq_lens_list = list(decode.seq_lens_list)
+    elif failure == "sequence_length":
+        decode.seq_lens_list.append(4)
+    elif failure == "sequence_constant_type":
+        decode.seq_lens_list[0] = float(decode.seq_lens_list[0])
+    elif failure == "proxy_replaced":
+        root.cos = copy(root.cos)
+    elif failure == "proxy_selector":
+        root.cos.idx = 1
+    elif failure == "alias_split":
+        decode.seq_lens = root.seq_lens.clone()
+    else:
+        decode.sas_metadata = decode.qli_metadata
+    with pytest.raises(ValueError, match="Position template"):
+        owner.update(request)
+    torch.testing.assert_close(decode.block_table, before)
+    assert owner.copies == 0
+    assert not request.consumed
+
+
+def test_owned_update_does_not_use_the_generic_source_validation_dag(monkeypatch):
+    owner, sources = bound_owner()
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Generic source validation must not run on owned metadata")
+
+    monkeypatch.setattr(owner, "_validate", unexpected)
+    owner.update(owner.request(sources))
+    assert owner.copies == 2
+
+
+def test_owned_cpu_snapshots_do_not_alias_the_exposed_template():
+    owner, sources = bound_owner()
+    cpu = owner.tree["layer0"].query_lens
+    for value in (2, 1, 3, 1):
+        cpu.fill_(value)
+        if value == 1:
+            owner.update(owner.request(sources))
+        else:
+            with pytest.raises(ValueError, match="CPU payload"):
+                owner.update(owner.request(sources))
+    assert owner.copies == 4
+
+
+@pytest.mark.parametrize("replacement", (False, True))
+def test_owned_immutable_tensor_pointer_and_field_are_guarded(replacement):
+    values = metadata()
+    values["layer0"].hadamard = device([1.0], torch.float32)
+    owner = PositionTemplateBuffers(values)
+    sources = {(0, "block_table"): device([[9, 1]]), (0, "slot_mapping"): device([75])}
+    owner.bind({"layer0": (0, 8), "layer1": (0, 8)}, sources)
+    if replacement:
+        owner.tree["layer0"].hadamard = owner.tree["layer0"].hadamard.clone()
+    else:
+        owner.tree["layer0"].hadamard.set_(owner.tree["layer0"].hadamard.clone())
+    with pytest.raises(ValueError, match="Position template owned"):
+        owner.update(owner.request(sources))
+    assert owner.copies == 0
 
 
 def test_request_is_one_use_and_cannot_be_used_for_another_position():

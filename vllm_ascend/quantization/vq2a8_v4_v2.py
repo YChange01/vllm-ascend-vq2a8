@@ -59,7 +59,9 @@ from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
 )
 
 
-def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, validity_mode="torch", native_ops=None):
+def require_v4_v2_features(
+    reorder="scalar", preparation="rowwise", *, validity_mode="torch", route_mapping="torch", native_ops=None
+):
     """Check only explicitly selected native extensions before weight loading."""
     if reorder not in ("scalar", "vectorized") or preparation not in (
         "rowwise",
@@ -74,6 +76,8 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, validity_
         validity_mode == "fused" and preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
     ):
         raise ValueError("Fused validity requires native sign preparation.")
+    if route_mapping not in ("torch", "fused"):
+        raise ValueError("V4 v2 route mapping requires torch|fused.")
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
         (reorder == "vectorized", "activation_reorder_version"),
@@ -83,6 +87,7 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, validity_
         ),
         (preparation in ("sign_fused_strided", "sign_fused_direct"), "activation_sign_strided_version"),
         (validity_mode == "fused", "layer_validity_version"),
+        (route_mapping == "fused", "route_mapping_version"),
     ):
         if selected:
             try:
@@ -91,6 +96,12 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, validity_
                 raise RuntimeError(f"Rebuild V4 v2 library for {feature}; no fallback.") from error
             if type(version) is not int or version != 1:
                 raise RuntimeError(f"Unsupported V4 v2 {feature}={version!r}; require 1.")
+    if route_mapping == "fused":
+        # Reject partial/old binaries before loading the resident weights, not
+        # only when the first layer constructs its mapper during graph setup.
+        from vllm_ascend.quantization.vq2a8_route_mapping import FusedRouteMapping
+
+        FusedRouteMapping(native_ops=native)
 
 
 def require_v4_v2_library():
@@ -211,6 +222,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     v4_activation_reorder = "scalar"
     v4_activation_preparation = "rowwise"
     v4_validity_mode = "torch"
+    v4_route_mapping = "torch"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
     def __init__(
@@ -219,6 +231,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         v4_activation_reorder="scalar",
         v4_activation_preparation="rowwise",
         v4_validity_mode="torch",
+        v4_route_mapping="torch",
         **kwargs,
     ):
         if v4_activation_reorder not in ("scalar", "vectorized"):
@@ -240,6 +253,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         ):
             raise ValueError("Fused validity requires native sign preparation.")
         self.v4_validity_mode = v4_validity_mode
+        if v4_route_mapping not in ("torch", "fused"):
+            raise ValueError("V4 v2 route mapping requires torch|fused.")
+        self.v4_route_mapping = v4_route_mapping
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
@@ -467,6 +483,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "activation_reorder": self.v4_activation_reorder,
             "activation_preparation": self.v4_activation_preparation,
             "validity_mode": self.v4_validity_mode,
+            "route_mapping": self.v4_route_mapping,
             "layout": "v2_zn_pair_lut",
             "arithmetic_contract": "v2_k_regrouped_requires_tolerance_validation",
             "metadata_bytes": self._device_route_banks["metadata_bytes"] if self._device_route_banks else 0,

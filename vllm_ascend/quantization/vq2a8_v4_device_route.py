@@ -114,6 +114,17 @@ def _make_layer_validity(runtime):
     return FusedLayerValidity()
 
 
+def _make_route_mapping(runtime):
+    from vllm_ascend.quantization.vq2a8_route_mapping import FusedRouteMapping, torch_route_mapping
+
+    mode = getattr(runtime, "v4_route_mapping", "torch")
+    if mode == "torch":
+        return torch_route_mapping
+    if mode != "fused" or getattr(runtime, "v4_compute_backend", "v1") != "v2":
+        raise ValueError("Fused route mapping requires the V4 v2 device-route runtime.")
+    return FusedRouteMapping()
+
+
 class DeviceRouteDecodeState(FastMoEState):
     """Keep the top-k slots on device, preserving duplicates and reduction order."""
 
@@ -125,6 +136,7 @@ class DeviceRouteDecodeState(FastMoEState):
             raise ValueError("Initialize V4 device-route banks outside the forward/timing window first.")
         super().__init__(runtime, OptimizationOptions.preset("batched"), profile=profile)
         self._layer_validity = _make_layer_validity(runtime)
+        self._route_mapping = _make_route_mapping(runtime)
         self.stats.update(singleton_forwards=0, batched_prefill_forwards=0, device_select_calls=0)
         self._decode_graph = None
         self._graph_started = False
@@ -409,10 +421,8 @@ class DeviceRouteDecodeState(FastMoEState):
             )
             lookup = runtime._device_route_banks["lookup"]
             ids = ids.reshape(-1)
-            in_range = (ids >= 0) & (ids < lookup.numel())
-            mapped = lookup.index_select(0, ids.clamp(0, lookup.numel() - 1))
-            slots = torch.where(in_range, mapped, -1).contiguous()
-            retain_route((slots >= 0).all())
+            slots, mapped_valid = self._route_mapping(ids, lookup)
+            retain_route(mapped_valid)
         with self.scope("gate_up"):
             gate = self._project(runtime, hidden.expand(slots.numel(), -1), slots, "gate_up", raw_statuses)
         with self.scope("swiglu"):
@@ -461,6 +471,7 @@ class DeviceRouteGraphCompute:
         self.banks = dict(runtime._device_route_banks if banks is None else banks)
         self.config = runtime.config
         self._layer_validity = _make_layer_validity(runtime)
+        self._route_mapping = _make_route_mapping(runtime)
         self.preparations = {}
         geometries = {}
         for kind in ("gate_up", "down"):
@@ -475,6 +486,7 @@ class DeviceRouteGraphCompute:
             "activation_preparation": getattr(runtime, "v4_activation_preparation", "rowwise"),
             "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
             "validity_mode": getattr(runtime, "v4_validity_mode", "torch"),
+            "route_mapping": getattr(runtime, "v4_route_mapping", "torch"),
             "top_k": self.config.top_k,
             "hidden_size": self.config.hidden_size,
             "hash_route": self.root.get("gate.tid2eid") is not None,
@@ -496,6 +508,7 @@ class DeviceRouteGraphCompute:
             getattr(runtime, "v4_activation_preparation", "rowwise"),
             getattr(runtime, "v4_activation_reorder", "scalar"),
             getattr(runtime, "v4_validity_mode", "torch"),
+            getattr(runtime, "v4_route_mapping", "torch"),
             id(config),
             (
                 config.top_k,
@@ -601,10 +614,8 @@ class DeviceRouteGraphCompute:
         )
         lookup = self.banks["lookup"]
         ids = ids.reshape(-1)
-        in_range = (ids >= 0) & (ids < lookup.numel())
-        mapped = lookup.index_select(0, ids.clamp(0, lookup.numel() - 1))
-        slots = torch.where(in_range, mapped, -1).contiguous()
-        flags.append((slots >= 0).all())
+        slots, mapped_valid = self._route_mapping(ids, lookup)
+        flags.append(mapped_valid)
         gate = self._project(hidden.expand(slots.numel(), -1), slots, "gate_up", flags.append, raw_statuses)
         activation = deepseek_v4_swiglu_reference(gate, self.config.swiglu_limit)
         values = self._project(activation, slots, "down", flags.append, raw_statuses)

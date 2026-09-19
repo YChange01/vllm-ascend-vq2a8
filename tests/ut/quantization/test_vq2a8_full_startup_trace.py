@@ -57,6 +57,7 @@ def validation_function():
         "_validate_v4_activation_options",
         "_validate_v4_host_options",
         "_validate_v4_validity_options",
+        "_validate_v4_route_mapping",
     }
     body = [
         node

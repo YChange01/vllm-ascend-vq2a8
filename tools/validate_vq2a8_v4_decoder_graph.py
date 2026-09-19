@@ -49,6 +49,7 @@ def parse_args(argv=None):
         default="recursive",
     )
     parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
+    parser.add_argument("--route-mapping", choices=("torch", "fused"), default="torch")
     parser.add_argument(
         "--host-profile", action="store_true", help="CPU-only ranges/counters; never a timing benchmark"
     )
@@ -62,6 +63,8 @@ def parse_args(argv=None):
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.route_mapping == "fused" and args.compute_backend != "v2":
+        parser.error("Fused route mapping requires --compute-backend v2.")
     if args.validity_mode == "fused" and (
         args.compute_backend != "v2"
         or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
@@ -170,6 +173,7 @@ def run_model(args):
         v4_activation_reorder=args.activation_reorder,
         v4_activation_preparation=args.activation_preparation,
         v4_validity_mode=args.validity_mode,
+        v4_route_mapping=args.route_mapping,
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
@@ -232,6 +236,7 @@ def run_model(args):
         "cases": rows,
         "graph": report,
         "validity_mode": args.validity_mode,
+        "route_mapping": args.route_mapping,
         "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
     }
@@ -257,6 +262,7 @@ def main(argv=None):
                     "activation_reorder": args.activation_reorder,
                     "activation_preparation": args.activation_preparation,
                     "validity_mode": args.validity_mode,
+                    "route_mapping": args.route_mapping,
                     "decoder_metadata_mode": args.decoder_metadata_mode,
                     "host_profile": args.host_profile,
                     "device_execution": False,
@@ -290,6 +296,8 @@ def main(argv=None):
     if (
         receipt.get("status") != "PASS"
         or receipt.get("hardware_execution_verified") is not True
+        or receipt.get("route_mapping") != args.route_mapping
+        or receipt.get("graph", {}).get("route_mapping") != args.route_mapping
         or len(receipt.get("cases", [])) != REUSE_ROUNDS * len(CASES)
         or receipt.get("graph", {}).get("decoder", {}).get("replays") != expected_replays
     ):

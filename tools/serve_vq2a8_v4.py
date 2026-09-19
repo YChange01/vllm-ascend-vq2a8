@@ -58,6 +58,12 @@ def parse_args(argv=None):
         help="V4 v2 activation candidate; strided/direct require a new library and separate numerical acceptance",
     )
     parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
+    parser.add_argument(
+        "--route-mapping",
+        choices=("torch", "fused"),
+        default="torch",
+        help="Opt-in exact integer expert-ID to resident-slot mapping; requires rebuilt V4 v2 library",
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -128,6 +134,8 @@ def parse_args(argv=None):
         or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
     ):
         parser.error("Fused validity requires V4 v2 device-route decode with native sign preparation.")
+    if args.route_mapping == "fused" and (args.compute_backend != "v2" or not args.device_route_decode):
+        parser.error("Fused route mapping requires --compute-backend v2 and --device-route-decode.")
     if args.host_profile and args.decode_graph != "decoder":
         parser.error("--host-profile requires --decode-graph decoder.")
     if (
@@ -203,6 +211,8 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_activation_preparation"] = args.activation_preparation
     if args.validity_mode != "torch":
         additional["vq2a8_offline"]["v4_validity_mode"] = args.validity_mode
+    if args.route_mapping != "torch":
+        additional["vq2a8_offline"]["v4_route_mapping"] = args.route_mapping
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
@@ -324,6 +334,7 @@ def main(argv=None):
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
                 f"metadata_mode={args.decoder_metadata_mode}, validity_mode={args.validity_mode}, "
+                f"route_mapping={args.route_mapping}, "
                 f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,

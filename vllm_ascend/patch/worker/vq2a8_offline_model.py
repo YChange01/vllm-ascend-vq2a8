@@ -176,6 +176,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_activation_reorder = options.get("v4_activation_reorder", "scalar")
         self._v4_activation_preparation = options.get("v4_activation_preparation", "rowwise")
         self._v4_validity_mode = options.get("v4_validity_mode", "torch")
+        self._v4_route_mapping = options.get("v4_route_mapping", "torch")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -288,6 +289,8 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             f"{stage} preset={preset} compute_backend={getattr(self, '_v4_compute_backend', 'v1')} "
             f"activation_reorder={getattr(self, '_v4_activation_reorder', 'scalar')} "
             f"activation_preparation={getattr(self, '_v4_activation_preparation', 'rowwise')} "
+            f"validity_mode={getattr(self, '_v4_validity_mode', 'torch')} "
+            f"route_mapping={getattr(self, '_v4_route_mapping', 'torch')} "
             "expert_payload_runtime_loading=False",
             flush=True,
         )
@@ -530,6 +533,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "activation_reorder": getattr(self, "_v4_activation_reorder", "scalar"),
             "activation_preparation": getattr(self, "_v4_activation_preparation", "rowwise"),
             "validity_mode": getattr(self, "_v4_validity_mode", "torch"),
+            "route_mapping": getattr(self, "_v4_route_mapping", "torch"),
             "decoder_metadata_mode": getattr(self, "_v4_decoder_metadata_mode", "recursive"),
             "host_profile": self._v4_host_recorder.report() if getattr(self, "_v4_host_recorder", None) else None,
             "effective_graph_mode": self._v4_decode_graph if self._v4_graph_enabled else "none",
