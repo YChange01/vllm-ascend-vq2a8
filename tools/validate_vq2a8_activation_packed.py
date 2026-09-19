@@ -462,7 +462,11 @@ def run_strided_queue_case(device, native, stage, case):
                 hidden = owner[:, PAD_COLUMNS : PAD_COLUMNS + width]
             else:
                 hidden = owner
-            hidden.fill_((iteration % 7 - 3) / 8)
+            # NPU fill/ViewCopy cannot write a stride-zero expanded target.
+            # Fill its single-row owner but still submit the expanded view;
+            # padded inputs keep their padding untouched. No extra owner alias
+            # may survive the explicit release below.
+            (owner if layout == "expanded" else hidden).fill_((iteration % 7 - 3) / 8)
             values = [hidden, *(value.clone() for value in template[1:4]), template[4]]
             flags.clear()
             output = preparation.packed(*values, validity=flags.append)

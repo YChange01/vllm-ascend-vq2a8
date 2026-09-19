@@ -280,12 +280,22 @@ def test_boolean_abi_evidence_is_not_an_integer_version():
 
 
 @pytest.mark.parametrize("layout", probe.INPUT_LAYOUTS)
-def test_queue_orchestration_releases_temporary_owners_before_fence(monkeypatch, layout):
+@pytest.mark.parametrize("dtype", probe.INPUT_DTYPES)
+@pytest.mark.parametrize("width", [2048, 4096])
+@pytest.mark.parametrize("mode", probe.STRIDED_PREPARATION_MODES)
+def test_queue_orchestration_releases_temporary_owners_before_fence(monkeypatch, layout, dtype, width, mode):
     """A synchronous CPU stand-in checks Python ownership, not device ordering."""
 
     submitted_refs = []
     events = []
     calls = 0
+    original_fill = torch.Tensor.fill_
+
+    def npu_compatible_fill(tensor, value):
+        # CPU fill_ accepts repeated writes to expanded views; the tested NPU
+        # ViewCopy tiling rejects them. Keep that restriction in the fixture.
+        assert not any(size > 1 and stride == 0 for size, stride in zip(tensor.shape, tensor.stride()))
+        return original_fill(tensor, value)
 
     def output(values):
         return values[0].float().clone(), values[1].sum(-1, keepdim=True), values[2].sum(-1, keepdim=True)
@@ -294,8 +304,24 @@ def test_queue_orchestration_releases_temporary_owners_before_fence(monkeypatch,
         def packed(self, *values, validity):
             nonlocal calls
             calls += 1
+            hidden = values[0]
+            assert hidden.shape == (6, width)
+            assert hidden.dtype == {"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]
+            if layout == "expanded":
+                # Do not fix the write by materializing the input and losing
+                # coverage of the native stride-zero read path.
+                assert hidden.stride() == (0, 1)
+            elif layout == "padded":
+                assert hidden.stride() == (width + 2 * probe.PAD_COLUMNS, 1)
+                assert hidden.storage_offset() == probe.PAD_COLUMNS
+                assert bool((hidden._base[:, : probe.PAD_COLUMNS] == 19).all())
+                assert bool((hidden._base[:, -probe.PAD_COLUMNS :] == 19).all())
             if calls > 1:
                 submitted_refs.extend(weakref.ref(value) for value in values[:4])
+                if hidden._base is not None:
+                    submitted_refs.append(weakref.ref(hidden._base))
+                expected_value = ((calls - 2) % 7 - 3) / 8
+                assert torch.equal(hidden, torch.full((6, width), expected_value, dtype=hidden.dtype))
             validity(torch.tensor(True))
             return output(values)
 
@@ -307,8 +333,9 @@ def test_queue_orchestration_releases_temporary_owners_before_fence(monkeypatch,
     monkeypatch.setattr(probe, "QUEUE_ITERATIONS", 3)
     monkeypatch.setattr(probe, "preparation_for_mode", lambda *_: Preparation())
     monkeypatch.setattr(probe, "reference", output)
+    monkeypatch.setattr(torch.Tensor, "fill_", npu_compatible_fill)
     monkeypatch.setattr(torch, "npu", SimpleNamespace(synchronize=synchronize), raising=False)
-    case = ("cpu_orchestration", "sign_fused_direct", 2048, "bf16", layout)
+    case = ("cpu_orchestration", mode, width, dtype, layout)
     assert probe.run_strided_queue_case("cpu", None, lambda _: nullcontext(), case) == case[0]
     assert events == ["fence"]
 
