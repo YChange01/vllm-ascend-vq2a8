@@ -341,9 +341,30 @@ def queue_evidence():
         "python_input_owners_dropped_before_fence": True,
         "bank_owners_dropped_before_fence": True,
         "allocation_pressure_bytes": PRESSURE_BYTES,
+        "ordinary_reference": "same_device_unfused_select_then_add",
         "task_queue_enable": "1",
         "runtime_queue_slots_measured": False,
     }
+
+
+def assert_ordinary_bits(actual, expected, name):
+    import torch
+
+    got = actual.detach().cpu().contiguous()
+    want = expected.detach().cpu().contiguous()
+    if got.dtype != torch.float32 or got.dtype != want.dtype or got.shape != want.shape:
+        raise AssertionError(f"{name}: ordinary operation dtype/shape changed")
+    got_bits = got.view(torch.int32).reshape(-1)
+    want_bits = want.view(torch.int32).reshape(-1)
+    if not torch.equal(got_bits, want_bits):
+        index = int(torch.nonzero(got_bits != want_bits, as_tuple=False)[0, 0])
+        actual_bits = int(got_bits[index]) & 0xFFFFFFFF
+        expected_bits = int(want_bits[index]) & 0xFFFFFFFF
+        raise AssertionError(
+            f"{name}: ordinary operation changed at flat_index={index}, "
+            f"actual_bits=0x{actual_bits:08x}, expected_bits=0x{expected_bits:08x}; "
+            "reference=same_device_unfused_select_then_add"
+        )
 
 
 def run_queue(device, factory, native, fused, stage):
@@ -358,19 +379,27 @@ def run_queue(device, factory, native, fused, stage):
                 for pattern in ("valid", "min", "duplicate"):
                     hidden, owner = make_hidden(device, width, 6, dtype, layout)
                     ids = torch.tensor(ids_values(6, 3, pattern), dtype=torch.int64, device=device)
-                    expected = tuple(t.cpu().clone() for t in reference(banks[width][0], hidden, ids, native))
-                    templates.append((width, layout, owner, ids, expected))
+                    device_expected = reference(banks[width][0], hidden, ids, native)
+                    # Invalid slots intentionally return NaN scale rows. Build
+                    # the ordinary-op oracle on the same device via the old
+                    # path: CPU/NPU NaN arithmetic need not preserve equal bits.
+                    ordinary_expected = (device_expected[1] + 1.0).cpu().clone()
+                    expected = tuple(t.cpu().clone() for t in device_expected)
+                    templates.append((width, layout, owner, ids, expected, ordinary_expected))
+                    del device_expected
     torch.npu.synchronize()
     outputs = []
     with stage("queue_lifetime"):
         for iteration in range(QUEUE_ITERATIONS):
-            width, layout, template_owner, template_ids, expected = templates[iteration % len(templates)]
+            width, layout, template_owner, template_ids, expected, ordinary_expected = templates[
+                iteration % len(templates)
+            ]
             owner = template_owner.clone()
             hidden = hidden_view(owner, 6, width, layout)
             ids = template_ids.clone()
             values = fused(banks[width][0], hidden, ids)
             ordinary = values[1] + 1.0
-            outputs.append((values, ordinary, expected))
+            outputs.append((values, ordinary, expected, ordinary_expected))
             del hidden, owner, ids, values
             pressure = torch.empty(PRESSURE_BYTES, dtype=torch.uint8, device=device)
             pressure.fill_(iteration % 251)
@@ -381,11 +410,10 @@ def run_queue(device, factory, native, fused, stage):
         pressure = torch.empty(PRESSURE_BYTES, dtype=torch.uint8, device=device)
         pressure.fill_(91)
         del pressure
-    for index, (values, ordinary, expected) in enumerate(outputs):
-        assert_bits(tuple(value.cpu() for value in values), expected, f"queue_{index}")
-        want = expected[1] + 1.0
-        if not torch.equal(ordinary.cpu().view(torch.uint8), want.view(torch.uint8)):
-            raise AssertionError(f"queue_{index}: ordinary operation changed")
+    with stage("queue_lifetime_verify"):
+        for index, (values, ordinary, expected, ordinary_expected) in enumerate(outputs):
+            assert_bits(tuple(value.cpu() for value in values), expected, f"queue_{index}")
+            assert_ordinary_bits(ordinary, ordinary_expected, f"queue_{index}")
     return queue_evidence()
 
 
@@ -415,6 +443,12 @@ def validate_child_evidence(result, queue_lifetime):
         or not isinstance(digest, str)
         or len(digest) != 64
         or any(c not in "0123456789abcdef" for c in digest)
+        or (
+            queue_lifetime
+            and not any(
+                event.get("event") == "PASS" and event.get("stage") == "queue_lifetime_verify" for event in events
+            )
+        )
         or not any(event.get("event") == "PASS" and event.get("stage") == "final_sync" for event in events)
     ):
         raise ValueError("Incomplete resident select/sign child evidence")
