@@ -25,6 +25,7 @@ import tempfile
 from pathlib import Path
 
 from tools.diagnose_vq2a8_tp1_startup import child_environment, emit, run_child, stage_recorder
+from tools.vq2a8_candidate_options import add_candidate_arguments, validate_candidate_args
 
 CASES = ((1, 4), (3, 4), (7, 4), (11, 4), (12, 4), (1, 15))
 REUSE_ROUNDS = 2
@@ -48,7 +49,8 @@ def parse_args(argv=None):
         choices=("recursive", "planned", "planned_fast", "position_template"),
         default="recursive",
     )
-    parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
+    parser.add_argument("--validity-mode", choices=("torch", "fused", "fused_vectorized"), default="torch")
+    add_candidate_arguments(parser)
     parser.add_argument("--route-mapping", choices=("torch", "fused"), default="torch")
     parser.add_argument(
         "--host-profile", action="store_true", help="CPU-only ranges/counters; never a timing benchmark"
@@ -63,9 +65,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    try:
+        validate_candidate_args(args, graph_mode="decoder", device_route=True)
+    except ValueError as error:
+        parser.error(str(error))
     if args.route_mapping == "fused" and args.compute_backend != "v2":
         parser.error("Fused route mapping requires --compute-backend v2.")
-    if args.validity_mode == "fused" and (
+    if args.validity_mode in ("fused", "fused_vectorized") and (
         args.compute_backend != "v2"
         or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
     ):
@@ -174,6 +180,9 @@ def run_model(args):
         v4_activation_preparation=args.activation_preparation,
         v4_validity_mode=args.validity_mode,
         v4_route_mapping=args.route_mapping,
+        v4_runtime_guard=args.runtime_guard,
+        v4_select_sign=args.select_sign,
+        v4_activation_tail=args.activation_tail,
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
@@ -237,12 +246,37 @@ def run_model(args):
         "graph": report,
         "validity_mode": args.validity_mode,
         "route_mapping": args.route_mapping,
+        "runtime_guard": args.runtime_guard,
+        "select_sign": args.select_sign,
+        "activation_tail": args.activation_tail,
         "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
     }
     (output / "summary.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     print("V4_DECODER_GRAPH=PASS SUMMARY=" + str(output / "summary.json"), flush=True)
     emit("v4_decoder_graph", "CASE_PASS", scope=receipt["scope"])
+
+
+def validate_receipt(args, receipt):
+    """A successful subprocess must prove the requested modes and all replays."""
+    expected_replays = REUSE_ROUNDS * sum(count - 1 for _, count in CASES)
+    if args.decoder_metadata_mode == "position_template":
+        expected_replays *= 2  # Shadow equivalence plus actual producer-skip path.
+    if (
+        receipt.get("status") != "PASS"
+        or receipt.get("hardware_execution_verified") is not True
+        or receipt.get("route_mapping") != args.route_mapping
+        or receipt.get("graph", {}).get("route_mapping") != args.route_mapping
+        or any(
+            receipt.get(name) != getattr(args, name) or receipt.get("graph", {}).get(name) != getattr(args, name)
+            for name in ("runtime_guard", "select_sign", "activation_tail", "validity_mode")
+        )
+        or len(receipt.get("cases", [])) != REUSE_ROUNDS * len(CASES)
+        or receipt.get("graph", {}).get("decoder", {}).get("replays") != expected_replays
+    ):
+        raise ValueError("Device probe receipt does not confirm all requested modes and real decoder replays.")
+    if args.decoder_metadata_mode == "position_template":
+        require_template_evidence(receipt.get("graph", {}))
 
 
 def main(argv=None):
@@ -263,6 +297,9 @@ def main(argv=None):
                     "activation_preparation": args.activation_preparation,
                     "validity_mode": args.validity_mode,
                     "route_mapping": args.route_mapping,
+                    "runtime_guard": args.runtime_guard,
+                    "select_sign": args.select_sign,
+                    "activation_tail": args.activation_tail,
                     "decoder_metadata_mode": args.decoder_metadata_mode,
                     "host_profile": args.host_profile,
                     "device_execution": False,
@@ -290,20 +327,7 @@ def main(argv=None):
         print(f"V4_DECODER_GRAPH={result['status']} LOG=" + str(output / "validation.log"), flush=True)
         return 1
     receipt = json.loads((output / "summary.json").read_text(encoding="utf-8"))
-    expected_replays = REUSE_ROUNDS * sum(count - 1 for _, count in CASES)
-    if args.decoder_metadata_mode == "position_template":
-        expected_replays *= 2  # Shadow equivalence plus actual producer-skip path.
-    if (
-        receipt.get("status") != "PASS"
-        or receipt.get("hardware_execution_verified") is not True
-        or receipt.get("route_mapping") != args.route_mapping
-        or receipt.get("graph", {}).get("route_mapping") != args.route_mapping
-        or len(receipt.get("cases", [])) != REUSE_ROUNDS * len(CASES)
-        or receipt.get("graph", {}).get("decoder", {}).get("replays") != expected_replays
-    ):
-        raise ValueError("Device probe receipt does not confirm all requested real decoder replays.")
-    if args.decoder_metadata_mode == "position_template":
-        require_template_evidence(receipt.get("graph", {}))
+    validate_receipt(args, receipt)
     return 0
 
 

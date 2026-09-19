@@ -13,6 +13,7 @@ import regex as re
 import torch
 from safetensors import safe_open
 
+from vllm_ascend.quantization.vq2a8_abcd import validate_candidates
 from vllm_ascend.quantization.vq2a8_execution import (
     GIB,
     AscendCVQ2TP1MoE,
@@ -72,9 +73,9 @@ def _validate_v4_host_options(metadata_mode, host_profile, graph_mode, policy):
 
 
 def _validate_v4_validity_options(mode, preparation, backend, policy, device_route):
-    if mode not in ("torch", "fused"):
-        raise ValueError("v4_validity_mode requires torch|fused.")
-    if mode == "fused" and (
+    if mode not in ("torch", "fused", "fused_vectorized"):
+        raise ValueError("v4_validity_mode requires torch|fused|fused_vectorized.")
+    if mode in ("fused", "fused_vectorized") and (
         policy != "ascendc_v4"
         or backend != "v2"
         or device_route is not True
@@ -117,6 +118,9 @@ def offline_engine_options(
     v4_activation_preparation="rowwise",
     v4_validity_mode="torch",
     v4_route_mapping="torch",
+    v4_runtime_guard="signature",
+    v4_select_sign="separate",
+    v4_activation_tail="torch",
     v4_decoder_metadata_mode="recursive",
     v4_host_profile=False,
     verbose_experts=False,
@@ -132,6 +136,17 @@ def offline_engine_options(
         v4_validity_mode, v4_activation_preparation, v4_compute_backend, execution_policy, v4_device_route_decode
     )
     _validate_v4_route_mapping(v4_route_mapping, v4_compute_backend, execution_policy, v4_device_route_decode)
+    validate_candidates(
+        v4_runtime_guard,
+        v4_select_sign,
+        v4_activation_tail,
+        backend=v4_compute_backend,
+        policy=execution_policy,
+        preparation=v4_activation_preparation,
+        reorder=v4_activation_reorder,
+        device_route=v4_device_route_decode,
+        graph_mode=v4_decode_graph,
+    )
     if (
         v4_activation_preparation in ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct")
         and not v4_device_route_decode
@@ -228,6 +243,9 @@ def offline_engine_options(
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
                 **({"v4_validity_mode": v4_validity_mode} if v4_validity_mode != "torch" else {}),
                 **({"v4_route_mapping": v4_route_mapping} if v4_route_mapping != "torch" else {}),
+                **({"v4_runtime_guard": v4_runtime_guard} if v4_runtime_guard != "signature" else {}),
+                **({"v4_select_sign": v4_select_sign} if v4_select_sign != "separate" else {}),
+                **({"v4_activation_tail": v4_activation_tail} if v4_activation_tail != "torch" else {}),
                 **(
                     {"v4_decoder_metadata_mode": v4_decoder_metadata_mode}
                     if v4_decoder_metadata_mode != "recursive"
@@ -296,6 +314,9 @@ def validate_offline_config(config) -> dict:
         "v4_activation_preparation",
         "v4_validity_mode",
         "v4_route_mapping",
+        "v4_runtime_guard",
+        "v4_select_sign",
+        "v4_activation_tail",
         "v4_decoder_metadata_mode",
         "v4_host_profile",
         "v3_startup_trace",
@@ -380,6 +401,17 @@ def validate_offline_config(config) -> dict:
     elif "ascendc_library" in options or "ascendc_sha256" in options:
         raise ValueError("Native library options require explicit execution_policy=ascendc or ascendc_v4.")
     _validate_v4_compute_backend(options.get("v4_compute_backend", "v1"), options.get("execution_policy"))
+    validate_candidates(
+        options.get("v4_runtime_guard", "signature"),
+        options.get("v4_select_sign", "separate"),
+        options.get("v4_activation_tail", "torch"),
+        backend=options.get("v4_compute_backend", "v1"),
+        policy=options.get("execution_policy"),
+        preparation=options.get("v4_activation_preparation", "rowwise"),
+        reorder=options.get("v4_activation_reorder", "scalar"),
+        device_route=options.get("v4_device_route_decode", False),
+        graph_mode=options.get("v4_decode_graph", "none"),
+    )
     _validate_v4_route_mapping(
         options.get("v4_route_mapping", "torch"),
         options.get("v4_compute_backend", "v1"),
@@ -401,7 +433,15 @@ def validate_offline_config(config) -> dict:
     )
     if options.get("execution_policy") != "ascendc_v4" and any(
         key in options
-        for key in ("v4_activation_reorder", "v4_activation_preparation", "v4_validity_mode", "v4_route_mapping")
+        for key in (
+            "v4_activation_reorder",
+            "v4_activation_preparation",
+            "v4_validity_mode",
+            "v4_route_mapping",
+            "v4_runtime_guard",
+            "v4_select_sign",
+            "v4_activation_tail",
+        )
     ):
         raise ValueError("V4 activation options require execution_policy=ascendc_v4.")
     if "v4_compute_backend" in options and options.get("execution_policy") != "ascendc_v4":
@@ -605,6 +645,8 @@ class OfflineMoEOwner:
                     options.get("v4_activation_preparation", "rowwise"),
                     validity_mode=options.get("v4_validity_mode", "torch"),
                     route_mapping=options.get("v4_route_mapping", "torch"),
+                    select_sign=options.get("v4_select_sign", "separate"),
+                    activation_tail=options.get("v4_activation_tail", "torch"),
                 )
             else:
                 from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
@@ -737,6 +779,9 @@ class OfflineMoEOwner:
                         "v4_activation_preparation": self.options.get("v4_activation_preparation", "rowwise"),
                         "v4_validity_mode": self.options.get("v4_validity_mode", "torch"),
                         "v4_route_mapping": self.options.get("v4_route_mapping", "torch"),
+                        "v4_runtime_guard": self.options.get("v4_runtime_guard", "signature"),
+                        "v4_select_sign": self.options.get("v4_select_sign", "separate"),
+                        "v4_activation_tail": self.options.get("v4_activation_tail", "torch"),
                     }
                     if self.options.get("execution_policy") == "ascendc_v4"
                     and self.options.get("v4_compute_backend", "v1") == "v2"

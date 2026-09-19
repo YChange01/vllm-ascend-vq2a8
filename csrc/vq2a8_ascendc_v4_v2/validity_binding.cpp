@@ -42,7 +42,8 @@ void CheckOutput(const at::Tensor& tensor, const c10::Device& device, int64_t gr
 }
 }  // namespace
 
-at::Tensor LayerValidity(at::TensorList statusList, at::TensorList outputList, at::TensorList flagList) {
+template <bool Vectorized>
+at::Tensor LayerValidityImpl(at::TensorList statusList, at::TensorList outputList, at::TensorList flagList) {
   TORCH_CHECK(statusList.size() == kLayerValidityStatuses && outputList.size() == kLayerValidityOutputs &&
                   flagList.size() <= kLayerValidityRouteFlags,
               "Layer validity requires six statuses, three outputs, and at most eight route flags");
@@ -79,7 +80,7 @@ at::Tensor LayerValidity(at::TensorList statusList, at::TensorList outputList, a
   // its callback. RunOpApi also avoids legacy callback destruction reentrancy.
   const auto launchStream = stream.stream();
   const uint32_t gateWidth = outputs[0].size(-1), downWidth = outputs[1].size(-1);
-  at_npu::native::OpCommand::RunOpApi("Vq2a8V4V2LayerValidity",
+  at_npu::native::OpCommand::RunOpApi(Vectorized ? "Vq2a8V4V2LayerValidityVectorized" : "Vq2a8V4V2LayerValidity",
       [launchStream, statuses, outputs, flags, result, groups, gateWidth, downWidth]() -> int {
     std::array<void*, kLayerValidityStatuses> statusPointers{};
     std::array<void*, kLayerValidityOutputs> outputPointers{};
@@ -87,18 +88,34 @@ at::Tensor LayerValidity(at::TensorList statusList, at::TensorList outputList, a
     for (size_t i = 0; i < statuses.size(); ++i) statusPointers[i] = statuses[i].data_ptr();
     for (size_t i = 0; i < outputs.size(); ++i) outputPointers[i] = outputs[i].data_ptr();
     for (size_t i = 0; i < flags.size(); ++i) flagPointers[i] = flags[i].data_ptr();
-    LaunchLayerValidity(launchStream, statusPointers.data(), outputPointers.data(), flagPointers.data(),
-                        result.data_ptr(), groups, gateWidth, downWidth, flags.size());
+    if constexpr (Vectorized) {
+      LaunchLayerValidityVectorized(launchStream, statusPointers.data(), outputPointers.data(), flagPointers.data(),
+                                    result.data_ptr(), groups, gateWidth, downWidth, flags.size());
+    } else {
+      LaunchLayerValidity(launchStream, statusPointers.data(), outputPointers.data(), flagPointers.data(),
+                          result.data_ptr(), groups, gateWidth, downWidth, flags.size());
+    }
     return 0;
   }, false);
   return result;
+}
+
+at::Tensor LayerValidity(at::TensorList statuses, at::TensorList outputs, at::TensorList flags) {
+  return LayerValidityImpl<false>(statuses, outputs, flags);
+}
+
+at::Tensor LayerValidityVectorized(at::TensorList statuses, at::TensorList outputs, at::TensorList flags) {
+  return LayerValidityImpl<true>(statuses, outputs, flags);
 }
 }  // namespace vq2a8_ascendc_v4_v2
 
 TORCH_LIBRARY_FRAGMENT(vq2a8_ascendc_v4_v2, m) {
   m.def("layer_validity_version() -> int", []() -> int64_t { return 1; });
   m.def("layer_validity(Tensor[] statuses, Tensor[] outputs, Tensor[] route_flags) -> Tensor");
+  m.def("layer_validity_vectorized_version() -> int", []() -> int64_t { return 1; });
+  m.def("layer_validity_vectorized(Tensor[] statuses, Tensor[] outputs, Tensor[] route_flags) -> Tensor");
 }
 TORCH_LIBRARY_IMPL(vq2a8_ascendc_v4_v2, PrivateUse1, m) {
   m.impl("layer_validity", &vq2a8_ascendc_v4_v2::LayerValidity);
+  m.impl("layer_validity_vectorized", &vq2a8_ascendc_v4_v2::LayerValidityVectorized);
 }

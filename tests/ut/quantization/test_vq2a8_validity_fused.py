@@ -17,7 +17,15 @@ NATIVE = REPO / "csrc/vq2a8_ascendc_v4_v2"
 
 
 def native_reference(**changes):
-    return SimpleNamespace(**{"layer_validity_version": lambda: 1, "layer_validity": reference, **changes})
+    return SimpleNamespace(
+        **{
+            "layer_validity_version": lambda: 1,
+            "layer_validity": reference,
+            "layer_validity_vectorized_version": lambda: 1,
+            "layer_validity_vectorized": reference,
+            **changes,
+        }
+    )
 
 
 @pytest.mark.parametrize("version", [0, 2, True, False, "1", None])
@@ -34,11 +42,34 @@ def test_missing_native_feature_is_rejected(missing):
         FusedLayerValidity(native)
 
 
+@pytest.mark.parametrize("version", [0, 2, True, False, "1", None])
+def test_vectorized_reduction_requires_its_own_abi(version):
+    native = native_reference(layer_validity_vectorized_version=lambda: version)
+    with pytest.raises(RuntimeError, match="Unsupported layer validity ABI"):
+        FusedLayerValidity(native, reduction="vectorized")
+    assert FusedLayerValidity(native).reduction == "scalar"
+
+
+@pytest.mark.parametrize("missing", ["layer_validity_vectorized", "layer_validity_vectorized_version"])
+def test_vectorized_feature_does_not_fall_back_to_scalar(missing):
+    native = native_reference()
+    delattr(native, missing)
+    with pytest.raises(RuntimeError, match="no implicit fallback"):
+        FusedLayerValidity(native, reduction="vectorized")
+
+
+@pytest.mark.parametrize("mode", ["", None, True, "fused", "unknown"])
+def test_unknown_reduction_rejected(mode):
+    with pytest.raises(ValueError, match="reduction must be"):
+        FusedLayerValidity(native_reference(), reduction=mode)
+
+
 @pytest.mark.parametrize("groups", range(1, 7))
 @pytest.mark.parametrize("gate,down", [(2048, 2048), (2048, 4096), (4096, 2048), (4096, 4096)])
 @pytest.mark.parametrize("flags", [0, 1, 8])
 @pytest.mark.parametrize("projected_3d", [False, True])
-def test_bounded_geometry_forwards_original_tensor_owners(groups, gate, down, flags, projected_3d):
+@pytest.mark.parametrize("reduction", ["scalar", "vectorized"])
+def test_bounded_geometry_forwards_original_tensor_owners(groups, gate, down, flags, projected_3d, reduction):
     values = fixture("cpu", groups, gate, down, flags, projected_3d=projected_3d)
     calls = []
 
@@ -52,7 +83,8 @@ def test_bounded_geometry_forwards_original_tensor_owners(groups, gate, down, fl
         calls.append(True)
         return reference(statuses, outputs, route_flags)
 
-    result = FusedLayerValidity(native_reference(layer_validity=operation))(*values)
+    name = "layer_validity" if reduction == "scalar" else "layer_validity_vectorized"
+    result = FusedLayerValidity(native_reference(**{name: operation}), reduction=reduction)(*values)
     assert result.dtype == torch.bool and result.shape == () and bool(result)
     assert calls == [True]
 
@@ -175,11 +207,15 @@ def test_native_binding_keeps_tensor_owners_and_caller_resolved_stream():
     for name in ("statuses", "outputs", "flags"):
         assert f"std::vector<at::Tensor> {name}(" in binding
     assert "recordStream(tensor.storage().data_ptr(), stream)" in binding
-    enqueue = binding.index('OpCommand::RunOpApi("Vq2a8V4V2LayerValidity"')
+    enqueue = binding.index("OpCommand::RunOpApi(")
     assert binding.index("const auto launchStream = stream.stream();") < enqueue
     assert "[launchStream, statuses, outputs, flags, result, groups, gateWidth, downWidth]" in binding
     assert "stream.stream()" not in binding[enqueue:]
     assert "RunOpApiV2" not in binding
+    assert "LayerValidityImpl<false>(statuses, outputs, flags)" in binding
+    assert "LayerValidityImpl<true>(statuses, outputs, flags)" in binding
+    assert "layer_validity_vectorized_version() -> int" in binding
+    assert "layer_validity_vectorized(Tensor[] statuses, Tensor[] outputs, Tensor[] route_flags) -> Tensor" in binding
     for forbidden in ("aclrtMemcpy", ".cpu(", ".item<", "at::stack", "at::cat"):
         assert forbidden not in binding
 
@@ -222,3 +258,28 @@ def test_one_native_launch_has_fresh_single_writer_and_vector_finite_scan():
         assert f"op.CheckStatus(s{index}, groups);" in kernel
     for index in range(8):
         assert f"if (flagCount > {index}) op.CheckFlag(f{index});" in kernel
+
+
+def test_vectorized_mask_reduction_is_unsigned_and_baseline_is_preserved():
+    kernel = (NATIVE / "validity_kernel.cpp").read_text(encoding="utf-8")
+    assert "RunLayerValidity<false>" in kernel and "RunLayerValidity<true>" in kernel
+    assert "ReduceMin(reducedUb_.Get<uint32_t>(), maskUb_.Get<uint32_t>()" in kernel
+    assert "scratchUb_.Get<uint32_t>(), width / kValidityMaskBits, false)" in kernel
+    assert "allBits = reducedUb_.Get<uint32_t>().GetValue(0)" in kernel
+    assert "allBits &= maskUb_.Get<uint32_t>().GetValue(word)" in kernel
+    assert "valid_ = (allBits == 0xffffffffU) && valid_;" in kernel
+    assert "vq2a8_v4_v2_layer_validity_vectorized<<<1, nullptr, stream>>>" in kernel
+
+
+@pytest.mark.parametrize("words", [64, 128])
+def test_unsigned_min_predicate_matches_all_bits_including_clear_high_bit(words):
+    from functools import reduce
+    from operator import and_
+
+    masks = [0xFFFFFFFF] * words
+    assert min(masks) == reduce(and_, masks) == 0xFFFFFFFF
+    for word in range(words):
+        for bit in range(32):
+            masks[word] = 0xFFFFFFFF ^ (1 << bit)
+            assert (min(masks) == 0xFFFFFFFF) == (reduce(and_, masks) == 0xFFFFFFFF) is False
+            masks[word] = 0xFFFFFFFF

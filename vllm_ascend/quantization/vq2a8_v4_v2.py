@@ -20,6 +20,7 @@ import regex as re
 import torch
 import torch.nn.functional as F
 
+from vllm_ascend.quantization.vq2a8_abcd import validate_candidates
 from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
 from vllm_ascend.quantization.vq2a8_execution import ALLOCATION_GRANULARITY, ASCENDC_MAX_JOBS, ASCENDC_MAX_ROWS
 from vllm_ascend.quantization.vq2a8_execution_v4 import AscendCV4VQ2TP1MoE, _tensor_identity
@@ -60,7 +61,14 @@ from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
 
 
 def require_v4_v2_features(
-    reorder="scalar", preparation="rowwise", *, validity_mode="torch", route_mapping="torch", native_ops=None
+    reorder="scalar",
+    preparation="rowwise",
+    *,
+    validity_mode="torch",
+    route_mapping="torch",
+    select_sign="separate",
+    activation_tail="torch",
+    native_ops=None,
 ):
     """Check only explicitly selected native extensions before weight loading."""
     if reorder not in ("scalar", "vectorized") or preparation not in (
@@ -72,12 +80,16 @@ def require_v4_v2_features(
         "fused",
     ):
         raise ValueError("Invalid V4 v2 activation options.")
-    if validity_mode not in ("torch", "fused") or (
-        validity_mode == "fused" and preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    if validity_mode not in ("torch", "fused", "fused_vectorized") or (
+        validity_mode in ("fused", "fused_vectorized")
+        and preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
     ):
         raise ValueError("Fused validity requires native sign preparation.")
     if route_mapping not in ("torch", "fused"):
         raise ValueError("V4 v2 route mapping requires torch|fused.")
+    validate_candidates(
+        select_sign=select_sign, activation_tail=activation_tail, preparation=preparation, reorder=reorder
+    )
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
         (reorder == "vectorized", "activation_reorder_version"),
@@ -87,7 +99,10 @@ def require_v4_v2_features(
         ),
         (preparation in ("sign_fused_strided", "sign_fused_direct"), "activation_sign_strided_version"),
         (validity_mode == "fused", "layer_validity_version"),
+        (validity_mode == "fused_vectorized", "layer_validity_vectorized_version"),
         (route_mapping == "fused", "route_mapping_version"),
+        (select_sign == "fused", "select_sign_version"),
+        (activation_tail == "fused_reorder", "activation_tail_reorder_version"),
     ):
         if selected:
             try:
@@ -223,6 +238,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     v4_activation_preparation = "rowwise"
     v4_validity_mode = "torch"
     v4_route_mapping = "torch"
+    v4_runtime_guard = "signature"
+    v4_select_sign = "separate"
+    v4_activation_tail = "torch"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
     def __init__(
@@ -232,6 +250,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         v4_activation_preparation="rowwise",
         v4_validity_mode="torch",
         v4_route_mapping="torch",
+        v4_runtime_guard="signature",
+        v4_select_sign="separate",
+        v4_activation_tail="torch",
         **kwargs,
     ):
         if v4_activation_reorder not in ("scalar", "vectorized"):
@@ -247,8 +268,8 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             raise ValueError("Invalid V4 v2 activation preparation mode.")
         self.v4_activation_reorder = v4_activation_reorder
         self.v4_activation_preparation = v4_activation_preparation
-        if v4_validity_mode not in ("torch", "fused") or (
-            v4_validity_mode == "fused"
+        if v4_validity_mode not in ("torch", "fused", "fused_vectorized") or (
+            v4_validity_mode in ("fused", "fused_vectorized")
             and v4_activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
         ):
             raise ValueError("Fused validity requires native sign preparation.")
@@ -256,6 +277,16 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         if v4_route_mapping not in ("torch", "fused"):
             raise ValueError("V4 v2 route mapping requires torch|fused.")
         self.v4_route_mapping = v4_route_mapping
+        validate_candidates(
+            v4_runtime_guard,
+            v4_select_sign,
+            v4_activation_tail,
+            preparation=v4_activation_preparation,
+            reorder=v4_activation_reorder,
+        )
+        self.v4_runtime_guard = v4_runtime_guard
+        self.v4_select_sign = v4_select_sign
+        self.v4_activation_tail = v4_activation_tail
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
@@ -274,6 +305,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
                 fuse_sign=self.v4_activation_preparation != "rowwise_packed",
                 strided_sign=self.v4_activation_preparation in ("sign_fused_strided", "sign_fused_direct"),
                 direct_output=self.v4_activation_preparation == "sign_fused_direct",
+                fuse_select=self.v4_select_sign == "fused",
             )
         if self.v4_activation_preparation == "fused":
             from vllm_ascend.quantization.vq2a8_activation_fused import FusedV4V2Preparation
@@ -285,6 +317,12 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         """Static host option; never read route IDs or copy expert payloads."""
         project = bank.project_vectorized if self.v4_activation_reorder == "vectorized" else bank.project
         return project(quantized, scale, bias, slots)
+
+    def project_v4_normalized(self, bank, normalized, scale, bias, slots):
+        """Candidate D only; callers must explicitly retain Torch RealDiv."""
+        if self.v4_activation_tail != "fused_reorder":
+            raise ValueError("Normalized projection requires fused_reorder activation tail.")
+        return bank.project_tail(normalized, scale, bias, slots)
 
     def _prepare_host_expert(self, host):
         from vllm_ascend.quantization.vq2a8_v4_v2_prepacked import V4_V2_PREPACKED_FORMAT
@@ -484,6 +522,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "activation_preparation": self.v4_activation_preparation,
             "validity_mode": self.v4_validity_mode,
             "route_mapping": self.v4_route_mapping,
+            "runtime_guard": self.v4_runtime_guard,
+            "select_sign": self.v4_select_sign,
+            "activation_tail": self.v4_activation_tail,
             "layout": "v2_zn_pair_lut",
             "arithmetic_contract": "v2_k_regrouped_requires_tolerance_validation",
             "metadata_bytes": self._device_route_banks["metadata_bytes"] if self._device_route_banks else 0,

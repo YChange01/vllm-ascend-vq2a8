@@ -17,6 +17,7 @@ __aicore__ inline void ValidityFence() {
   WaitFlag<Event>(event);
 }
 
+template <bool Vectorized>
 class LayerValidityKernel {
  public:
   __aicore__ inline void Init(GM_ADDR result) {
@@ -26,6 +27,7 @@ class LayerValidityKernel {
     pipe_.InitBuffer(scratchUb_, kValidityMaximumWidth * sizeof(float));
     pipe_.InitBuffer(maskUb_, kValidityMaximumWidth / 8);
     pipe_.InitBuffer(resultUb_, kValidityScalarBytes);
+    if constexpr (Vectorized) pipe_.InitBuffer(reducedUb_, kValidityScalarBytes);
     valid_ = true;
   }
 
@@ -58,10 +60,23 @@ class LayerValidityKernel {
       Abs(scratch, widened, width);
       PipeBarrier<PIPE_V>();
       Compares(mask, scratch, kValidityFiniteMaximum, CMPMODE::LE, width);
-      ValidityFence<HardEvent::V_S>();
       uint32_t allBits = 0xffffffffU;
-      for (uint32_t word = 0; word < width / kValidityMaskBits; ++word) {
-        allBits &= maskUb_.Get<uint32_t>().GetValue(word);
+      if constexpr (Vectorized) {
+        PipeBarrier<PIPE_V>();
+        // Ascend 950 ReduceMin's count overload supports uint32_t. Unsigned
+        // min == UINT32_MAX iff every mask word is UINT32_MAX: exactly the
+        // original AND predicate, including the high/sign bit of every word.
+        // Source, destination and scratch are distinct, aligned UB buffers.
+        // https://asc.gitcode.com/api/SIMD-API/basic_api/memory_vector_compute/reduction_compute/ReduceMin.html
+        ReduceMin(reducedUb_.Get<uint32_t>(), maskUb_.Get<uint32_t>(),
+                  scratchUb_.Get<uint32_t>(), width / kValidityMaskBits, false);
+        ValidityFence<HardEvent::V_S>();
+        allBits = reducedUb_.Get<uint32_t>().GetValue(0);
+      } else {
+        ValidityFence<HardEvent::V_S>();
+        for (uint32_t word = 0; word < width / kValidityMaskBits; ++word) {
+          allBits &= maskUb_.Get<uint32_t>().GetValue(word);
+        }
       }
       valid_ = (allBits == 0xffffffffU) && valid_;
       // Do not overwrite the input UB while the prior vector read is in flight.
@@ -81,19 +96,17 @@ class LayerValidityKernel {
 
  private:
   TPipe pipe_;
-  TBuf<TPosition::VECCALC> inputUb_, floatUb_, scratchUb_, maskUb_, resultUb_;
+  TBuf<TPosition::VECCALC> inputUb_, floatUb_, scratchUb_, maskUb_, resultUb_, reducedUb_;
   GlobalTensor<uint8_t> result_;
   bool valid_;
 };
-}  // namespace vq2a8_ascendc_v4_v2
-
-extern "C" __global__ __aicore__ void vq2a8_v4_v2_layer_validity(
+template <bool Vectorized>
+__aicore__ inline void RunLayerValidity(
     GM_ADDR s0, GM_ADDR s1, GM_ADDR s2, GM_ADDR s3, GM_ADDR s4, GM_ADDR s5,
     GM_ADDR gate, GM_ADDR down, GM_ADDR combined,
     GM_ADDR f0, GM_ADDR f1, GM_ADDR f2, GM_ADDR f3, GM_ADDR f4, GM_ADDR f5, GM_ADDR f6, GM_ADDR f7,
     GM_ADDR result, uint32_t groups, uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount) {
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-  vq2a8_ascendc_v4_v2::LayerValidityKernel op;
+  LayerValidityKernel<Vectorized> op;
   op.Init(result);
   op.CheckStatus(s0, groups);
   op.CheckStatus(s1, groups);
@@ -114,12 +127,46 @@ extern "C" __global__ __aicore__ void vq2a8_v4_v2_layer_validity(
   if (flagCount > 7) op.CheckFlag(f7);
   op.Finish();
 }
+}  // namespace vq2a8_ascendc_v4_v2
+
+extern "C" __global__ __aicore__ void vq2a8_v4_v2_layer_validity(
+    GM_ADDR s0, GM_ADDR s1, GM_ADDR s2, GM_ADDR s3, GM_ADDR s4, GM_ADDR s5,
+    GM_ADDR gate, GM_ADDR down, GM_ADDR combined,
+    GM_ADDR f0, GM_ADDR f1, GM_ADDR f2, GM_ADDR f3, GM_ADDR f4, GM_ADDR f5, GM_ADDR f6, GM_ADDR f7,
+    GM_ADDR result, uint32_t groups, uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::RunLayerValidity<false>(s0, s1, s2, s3, s4, s5, gate, down, combined,
+      f0, f1, f2, f3, f4, f5, f6, f7, result, groups, gateWidth, downWidth, flagCount);
+}
+
+extern "C" __global__ __aicore__ void vq2a8_v4_v2_layer_validity_vectorized(
+    GM_ADDR s0, GM_ADDR s1, GM_ADDR s2, GM_ADDR s3, GM_ADDR s4, GM_ADDR s5,
+    GM_ADDR gate, GM_ADDR down, GM_ADDR combined,
+    GM_ADDR f0, GM_ADDR f1, GM_ADDR f2, GM_ADDR f3, GM_ADDR f4, GM_ADDR f5, GM_ADDR f6, GM_ADDR f7,
+    GM_ADDR result, uint32_t groups, uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  vq2a8_ascendc_v4_v2::RunLayerValidity<true>(s0, s1, s2, s3, s4, s5, gate, down, combined,
+      f0, f1, f2, f3, f4, f5, f6, f7, result, groups, gateWidth, downWidth, flagCount);
+}
 
 namespace vq2a8_ascendc_v4_v2 {
 void LaunchLayerValidity(void* stream, void* const* statuses, void* const* outputs,
                          void* const* flags, void* result, uint32_t groups,
                          uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount) {
   vq2a8_v4_v2_layer_validity<<<1, nullptr, stream>>>(
+      static_cast<GM_ADDR>(statuses[0]), static_cast<GM_ADDR>(statuses[1]), static_cast<GM_ADDR>(statuses[2]),
+      static_cast<GM_ADDR>(statuses[3]), static_cast<GM_ADDR>(statuses[4]), static_cast<GM_ADDR>(statuses[5]),
+      static_cast<GM_ADDR>(outputs[0]), static_cast<GM_ADDR>(outputs[1]), static_cast<GM_ADDR>(outputs[2]),
+      static_cast<GM_ADDR>(flags[0]), static_cast<GM_ADDR>(flags[1]), static_cast<GM_ADDR>(flags[2]),
+      static_cast<GM_ADDR>(flags[3]), static_cast<GM_ADDR>(flags[4]), static_cast<GM_ADDR>(flags[5]),
+      static_cast<GM_ADDR>(flags[6]), static_cast<GM_ADDR>(flags[7]), static_cast<GM_ADDR>(result),
+      groups, gateWidth, downWidth, flagCount);
+}
+
+void LaunchLayerValidityVectorized(void* stream, void* const* statuses, void* const* outputs,
+                                   void* const* flags, void* result, uint32_t groups,
+                                   uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount) {
+  vq2a8_v4_v2_layer_validity_vectorized<<<1, nullptr, stream>>>(
       static_cast<GM_ADDR>(statuses[0]), static_cast<GM_ADDR>(statuses[1]), static_cast<GM_ADDR>(statuses[2]),
       static_cast<GM_ADDR>(statuses[3]), static_cast<GM_ADDR>(statuses[4]), static_cast<GM_ADDR>(statuses[5]),
       static_cast<GM_ADDR>(outputs[0]), static_cast<GM_ADDR>(outputs[1]), static_cast<GM_ADDR>(outputs[2]),

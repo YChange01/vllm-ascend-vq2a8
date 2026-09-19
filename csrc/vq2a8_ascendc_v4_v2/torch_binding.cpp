@@ -18,6 +18,7 @@
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "launch.h"
 #include "resident_layout.h"
+#include "select_sign_binding.h"
 
 namespace vq2a8_ascendc_v4_v2 {
 namespace {
@@ -137,13 +138,22 @@ class ResidentBank : public torch::CustomClassHolder {
     return {scale, bias, sign, valid};
   }
 
-  template <bool Vectorized = false, bool PrepareOnly = false>
+  Tensors SelectSign(const at::Tensor& hidden, const at::Tensor& ids) {
+    const auto state = state_;
+    const c10_npu::OptionalNPUGuard guard(state->table.device());
+    CheckIds(ids);
+    return ResidentSelectSign(hidden, ids, state->table, state->weight_scale,
+                              state->weight_bias, state->signs, state->experts, state->k, state->stream);
+  }
+
+  template <bool Vectorized = false, bool PrepareOnly = false, bool NormalizedTail = false>
   Tensors Project(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
     const auto state = state_;
     const c10_npu::OptionalNPUGuard guard(state->table.device());
     CheckIds(ids);
     TORCH_CHECK(x.defined() && (x.dim() == 2 || x.dim() == 3), "activation requires [R,K] or [R,M,K]");
-    CheckTensor(x, state->table, at::kFloat8_e4m3fn, x.dim(), "activation");
+    CheckTensor(x, state->table, NormalizedTail ? at::kFloat : at::kFloat8_e4m3fn, x.dim(), "activation");
+    if constexpr (NormalizedTail) TORCH_CHECK(x.dim() == 2, "Tail fusion requires M=1 [R,K]");
     CheckTensor(scale, state->table, at::kFloat, x.dim() - 1, "activation_scale", 4);
     CheckTensor(bias, state->table, at::kFloat, x.dim() - 1, "bias_correction", 4);
     const int64_t routes = ids.numel(), m = x.dim() == 2 ? 1 : x.size(1);
@@ -152,7 +162,8 @@ class ResidentBank : public torch::CustomClassHolder {
                     bias.numel() == routes * m, "projection requires matching [R,M,K], [R,M], R<=6, M1..32");
     auto outputShape = x.sizes().vec(); outputShape.back() = state->n;
     auto output = at::empty(outputShape, x.options().dtype(at::kBFloat16));
-    auto reordered = at::empty_like(x);
+    auto reordered = NormalizedTail ? at::empty(x.sizes(), x.options().dtype(at::kFloat8_e4m3fn))
+                                   : at::empty_like(x);
     auto descriptors = at::empty({routes, kJobWords}, state->table.options());
     auto valid = at::empty({routes}, state->table.options().dtype(at::kInt));
     const uint32_t blocks = std::min(state->aic_cores, static_cast<uint32_t>(routes) * state->n / kN);
@@ -163,10 +174,15 @@ class ResidentBank : public torch::CustomClassHolder {
     // outside the legacy enqueue slot lock. Keep strong owners AND stream
     // records; dropping Python handles must not recycle any indirect pointer.
     at_npu::native::OpCommand::RunOpApi(
+        NormalizedTail ? "Vq2a8AscendCV4V2TailReorder" :
         PrepareOnly ? "Vq2a8AscendCV4V2PrepareVectorizedProbe" :
             (Vectorized ? "Vq2a8AscendCV4V2ProjectionVectorized" : "Vq2a8AscendCV4V2Projection"),
         [state, x, scale, bias, ids, reordered, descriptors, output, valid, routes, m, blocks, prepareBlocks]() -> int {
-          if constexpr (Vectorized) {
+          if constexpr (NormalizedTail) {
+            LaunchResidentPrepareTail(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
+                x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
+                output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
+          } else if constexpr (Vectorized) {
             LaunchResidentPrepareVectorized(state->stream, prepareBlocks, state->table.data_ptr(), ids.data_ptr(),
                 x.data_ptr(), scale.data_ptr(), bias.data_ptr(), reordered.data_ptr(), descriptors.data_ptr(),
                 output.data_ptr(), valid.data_ptr(), state->experts, routes, m, state->n, state->k);
@@ -180,6 +196,7 @@ class ResidentBank : public torch::CustomClassHolder {
           }
           return 0;
         }, false);
+    if constexpr (PrepareOnly && NormalizedTail) return {reordered, valid, descriptors, output};
     if constexpr (PrepareOnly) return {reordered, valid};
     return {output, valid};
   }
@@ -187,6 +204,14 @@ class ResidentBank : public torch::CustomClassHolder {
   Tensors ProjectVectorized(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias,
                            const at::Tensor& ids) {
     return Project<true>(x, scale, bias, ids);
+  }
+
+  Tensors ProjectTail(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
+    return Project<true, false, true>(x, scale, bias, ids);
+  }
+
+  Tensors PrepareTail(const at::Tensor& x, const at::Tensor& scale, const at::Tensor& bias, const at::Tensor& ids) {
+    return Project<true, true, true>(x, scale, bias, ids);
   }
 
   // DIAGNOSTIC ONLY: expose the exact gathered bytes before any GEMM can hide
@@ -217,11 +242,15 @@ TORCH_LIBRARY_FRAGMENT(vq2a8_ascendc_v4_v2, m) {
   m.def("activation_reorder_version() -> int", []() -> int64_t {
     return vq2a8_ascendc_v4_v2::kActivationReorderVersion;
   });
+  m.def("activation_tail_reorder_version() -> int", []() -> int64_t { return 1; });
   m.class_<vq2a8_ascendc_v4_v2::ResidentBank>("ResidentBank")
       .def(torch::init<Tensors, Tensors, Tensors, Tensors, Tensors, Tensors>())
       .def("select", &vq2a8_ascendc_v4_v2::ResidentBank::Select)
+      .def("select_sign", &vq2a8_ascendc_v4_v2::ResidentBank::SelectSign)
       .def("project", &vq2a8_ascendc_v4_v2::ResidentBank::Project<false>)
       .def("project_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectVectorized)
       .def("prepare_vectorized", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareVectorized)
+      .def("project_tail", &vq2a8_ascendc_v4_v2::ResidentBank::ProjectTail)
+      .def("prepare_tail", &vq2a8_ascendc_v4_v2::ResidentBank::PrepareTail)
       .def("metadata", &vq2a8_ascendc_v4_v2::ResidentBank::Metadata);
 }

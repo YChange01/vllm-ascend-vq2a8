@@ -13,4 +13,7 @@ constexpr uint32_t kLayerValidityRouteFlags = 8;
 void LaunchLayerValidity(void* stream, void* const* statuses, void* const* outputs,
                          void* const* flags, void* result, uint32_t groups,
                          uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount);
+void LaunchLayerValidityVectorized(void* stream, void* const* statuses, void* const* outputs,
+                                   void* const* flags, void* result, uint32_t groups,
+                                   uint32_t gateWidth, uint32_t downWidth, uint32_t flagCount);
 }  // namespace vq2a8_ascendc_v4_v2

@@ -12,6 +12,7 @@ from __future__ import annotations
 import torch
 
 LAYER_VALIDITY_ABI = 1
+LAYER_VALIDITY_VECTORIZED_ABI = 1
 STATUS_COUNT = 6
 OUTPUT_COUNT = 3
 MAX_ROUTE_FLAGS = 8
@@ -22,16 +23,23 @@ OUTPUT_WIDTHS = (2048, 4096)
 class FusedLayerValidity:
     """Native ABI gate with no host scalar read or implicit Torch fallback."""
 
-    def __init__(self, native_ops=None):
+    def __init__(self, native_ops=None, *, reduction="scalar"):
+        if reduction not in ("scalar", "vectorized"):
+            raise ValueError("Layer validity reduction must be scalar or vectorized.")
         native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
+        operation_name = "layer_validity" if reduction == "scalar" else "layer_validity_vectorized"
+        required_abi = LAYER_VALIDITY_ABI if reduction == "scalar" else LAYER_VALIDITY_VECTORIZED_ABI
         try:
-            version = native.layer_validity_version()
-            operation = native.layer_validity
+            version = getattr(native, operation_name + "_version")()
+            operation = getattr(native, operation_name)
         except (AttributeError, RuntimeError) as error:
-            raise RuntimeError("Fused layer validity requires rebuilt ABI 1; no implicit fallback.") from error
-        if type(version) is not int or version != LAYER_VALIDITY_ABI:
-            raise RuntimeError(f"Unsupported layer validity ABI {version}; require {LAYER_VALIDITY_ABI}.")
+            raise RuntimeError(
+                f"Fused layer validity ({reduction}) requires rebuilt ABI {required_abi}; no implicit fallback."
+            ) from error
+        if type(version) is not int or version != required_abi:
+            raise RuntimeError(f"Unsupported layer validity ABI {version} ({reduction}); require {required_abi}.")
         self._operation = operation
+        self.reduction = reduction
 
     def __call__(self, statuses, outputs, route_flags):
         validate_inputs(statuses, outputs, route_flags)

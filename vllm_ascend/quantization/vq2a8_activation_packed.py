@@ -11,8 +11,9 @@ The optional native path is intentionally narrow: sign multiplication and input
 validation only. The baseline uses the shipped ``activation_sign``; separate
 strided/direct candidates consume BF16/FP32 input views and optionally write
 MatMul outputs directly into final buffers. Row scaling, amax, division,
-clamping, and FP8 conversion remain Torch operations because the native
-quantizer has not met the byte-exact oracle.
+clamping, and FP8 conversion remain Torch operations by default. Candidate D
+can return the unchanged normalized FP32 rows after division, for a separately
+gated clamp/cast/reorder kernel; it does not enable the earlier native quantizer.
 """
 
 from __future__ import annotations
@@ -32,7 +33,15 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
     """Prepare one activation row per selected expert without Python repacking."""
 
     def __init__(
-        self, *, compact=False, validity=None, fuse_sign=False, native_ops=None, strided_sign=False, direct_output=False
+        self,
+        *,
+        compact=False,
+        validity=None,
+        fuse_sign=False,
+        native_ops=None,
+        strided_sign=False,
+        direct_output=False,
+        fuse_select=False,
     ):
         super().__init__(compact=compact, validity=validity)
         if (strided_sign and not fuse_sign) or (direct_output and not strided_sign):
@@ -40,6 +49,13 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         self.fuse_sign = fuse_sign
         self.strided_sign = strided_sign
         self.direct_output = direct_output
+        self._select_sign = None
+        if fuse_select:
+            if not direct_output:
+                raise ValueError("Resident select/sign fusion requires direct strided preparation.")
+            from vllm_ascend.quantization.vq2a8_select_sign import FusedSelectSign
+
+            self._select_sign = FusedSelectSign(native_ops=native_ops)
         self._sign = None
         if not fuse_sign:
             return
@@ -63,7 +79,18 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
                 raise RuntimeError(f"Unsupported strided sign ABI {version}; require {STRIDED_SIGN_ABI}.")
         self._sign = sign
 
-    def packed(self, hidden, weight_scale, weight_bias, signs, spec, *, validity=None, raw_input_validity=None):
+    def packed(
+        self,
+        hidden,
+        weight_scale,
+        weight_bias,
+        signs,
+        spec,
+        *,
+        validity=None,
+        raw_input_validity=None,
+        return_normalized=False,
+    ):
         """Return contiguous ``(FP8 rows, row scales, row biases)``.
 
         ``hidden`` and every metadata tensor contain one row for each selected
@@ -102,9 +129,37 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
             else:
                 validity(valid)
 
+        return self._from_signed(signed, weight_scale, weight_bias, spec, return_normalized=return_normalized)
+
+    def packed_resident(self, bank, hidden, slots, spec, *, validity, raw_statuses=None, return_normalized=False):
+        """Candidate C: retain both statuses without materializing selected signs."""
+        if self._select_sign is None:
+            raise ValueError("Resident preparation requires explicit select/sign fusion.")
+        if hidden.ndim != 2 or not 1 <= hidden.shape[0] <= PACKED_GROUP_LIMIT:
+            raise ValueError("Resident preparation requires 1..6 rows.")
+        self._check_strided_hidden(hidden)
+        width = hidden.shape[1]
+        if width not in PACKED_WIDTHS or (spec.columns, spec.rht_true_columns, spec.rht_block_size) != (
+            width,
+            width,
+            128,
+        ):
+            raise ValueError("Resident preparation requires unpadded K2048/4096 and RHT128.")
+        signed, weight_scale, weight_bias, select_valid, input_valid = self._select_sign(bank, hidden, slots)
+        if raw_statuses is not None:
+            raw_statuses.extend((select_valid, input_valid))
+        else:
+            validity((select_valid != 0).all())
+            validity(input_valid.all())
+        self._ensure_hadamard(hidden.device, spec.rht_block_size)
+        return self._from_signed(signed, weight_scale, weight_bias, spec, return_normalized=return_normalized)
+
+    def _from_signed(self, signed, weight_scale, weight_bias, spec, *, return_normalized=False):
+        groups, width = signed.shape
+        block = spec.rht_block_size
         signed_blocks = signed.reshape(groups, width // block, block)
-        rotated = torch.empty((groups, width), dtype=torch.float32, device=hidden.device)
-        bias = torch.empty(groups, dtype=torch.float32, device=hidden.device)
+        rotated = torch.empty((groups, width), dtype=torch.float32, device=signed.device)
+        bias = torch.empty(groups, dtype=torch.float32, device=signed.device)
         for group_index in range(groups):
             # Keep these as independent one-row GEMMs.  A batched GEMM is not
             # byte-equivalent to RowwiseVQ2A8Preparation on Ascend 950.
@@ -128,7 +183,11 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         transformed = rotated * weight_scale
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         scale = torch.clamp(transformed.abs().amax(dim=-1) / fp8_max, min=VQ2_FP8_MIN_SCALE)
-        quantized = torch.clamp(transformed / scale.unsqueeze(-1), -fp8_max, fp8_max).to(torch.float8_e4m3fn)
+        normalized = transformed / scale.unsqueeze(-1)
+        if return_normalized:
+            # Candidate D begins only after the same Torch reductions/division.
+            return normalized.contiguous(), scale.contiguous(), bias.contiguous()
+        quantized = torch.clamp(normalized, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
         return quantized.contiguous(), scale.contiguous(), bias.contiguous()
 
     @staticmethod

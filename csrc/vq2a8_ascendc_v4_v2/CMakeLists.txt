@@ -51,13 +51,13 @@ endif()
 # binary registration and the host launch stub. Do not guess ld.lld flags or
 # link chat-recovered hacl_rt.h declarations into the PyTorch extension.
 ascendc_library(vq2a8_ascendc_v4_v2_kernel STATIC kernel.cpp resident_select.cpp resident_prepare.cpp activation_kernel.cpp
-  validity_kernel.cpp activation_diagnostic_kernel.cpp route_mapping_kernel.cpp)
+  validity_kernel.cpp activation_diagnostic_kernel.cpp route_mapping_kernel.cpp select_sign_kernel.cpp)
 ascendc_include_directories(vq2a8_ascendc_v4_v2_kernel PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 find_package(Torch REQUIRED)
 separate_arguments(TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 add_library(vq2a8_ascendc_v4_v2 SHARED torch_binding.cpp grouped_binding.cpp activation_binding.cpp
-  validity_binding.cpp activation_diagnostic_binding.cpp route_mapping_binding.cpp)
+  validity_binding.cpp activation_diagnostic_binding.cpp route_mapping_binding.cpp select_sign_binding.cpp)
 target_compile_options(vq2a8_ascendc_v4_v2 PRIVATE ${TORCH_FLAGS})
 target_include_directories(vq2a8_ascendc_v4_v2 PRIVATE
   ${TORCH_INCLUDE_DIRS} "${TORCH_NPU_PATH}/include"

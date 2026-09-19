@@ -32,6 +32,7 @@ CASE = "v4_v2_validity_fused"
 REPO = Path(__file__).resolve().parents[1]
 LIBRARY_NAME = "libvq2a8_ascendc_v4_v2.so"
 QUEUE_ITERATIONS = 513
+QUEUE_TEMPLATES = 28  # LCM of the seven finite values and four validity cases.
 PRESSURE_BYTES = 2 * 1024 * 1024
 WIDTH_PAIRS = ((2048, 2048), (2048, 4096), (4096, 2048), (4096, 4096))
 GRAPH_CASES = ("valid", "status", "recovered_status", "output", "recovered_output", "route", "recovered_route")
@@ -43,6 +44,7 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--queue-lifetime", action="store_true")
+    parser.add_argument("--reduction", choices=("scalar", "vectorized"), default="scalar")
     parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument("--plan-only", action="store_true")
@@ -66,6 +68,8 @@ def child_command(args):
         str(args.physical_npu),
         "--timeout-s",
         str(args.timeout_s),
+        "--reduction",
+        args.reduction,
     ]
     return command + (["--queue-lifetime"] if args.queue_lifetime else [])
 
@@ -109,6 +113,20 @@ def assert_equal(actual, expected, name):
         raise AssertionError(f"{name}: predicate mismatch; no relaxed tolerance")
 
 
+def assert_checked(checker, values, name):
+    """Evaluate the independent oracle first and detect mutation of any input."""
+    import torch
+
+    snapshots = [[tensor.view(torch.uint8).clone() for tensor in part] for part in values]
+    expected = reference(*values)
+    actual = checker(*values)
+    assert_equal(actual, expected, name)
+    for part, saved in zip(values, snapshots):
+        for tensor, snapshot in zip(part, saved):
+            if not torch.equal(tensor.view(torch.uint8).cpu(), snapshot.cpu()):
+                raise AssertionError(f"{name}: validity operation mutated an input")
+
+
 def numerical_case_names():
     return [
         f"g{groups}_gate{gate}_down{down}_flags{flags}"
@@ -142,7 +160,7 @@ def run_numeric_checks(device, checker, stage):
                         )
                         output.copy_(pattern[: output.numel()].reshape(output.shape).to(device))
                         pattern_cursor += output.numel()
-                    assert_equal(checker(*values), reference(*values), name)
+                    assert_checked(checker, values, name)
                 names.append(name)
     return names
 
@@ -155,29 +173,60 @@ def run_invalid_checks(device, checker, stage):
         for status in statuses:
             for row in range(status.numel()):
                 status[row] = 0
-                assert_equal(checker(*values), reference(*values), f"status_{count}")
+                assert_checked(checker, values, f"status_{count}")
                 status[row] = -3
-                assert_equal(checker(*values), reference(*values), f"recovered_status_{count}")
+                assert_checked(checker, values, f"recovered_status_{count}")
                 count += 1
         for flag in flags:
             flag.fill_(False)
-            assert_equal(checker(*values), reference(*values), f"route_{count}")
+            assert_checked(checker, values, f"route_{count}")
             flag.fill_(True)
-            assert_equal(checker(*values), reference(*values), f"recovered_route_{count}")
+            assert_checked(checker, values, f"recovered_route_{count}")
             count += 1
         for output in outputs:
             for position in (0, output.numel() // 2, output.numel() - 1):
                 for invalid in (float("nan"), float("inf"), -float("inf")):
                     output.view(-1)[position] = invalid
-                    assert_equal(checker(*values), reference(*values), f"output_{count}")
+                    assert_checked(checker, values, f"output_{count}")
                     output.view(-1)[position] = 0.5
-                    assert_equal(checker(*values), reference(*values), f"recovered_output_{count}")
+                    assert_checked(checker, values, f"recovered_output_{count}")
                     count += 1
         # Protect the oracle itself: malformed input must not compare equal only
         # because both paths accidentally returned True.
         if count != 71 or not bool(reference(*values)):
             raise AssertionError("Invalid predicate coverage incomplete")
     return {"invalid_cases": count, "recovery_after_each": True}
+
+
+def boundary_positions(rows, width):
+    # Every 32-bit comparison-mask word must contribute, including clear high
+    # bits (signed integer reduction would be wrong). Also cover every row and
+    # either side of vector, row and 2048-element boundaries.
+    positions = {word * 32 + (31 if word % 2 else 0) for word in range(width // 32)}
+    columns = {0, 31, 32, 63, 64, width // 2 - 1, width // 2, width - 1}
+    positions.update(row * width + column for row in range(rows) for column in columns)
+    return sorted(positions)
+
+
+def boundary_case_count():
+    return sum(len(boundary_positions(rows, width)) for width in (2048, 4096) for rows in (6, 6, 1))
+
+
+def run_boundary_checks(device, checker, stage):
+    count = 0
+    for width in (2048, 4096):
+        with stage(f"mask_word_row_boundaries_{width}"):
+            values = fixture(device, gate_width=width, down_width=width)
+            for output in values[1]:
+                for position in boundary_positions(output.shape[0], width):
+                    output.view(-1)[position] = float("nan")
+                    assert_checked(checker, values, f"boundary_{count}")
+                    output.view(-1)[position] = -0.5
+                    assert_checked(checker, values, f"recovered_boundary_{count}")
+                    count += 1
+    if count != boundary_case_count():
+        raise AssertionError("Mask boundary coverage incomplete")
+    return {"invalid_cases": count, "recovery_after_each": True, "input_immutability_checked": True}
 
 
 def run_nonfinite_pattern_checks(device, checker, stage):
@@ -202,31 +251,32 @@ def run_nonfinite_pattern_checks(device, checker, stage):
                 expected = reference(*values)
                 if bool(expected):
                     raise AssertionError(f"nonfinite_bits_{index}: reference accepted a nonfinite pattern")
-                assert_equal(checker(*values), expected, f"nonfinite_bits_{index}")
+                assert_checked(checker, values, f"nonfinite_bits_{index}")
                 # 0x3f00 is exactly BF16 0.5, written through the integer view.
                 raw.fill_(0x3F00)
-                assert_equal(checker(*values), reference(*values), f"recovered_nonfinite_bits_{index}")
+                assert_checked(checker, values, f"recovered_nonfinite_bits_{index}")
                 count += 1
     if count != 256 or not bool(reference(*values)):
         raise AssertionError("Nonfinite BF16 bit-pattern coverage incomplete")
     return {"patterns": count, "raw_bits_verified": True, "recovery_after_each": True}
 
 
-def run_native_contract_checks(device, native, stage):
+def run_native_contract_checks(device, native, stage, *, reduction="scalar"):
+    operation = native.layer_validity if reduction == "scalar" else native.layer_validity_vectorized
     with stage("native_metadata_rejections"):
         statuses, outputs, flags = fixture(device)
         bad_calls = [
-            lambda: native.layer_validity(statuses[:5], outputs, flags),
-            lambda: native.layer_validity(statuses, outputs[:2], flags),
-            lambda: native.layer_validity(statuses, outputs, flags + flags[:1]),
-            lambda: native.layer_validity([statuses[0].long(), *statuses[1:]], outputs, flags),
-            lambda: native.layer_validity([statuses[0][:5], *statuses[1:]], outputs, flags),
-            lambda: native.layer_validity(statuses, [outputs[0].float(), *outputs[1:]], flags),
-            lambda: native.layer_validity(statuses, [outputs[0][:, ::2], *outputs[1:]], flags),
-            lambda: native.layer_validity(statuses, [outputs[0].cpu(), *outputs[1:]], flags),
-            lambda: native.layer_validity(statuses, outputs, [flags[0].reshape(1), *flags[1:]]),
-            lambda: native.layer_validity(statuses, outputs, [flags[0].int(), *flags[1:]]),
-            lambda: native.layer_validity(statuses, [outputs[0], outputs[1], outputs[2][:, :2048]], flags),
+            lambda: operation(statuses[:5], outputs, flags),
+            lambda: operation(statuses, outputs[:2], flags),
+            lambda: operation(statuses, outputs, flags + flags[:1]),
+            lambda: operation([statuses[0].long(), *statuses[1:]], outputs, flags),
+            lambda: operation([statuses[0][:5], *statuses[1:]], outputs, flags),
+            lambda: operation(statuses, [outputs[0].float(), *outputs[1:]], flags),
+            lambda: operation(statuses, [outputs[0][:, ::2], *outputs[1:]], flags),
+            lambda: operation(statuses, [outputs[0].cpu(), *outputs[1:]], flags),
+            lambda: operation(statuses, outputs, [flags[0].reshape(1), *flags[1:]]),
+            lambda: operation(statuses, outputs, [flags[0].int(), *flags[1:]]),
+            lambda: operation(statuses, [outputs[0], outputs[1], outputs[2][:, :2048]], flags),
         ]
         for call in bad_calls:
             try:
@@ -258,8 +308,12 @@ def run_graph_checks(device, checker, stage):
                 values[0][-1].fill_(0 if case == "status" else -2)
                 values[1][-1].fill_(float("nan") if case == "output" else -0.25)
                 values[2][-1].fill_(case != "route")
-                graph.replay()
-                assert_equal(actual, reference(*values), name)
+
+                def replay(*_values, graph=graph, actual=actual):
+                    graph.replay()
+                    return actual
+
+                assert_checked(replay, values, name)
             names.append(name)
         with stage(f"graph_reset_g{groups}"):
             torch.npu.synchronize()
@@ -271,8 +325,9 @@ def run_queue_checks(device, checker, stage):
     import torch
 
     actual, ordinary, expected, expected_ordinary = [], [], [], []
-    with stage("queue_owner_release_and_allocation_pressure"):
-        for iteration in range(QUEUE_ITERATIONS):
+    templates = []
+    with stage("queue_preupload"):
+        for iteration in range(QUEUE_TEMPLATES):
             value = (iteration % 7 - 3) / 8
             values = fixture(device, value=value, projected_3d=True)
             case = iteration % 4
@@ -282,6 +337,16 @@ def run_queue_checks(device, checker, stage):
                 values[1][-1][0, -1] = float("nan")
             elif case == 3:
                 values[2][-1].fill_(False)
+            templates.append(values)
+        del values
+        torch.npu.synchronize()
+    with stage("queue_owner_release_and_allocation_pressure"):
+        for iteration in range(QUEUE_ITERATIONS):
+            value = (iteration % 7 - 3) / 8
+            case = iteration % 4
+            # Device-to-device only: no tensor(True, device=NPU), H2D upload,
+            # reference computation, host read or fence inside this loop.
+            values = [[tensor.clone() for tensor in part] for part in templates[iteration % QUEUE_TEMPLATES]]
             actual.append(checker(*values))
             ordinary.append(values[1][0].float().sum())
             expected.append(case == 0)
@@ -304,17 +369,21 @@ def run_queue_checks(device, checker, stage):
         "explicit_per_iteration_synchronize": False,
         "allocation_pressure_bytes_per_iteration": PRESSURE_BYTES,
         "runtime_queue_slots_measured": False,
+        "input_upload_before_loop": True,
+        "input_templates": QUEUE_TEMPLATES,
+        "fresh_device_clones": True,
     }
 
 
-def validate_child_evidence(result, *, queue_lifetime):
+def validate_child_evidence(result, *, queue_lifetime, reduction="scalar"):
     final = next((event for event in reversed(result.get("events", [])) if event.get("event") == "CASE_PASS"), {})
-    expected_keys = {"numeric", "invalid", "nonfinite_patterns", "native_contract", "graph"} | (
+    expected_keys = {"numeric", "invalid", "boundaries", "nonfinite_patterns", "native_contract", "graph"} | (
         {"queue_lifetime"} if queue_lifetime else set()
     )
     values = final.get("results", {})
     if (
         final.get("case") != CASE
+        or final.get("reduction") != reduction
         or type(final.get("native_abi")) is not int
         or final.get("native_abi") != 1
         or final.get("device_execution_verified") is not True
@@ -322,6 +391,8 @@ def validate_child_evidence(result, *, queue_lifetime):
         or set(values) != expected_keys
         or values.get("numeric") != numerical_case_names()
         or values.get("invalid") != {"invalid_cases": 71, "recovery_after_each": True}
+        or values.get("boundaries")
+        != {"invalid_cases": boundary_case_count(), "recovery_after_each": True, "input_immutability_checked": True}
         or values.get("nonfinite_patterns") != {"patterns": 256, "raw_bits_verified": True, "recovery_after_each": True}
         or values.get("native_contract") != 11
         or values.get("graph") != [f"graph_g{groups}_{case}" for groups in (1, 6) for case in GRAPH_CASES]
@@ -336,6 +407,9 @@ def validate_child_evidence(result, *, queue_lifetime):
             or queue.get("explicit_per_iteration_synchronize") is not False
             or queue.get("allocation_pressure_bytes_per_iteration") != PRESSURE_BYTES
             or queue.get("task_queue_enable") != "1"
+            or queue.get("input_upload_before_loop") is not True
+            or queue.get("input_templates") != QUEUE_TEMPLATES
+            or queue.get("fresh_device_clones") is not True
         ):
             raise ValueError("Incomplete layer-validity queue evidence")
 
@@ -372,14 +446,15 @@ def run_case_child(args):
             identity = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             torch.ops.load_library(str(path))
             native = torch.ops.vq2a8_ascendc_v4_v2
-            checker = FusedLayerValidity(native)
-            emit(CASE, "INFO", library=identity, device=info, native_abi=1)
+            checker = FusedLayerValidity(native, reduction=args.reduction)
+            emit(CASE, "INFO", library=identity, device=info, native_abi=1, reduction=args.reduction)
         with torch.inference_mode():
             results = {
                 "numeric": run_numeric_checks(device, checker, stage),
                 "invalid": run_invalid_checks(device, checker, stage),
+                "boundaries": run_boundary_checks(device, checker, stage),
                 "nonfinite_patterns": run_nonfinite_pattern_checks(device, checker, stage),
-                "native_contract": run_native_contract_checks(device, native, stage),
+                "native_contract": run_native_contract_checks(device, native, stage, reduction=args.reduction),
                 "graph": run_graph_checks(device, checker, stage),
             }
             if args.queue_lifetime:
@@ -392,6 +467,7 @@ def run_case_child(args):
             "CASE_PASS",
             results=results,
             native_abi=1,
+            reduction=args.reduction,
             library=identity,
             device_execution_verified=True,
             graph_verified=True,
@@ -416,6 +492,7 @@ def main(argv=None):
         "command": child_command(args),
         "status": "PLANNED",
         "native_abi": 1,
+        "reduction": args.reduction,
         "device_execution_verified": False,
         "graph_verified": False,
         "model_integration_verified": False,
@@ -443,7 +520,7 @@ def main(argv=None):
             )
             report.update(status=result["status"], result=result)
             if result["status"] == "PASS":
-                validate_child_evidence(result, queue_lifetime=args.queue_lifetime)
+                validate_child_evidence(result, queue_lifetime=args.queue_lifetime, reduction=args.reduction)
                 report.update(device_execution_verified=True, graph_verified=True)
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED"

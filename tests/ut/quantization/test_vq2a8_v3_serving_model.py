@@ -13,6 +13,8 @@ import pytest
 import regex as re
 import torch
 
+from vllm_ascend.quantization.vq2a8_abcd import validate_candidates
+
 REPO = Path(__file__).resolve().parents[3]
 
 
@@ -34,7 +36,14 @@ def _offline_functions():
         for node in tree.body
         if isinstance(node, ast.Assign) or isinstance(node, ast.FunctionDef) and node.name in methods
     ]
-    scope = {"Path": Path, "torch": torch, "math": math, "re": re, "GIB": 1024**3}
+    scope = {
+        "Path": Path,
+        "torch": torch,
+        "math": math,
+        "re": re,
+        "GIB": 1024**3,
+        "validate_candidates": validate_candidates,
+    }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), scope)
     return NS(**{name: scope[name] for name in methods})
 

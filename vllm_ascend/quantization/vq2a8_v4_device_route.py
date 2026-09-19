@@ -103,7 +103,7 @@ def _make_layer_validity(runtime):
     if mode == "torch":
         return None
     if (
-        mode != "fused"
+        mode not in ("fused", "fused_vectorized")
         or getattr(runtime, "v4_compute_backend", "v1") != "v2"
         or getattr(runtime, "v4_activation_preparation", "rowwise")
         not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
@@ -111,7 +111,46 @@ def _make_layer_validity(runtime):
         raise ValueError("Fused validity requires V4 v2 native sign preparation.")
     from vllm_ascend.quantization.vq2a8_validity_fused import FusedLayerValidity
 
-    return FusedLayerValidity()
+    return FusedLayerValidity(reduction="vectorized" if mode == "fused_vectorized" else "scalar")
+
+
+def _uses_projection_candidate(runtime):
+    return (
+        getattr(runtime, "v4_select_sign", "separate") == "fused"
+        or getattr(runtime, "v4_activation_tail", "torch") == "fused_reorder"
+    )
+
+
+def _candidate_projection(runtime, bank, spec, preparation, hidden, slots, retain, raw_statuses):
+    """C/D keep selection, input and projection validity in the original order."""
+    tail = getattr(runtime, "v4_activation_tail", "torch") == "fused_reorder"
+    if getattr(runtime, "v4_select_sign", "separate") == "fused":
+        activation, scale, bias = preparation.packed_resident(
+            bank, hidden, slots, spec, validity=retain, raw_statuses=raw_statuses, return_normalized=tail
+        )
+    else:
+        weight_scale, weight_bias, signs, valid = bank.select(slots)
+        if raw_statuses is None:
+            retain((valid != 0).all())
+        else:
+            raw_statuses.append(valid)
+        activation, scale, bias = preparation.packed(
+            hidden,
+            weight_scale,
+            weight_bias,
+            signs,
+            spec,
+            validity=retain,
+            return_normalized=tail,
+            **({"raw_input_validity": raw_statuses.append} if raw_statuses is not None else {}),
+        )
+    project = runtime.project_v4_normalized if tail else runtime.project_v4_prepared
+    output, valid = project(bank, activation, scale, bias, slots)
+    if raw_statuses is None:
+        retain((valid != 0).all() & torch.isfinite(output).all())
+    else:
+        raw_statuses.append(valid)
+    return output
 
 
 def _make_route_mapping(runtime):
@@ -339,6 +378,20 @@ class DeviceRouteDecodeState(FastMoEState):
 
     def _project(self, runtime, hidden, slots, kind, raw_statuses=None):
         bank, spec = runtime._device_route_banks[kind]
+        if _uses_projection_candidate(runtime):
+            with self.scope("candidate_projection"):
+                output = _candidate_projection(
+                    runtime, bank, spec, runtime._row_preparation, hidden, slots, self.retain, raw_statuses
+                )
+            self.stats["preparation_calls"] += 1
+            key = "fused_select_sign_calls" if runtime.v4_select_sign == "fused" else "device_select_calls"
+            self.stats[key] = self.stats.get(key, 0) + 1
+            runtime.native_calls += slots.numel()
+            runtime.native_rows += slots.numel()
+            runtime.native_launches += 1
+            runtime.projection_rows += slots.numel()
+            runtime.prepare_batches += slots.numel()
+            return output
         with self.scope("device_select"):
             weight_scale, weight_bias, signs, valid = bank.select(slots)
             if raw_statuses is None:
@@ -459,6 +512,9 @@ class DeviceRouteGraphCompute:
     """
 
     def __init__(self, runtime, *, banks=None):
+        # Startup-only import keeps the optional plan out of eager routing.
+        from vllm_ascend.quantization.vq2a8_runtime_guard import RUNTIME_GUARD_MODES, PlannedRuntimeGuard
+
         if getattr(runtime, "execution_policy", None) != "ascendc_v4":
             raise ValueError("V4 graph compute requires the V4 resident runtime.")
         runtime._require_ready()
@@ -470,6 +526,9 @@ class DeviceRouteGraphCompute:
         self.root = dict(runtime.root)
         self.banks = dict(runtime._device_route_banks if banks is None else banks)
         self.config = runtime.config
+        self._runtime_guard_mode = getattr(runtime, "v4_runtime_guard", "signature")
+        if self._runtime_guard_mode not in RUNTIME_GUARD_MODES:
+            raise ValueError("V4 runtime guard must be signature or planned.")
         self._layer_validity = _make_layer_validity(runtime)
         self._route_mapping = _make_route_mapping(runtime)
         self.preparations = {}
@@ -487,6 +546,9 @@ class DeviceRouteGraphCompute:
             "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
             "validity_mode": getattr(runtime, "v4_validity_mode", "torch"),
             "route_mapping": getattr(runtime, "v4_route_mapping", "torch"),
+            "select_sign": getattr(runtime, "v4_select_sign", "separate"),
+            "activation_tail": getattr(runtime, "v4_activation_tail", "torch"),
+            "runtime_guard": self._runtime_guard_mode,
             "top_k": self.config.top_k,
             "hidden_size": self.config.hidden_size,
             "hash_route": self.root.get("gate.tid2eid") is not None,
@@ -497,6 +559,7 @@ class DeviceRouteGraphCompute:
             "projection_geometry": geometries,
         }
         self._runtime_contract = self._contract(runtime)
+        self._runtime_guard_plan = PlannedRuntimeGuard(runtime) if self._runtime_guard_mode == "planned" else None
 
     @staticmethod
     def _contract(runtime):
@@ -509,6 +572,9 @@ class DeviceRouteGraphCompute:
             getattr(runtime, "v4_activation_reorder", "scalar"),
             getattr(runtime, "v4_validity_mode", "torch"),
             getattr(runtime, "v4_route_mapping", "torch"),
+            getattr(runtime, "v4_select_sign", "separate"),
+            getattr(runtime, "v4_activation_tail", "torch"),
+            getattr(runtime, "v4_runtime_guard", "signature"),
             id(config),
             (
                 config.top_k,
@@ -531,17 +597,48 @@ class DeviceRouteGraphCompute:
                 for kind in ("gate_up", "down")
             ),
             tuple(
-                (name, id(tensor), tensor.data_ptr(), tuple(tensor.shape), tensor.dtype, tensor.device)
+                (
+                    name,
+                    id(tensor),
+                    tensor.data_ptr(),
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.storage_offset(),
+                    tensor.dtype,
+                    tensor.device,
+                )
                 for name, tensor in sorted(runtime.root.items())
+            ),
+            (
+                id(runtime._device_route_banks["lookup"]),
+                runtime._device_route_banks["lookup"].data_ptr(),
+                tuple(runtime._device_route_banks["lookup"].shape),
+                tuple(runtime._device_route_banks["lookup"].stride()),
+                runtime._device_route_banks["lookup"].storage_offset(),
+                runtime._device_route_banks["lookup"].dtype,
+                runtime._device_route_banks["lookup"].device,
             ),
         )
 
     def check_runtime_contract(self, runtime):
-        if self._contract(runtime) != self._runtime_contract:
+        try:
+            if self._runtime_guard_plan is not None:
+                self._runtime_guard_plan.check(runtime)
+                return
+            changed = self._contract(runtime) != self._runtime_contract
+        except (AttributeError, KeyError, TypeError) as error:
+            raise RuntimeError(
+                "V4 MoE graph runtime/root/geometry signature changed; no implicit recapture."
+            ) from error
+        if changed:
             raise RuntimeError("V4 MoE graph runtime/root/geometry signature changed; no implicit recapture.")
 
     def _project(self, hidden, slots, kind, retain, raw_statuses=None):
         bank, spec = self.banks[kind]
+        if _uses_projection_candidate(self.runtime):
+            return _candidate_projection(
+                self.runtime, bank, spec, self.preparations[kind], hidden, slots, retain, raw_statuses
+            )
         weight_scale, weight_bias, signs, valid = bank.select(slots)
         if raw_statuses is None:
             retain((valid != 0).all())

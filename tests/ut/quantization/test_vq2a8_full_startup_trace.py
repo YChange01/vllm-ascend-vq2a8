@@ -17,6 +17,7 @@ import regex as re
 import torch
 
 from tools import serve_vq2a8_v3 as server
+from vllm_ascend.quantization.vq2a8_abcd import validate_candidates
 
 REPO = Path(__file__).resolve().parents[3]
 TRACE_PATH = REPO / "vllm_ascend/quantization/vq2a8_startup_trace.py"
@@ -64,7 +65,14 @@ def validation_function():
         for node in tree.body
         if isinstance(node, ast.Assign) or isinstance(node, ast.FunctionDef) and node.name in names
     ]
-    scope = {"Path": Path, "torch": torch, "math": math, "re": re, "GIB": 1024**3}
+    scope = {
+        "Path": Path,
+        "torch": torch,
+        "math": math,
+        "re": re,
+        "GIB": 1024**3,
+        "validate_candidates": validate_candidates,
+    }
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source), "exec"), scope)
     return scope["validate_offline_config"]
 

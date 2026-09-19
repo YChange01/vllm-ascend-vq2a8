@@ -57,7 +57,10 @@ def parse_args(argv=None):
         default="rowwise",
         help="V4 v2 activation candidate; strided/direct require a new library and separate numerical acceptance",
     )
-    parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
+    parser.add_argument("--validity-mode", choices=("torch", "fused", "fused_vectorized"), default="torch")
+    parser.add_argument("--runtime-guard", choices=("signature", "planned"), default="signature")
+    parser.add_argument("--select-sign", choices=("separate", "fused"), default="separate")
+    parser.add_argument("--activation-tail", choices=("torch", "fused_reorder"), default="torch")
     parser.add_argument(
         "--route-mapping",
         choices=("torch", "fused"),
@@ -118,6 +121,18 @@ def parse_args(argv=None):
         help="Opt-in torch-NPU profiler export directory, controlled by /start_profile and /stop_profile",
     )
     args = parser.parse_args(argv)
+    if (args.runtime_guard != "signature" or args.select_sign != "separate" or args.activation_tail != "torch") and (
+        args.compute_backend != "v2" or not args.device_route_decode
+    ):
+        parser.error("ABCD candidates require V4 v2 device-route decode.")
+    if args.runtime_guard == "planned" and args.decode_graph == "none":
+        parser.error("Planned runtime guard requires MoE or decoder graphs.")
+    if (
+        args.select_sign == "fused" or args.activation_tail == "fused_reorder"
+    ) and args.activation_preparation != "sign_fused_direct":
+        parser.error("Select/sign and tail candidates require sign_fused_direct preparation.")
+    if args.activation_tail == "fused_reorder" and args.activation_reorder != "vectorized":
+        parser.error("Fused tail requires vectorized activation reorder.")
     if args.decode_graph != "none" and not args.device_route_decode:
         parser.error("--decode-graph moe/decoder requires --device-route-decode.")
     if args.graph_replay_stream == "caller" and args.decode_graph == "none":
@@ -128,7 +143,7 @@ def parse_args(argv=None):
         parser.error("--decode-graph decoder requires --graph-replay-stream caller and --max-model-len <=16.")
     if args.decoder_metadata_mode != "recursive" and args.decode_graph != "decoder":
         parser.error("Non-recursive metadata requires --decode-graph decoder.")
-    if args.validity_mode == "fused" and (
+    if args.validity_mode in ("fused", "fused_vectorized") and (
         args.compute_backend != "v2"
         or not args.device_route_decode
         or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
@@ -213,6 +228,9 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_validity_mode"] = args.validity_mode
     if args.route_mapping != "torch":
         additional["vq2a8_offline"]["v4_route_mapping"] = args.route_mapping
+    for name, default in (("runtime_guard", "signature"), ("select_sign", "separate"), ("activation_tail", "torch")):
+        if getattr(args, name) != default:
+            additional["vq2a8_offline"]["v4_" + name] = getattr(args, name)
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
@@ -335,6 +353,8 @@ def main(argv=None):
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
                 f"metadata_mode={args.decoder_metadata_mode}, validity_mode={args.validity_mode}, "
                 f"route_mapping={args.route_mapping}, "
+                f"runtime_guard={args.runtime_guard}, select_sign={args.select_sign}, "
+                f"activation_tail={args.activation_tail}, "
                 f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
