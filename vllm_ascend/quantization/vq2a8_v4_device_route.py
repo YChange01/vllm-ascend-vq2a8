@@ -98,6 +98,22 @@ def _record_tensor_stream(tensor, stream):
         tensor.record_stream(stream)
 
 
+def _make_layer_validity(runtime):
+    mode = getattr(runtime, "v4_validity_mode", "torch")
+    if mode == "torch":
+        return None
+    if (
+        mode != "fused"
+        or getattr(runtime, "v4_compute_backend", "v1") != "v2"
+        or getattr(runtime, "v4_activation_preparation", "rowwise")
+        not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    ):
+        raise ValueError("Fused validity requires V4 v2 native sign preparation.")
+    from vllm_ascend.quantization.vq2a8_validity_fused import FusedLayerValidity
+
+    return FusedLayerValidity()
+
+
 class DeviceRouteDecodeState(FastMoEState):
     """Keep the top-k slots on device, preserving duplicates and reduction order."""
 
@@ -108,6 +124,7 @@ class DeviceRouteDecodeState(FastMoEState):
         if getattr(runtime, "_device_route_banks", None) is None:
             raise ValueError("Initialize V4 device-route banks outside the forward/timing window first.")
         super().__init__(runtime, OptimizationOptions.preset("batched"), profile=profile)
+        self._layer_validity = _make_layer_validity(runtime)
         self.stats.update(singleton_forwards=0, batched_prefill_forwards=0, device_select_calls=0)
         self._decode_graph = None
         self._graph_started = False
@@ -308,11 +325,14 @@ class DeviceRouteDecodeState(FastMoEState):
             "device_execution_verified": False,  # counters alone are not NPU acceptance
         }
 
-    def _project(self, runtime, hidden, slots, kind):
+    def _project(self, runtime, hidden, slots, kind, raw_statuses=None):
         bank, spec = runtime._device_route_banks[kind]
         with self.scope("device_select"):
             weight_scale, weight_bias, signs, valid = bank.select(slots)
-            self.retain((valid != 0).all())
+            if raw_statuses is None:
+                self.retain((valid != 0).all())
+            else:
+                raw_statuses.append(valid)
             self.stats["device_select_calls"] += 1
         # Slot count is static host metadata, not device route data. Each row
         # still performs the original one-row RHT/bias GEMV and FP8 conversion.
@@ -324,7 +344,13 @@ class DeviceRouteDecodeState(FastMoEState):
                 "sign_fused_direct",
             ):
                 quantized, scale, bias = runtime._row_preparation.packed(
-                    hidden, weight_scale, weight_bias, signs, spec, validity=self.retain
+                    hidden,
+                    weight_scale,
+                    weight_bias,
+                    signs,
+                    spec,
+                    validity=self.retain,
+                    **({"raw_input_validity": raw_statuses.append} if raw_statuses is not None else {}),
                 )
             else:
                 requests = [
@@ -345,7 +371,10 @@ class DeviceRouteDecodeState(FastMoEState):
                 if project is None
                 else project(bank, quantized, scale, bias, slots)
             )
-            self.retain((valid != 0).all() & torch.isfinite(output).all())
+            if raw_statuses is None:
+                self.retain((valid != 0).all() & torch.isfinite(output).all())
+            else:
+                raw_statuses.append(valid)
         runtime.native_calls += slots.numel()
         runtime.native_rows += slots.numel()
         runtime.native_launches += 1  # projection only, same coverage definition as V1
@@ -363,6 +392,9 @@ class DeviceRouteDecodeState(FastMoEState):
             or hidden.device != runtime.device
         ):
             raise ValueError("Device-route decode requires BF16 [1,hidden_size] on the resident device.")
+        raw_statuses = [] if self._layer_validity is not None else None
+        route_flags = []
+        retain_route = route_flags.append if raw_statuses is not None else self.retain
         with self.scope("route"):
             logits = F.linear(hidden.float(), runtime.root["gate.weight"])
             weights, ids = route_vq2a8(
@@ -372,7 +404,7 @@ class DeviceRouteDecodeState(FastMoEState):
                 correction_bias=runtime.root.get("gate.bias"),
                 hash_table=runtime.root.get("gate.tid2eid"),
                 input_ids=input_ids,
-                validity=self.retain,
+                validity=retain_route,
                 device_only=True,
             )
             lookup = runtime._device_route_banks["lookup"]
@@ -380,20 +412,24 @@ class DeviceRouteDecodeState(FastMoEState):
             in_range = (ids >= 0) & (ids < lookup.numel())
             mapped = lookup.index_select(0, ids.clamp(0, lookup.numel() - 1))
             slots = torch.where(in_range, mapped, -1).contiguous()
-            self.retain((slots >= 0).all())
+            retain_route((slots >= 0).all())
         with self.scope("gate_up"):
-            gate = self._project(runtime, hidden.expand(slots.numel(), -1), slots, "gate_up")
+            gate = self._project(runtime, hidden.expand(slots.numel(), -1), slots, "gate_up", raw_statuses)
         with self.scope("swiglu"):
             activation = deepseek_v4_swiglu_reference(gate, runtime.config.swiglu_limit)
         with self.scope("down"):
-            values = self._project(runtime, activation, slots, "down")
+            values = self._project(runtime, activation, slots, "down", raw_statuses)
         with self.scope("mix_shared"):
             result = (values.reshape(1, slots.numel(), hidden.shape[1]).float() * weights.unsqueeze(-1)).sum(1)
             result *= runtime.config.routed_scale
             if runtime.config.num_shared:
                 result += runtime.shared(hidden).float()
             result = result.to(hidden.dtype)
-            self.retain(torch.isfinite(result).all())
+            self.retain(
+                torch.isfinite(result).all()
+                if raw_statuses is None
+                else self._layer_validity(raw_statuses, [gate, values, result], route_flags)
+            )
         runtime.native_experts += slots.numel()
         self.stats["singleton_forwards"] += 1
         self.stats["jobs"] += slots.numel()
@@ -424,6 +460,7 @@ class DeviceRouteGraphCompute:
         self.root = dict(runtime.root)
         self.banks = dict(runtime._device_route_banks if banks is None else banks)
         self.config = runtime.config
+        self._layer_validity = _make_layer_validity(runtime)
         self.preparations = {}
         geometries = {}
         for kind in ("gate_up", "down"):
@@ -437,6 +474,7 @@ class DeviceRouteGraphCompute:
             "compute_backend": getattr(runtime, "v4_compute_backend", "v1"),
             "activation_preparation": getattr(runtime, "v4_activation_preparation", "rowwise"),
             "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
+            "validity_mode": getattr(runtime, "v4_validity_mode", "torch"),
             "top_k": self.config.top_k,
             "hidden_size": self.config.hidden_size,
             "hash_route": self.root.get("gate.tid2eid") is not None,
@@ -457,6 +495,7 @@ class DeviceRouteGraphCompute:
             getattr(runtime, "v4_compute_backend", "v1"),
             getattr(runtime, "v4_activation_preparation", "rowwise"),
             getattr(runtime, "v4_activation_reorder", "scalar"),
+            getattr(runtime, "v4_validity_mode", "torch"),
             id(config),
             (
                 config.top_k,
@@ -488,10 +527,13 @@ class DeviceRouteGraphCompute:
         if self._contract(runtime) != self._runtime_contract:
             raise RuntimeError("V4 MoE graph runtime/root/geometry signature changed; no implicit recapture.")
 
-    def _project(self, hidden, slots, kind, retain):
+    def _project(self, hidden, slots, kind, retain, raw_statuses=None):
         bank, spec = self.banks[kind]
         weight_scale, weight_bias, signs, valid = bank.select(slots)
-        retain((valid != 0).all())
+        if raw_statuses is None:
+            retain((valid != 0).all())
+        else:
+            raw_statuses.append(valid)
         if getattr(self.runtime, "v4_activation_preparation", "rowwise") in (
             "rowwise_packed",
             "sign_fused",
@@ -499,7 +541,13 @@ class DeviceRouteGraphCompute:
             "sign_fused_direct",
         ):
             quantized, scale, bias = self.preparations[kind].packed(
-                hidden, weight_scale, weight_bias, signs, spec, validity=retain
+                hidden,
+                weight_scale,
+                weight_bias,
+                signs,
+                spec,
+                validity=retain,
+                **({"raw_input_validity": raw_statuses.append} if raw_statuses is not None else {}),
             )
         else:
             requests = [
@@ -518,7 +566,10 @@ class DeviceRouteGraphCompute:
             if project is None
             else project(bank, quantized, scale, bias, slots)
         )
-        retain((valid != 0).all() & torch.isfinite(output).all())
+        if raw_statuses is None:
+            retain((valid != 0).all() & torch.isfinite(output).all())
+        else:
+            raw_statuses.append(valid)
         return output
 
     @torch.inference_mode()
@@ -536,6 +587,7 @@ class DeviceRouteGraphCompute:
         # This bounded list exists only during compute/capture; no prior flag
         # is an input, so a later valid replay cannot replay stale validity.
         flags = []
+        raw_statuses = [] if self._layer_validity is not None else None
         logits = F.linear(hidden.float(), self.root["gate.weight"])
         weights, ids = route_vq2a8(
             logits,
@@ -553,13 +605,15 @@ class DeviceRouteGraphCompute:
         mapped = lookup.index_select(0, ids.clamp(0, lookup.numel() - 1))
         slots = torch.where(in_range, mapped, -1).contiguous()
         flags.append((slots >= 0).all())
-        gate = self._project(hidden.expand(slots.numel(), -1), slots, "gate_up", flags.append)
+        gate = self._project(hidden.expand(slots.numel(), -1), slots, "gate_up", flags.append, raw_statuses)
         activation = deepseek_v4_swiglu_reference(gate, self.config.swiglu_limit)
-        values = self._project(activation, slots, "down", flags.append)
+        values = self._project(activation, slots, "down", flags.append, raw_statuses)
         result = (values.reshape(1, slots.numel(), hidden.shape[1]).float() * weights.unsqueeze(-1)).sum(1)
         result *= self.config.routed_scale
         if self.config.num_shared:
             result += self.runtime.shared(hidden).float()
         result = result.to(hidden.dtype)
+        if raw_statuses is not None:
+            return result, self._layer_validity(raw_statuses, [gate, values, result], flags)
         flags.append(torch.isfinite(result).all())
         return result, torch.stack(flags).all()

@@ -175,6 +175,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_compute_backend = options.get("v4_compute_backend", "v1")
         self._v4_activation_reorder = options.get("v4_activation_reorder", "scalar")
         self._v4_activation_preparation = options.get("v4_activation_preparation", "rowwise")
+        self._v4_validity_mode = options.get("v4_validity_mode", "torch")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -424,6 +425,13 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 bank.snapshot.restore()
                 torch.npu.synchronize()
             bank.snapshot = None
+            if bank.metadata_mode == "position_template":
+                from vllm_ascend.quantization.vq2a8_decoder_position_template import install_position_template
+                from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+                if get_ascend_device_type() != AscendDeviceType.A5:
+                    raise ValueError("Position-template decoder metadata currently requires Ascend A5.")
+                install_position_template(runner, bank)
             bank.ready = True
             self._v4_graphs_ready = True
             self._v4_graph_enabled = True
@@ -456,6 +464,18 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
                 f"V4 MoE graph memory guard failed at {stage}: free={free}, required={minimum_free}; "
                 "KV, reserve and expert residency are not reduced automatically."
             )
+
+    def set_v4_position_template_verification(self, enabled):
+        """Acceptance-only shadow builder comparison, never enabled by serving."""
+        if type(enabled) is not bool or self._v4_graph_forward_active or self._v4_graphs_failed:
+            raise ValueError("Position-template verification requires an idle healthy model and boolean mode.")
+        bank = self._v4_decoder_graph
+        adapter = bank.position_template_adapter if bank is not None else None
+        if adapter is None:
+            raise ValueError("Position-template verification requires position_template metadata mode.")
+        torch.npu.synchronize()
+        adapter.verify_reference = enabled
+        return adapter.report()
 
     def set_v4_graph_enabled(self, enabled):
         """Same-engine eager/graph A/B switch; never recreate banks or graphs."""
@@ -509,6 +529,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "compute_backend": getattr(self, "_v4_compute_backend", "v1"),
             "activation_reorder": getattr(self, "_v4_activation_reorder", "scalar"),
             "activation_preparation": getattr(self, "_v4_activation_preparation", "rowwise"),
+            "validity_mode": getattr(self, "_v4_validity_mode", "torch"),
             "decoder_metadata_mode": getattr(self, "_v4_decoder_metadata_mode", "recursive"),
             "host_profile": self._v4_host_recorder.report() if getattr(self, "_v4_host_recorder", None) else None,
             "effective_graph_mode": self._v4_decode_graph if self._v4_graph_enabled else "none",

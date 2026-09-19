@@ -59,7 +59,7 @@ from vllm_ascend.quantization.vq2a8_v4_v2_layout import (
 )
 
 
-def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, native_ops=None):
+def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, validity_mode="torch", native_ops=None):
     """Check only explicitly selected native extensions before weight loading."""
     if reorder not in ("scalar", "vectorized") or preparation not in (
         "rowwise",
@@ -70,6 +70,10 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, native_op
         "fused",
     ):
         raise ValueError("Invalid V4 v2 activation options.")
+    if validity_mode not in ("torch", "fused") or (
+        validity_mode == "fused" and preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    ):
+        raise ValueError("Fused validity requires native sign preparation.")
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
         (reorder == "vectorized", "activation_reorder_version"),
@@ -78,6 +82,7 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, native_op
             "activation_preparation_version",
         ),
         (preparation in ("sign_fused_strided", "sign_fused_direct"), "activation_sign_strided_version"),
+        (validity_mode == "fused", "layer_validity_version"),
     ):
         if selected:
             try:
@@ -205,9 +210,17 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     v4_compute_backend = "v2"
     v4_activation_reorder = "scalar"
     v4_activation_preparation = "rowwise"
+    v4_validity_mode = "torch"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
-    def __init__(self, *args, v4_activation_reorder="scalar", v4_activation_preparation="rowwise", **kwargs):
+    def __init__(
+        self,
+        *args,
+        v4_activation_reorder="scalar",
+        v4_activation_preparation="rowwise",
+        v4_validity_mode="torch",
+        **kwargs,
+    ):
         if v4_activation_reorder not in ("scalar", "vectorized"):
             raise ValueError("V4 v2 activation reorder requires scalar|vectorized.")
         if v4_activation_preparation not in (
@@ -221,6 +234,12 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             raise ValueError("Invalid V4 v2 activation preparation mode.")
         self.v4_activation_reorder = v4_activation_reorder
         self.v4_activation_preparation = v4_activation_preparation
+        if v4_validity_mode not in ("torch", "fused") or (
+            v4_validity_mode == "fused"
+            and v4_activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+        ):
+            raise ValueError("Fused validity requires native sign preparation.")
+        self.v4_validity_mode = v4_validity_mode
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
@@ -447,6 +466,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "preload_h2d_s": self.timing.get("h2d_s", 0.0),
             "activation_reorder": self.v4_activation_reorder,
             "activation_preparation": self.v4_activation_preparation,
+            "validity_mode": self.v4_validity_mode,
             "layout": "v2_zn_pair_lut",
             "arithmetic_contract": "v2_k_regrouped_requires_tolerance_validation",
             "metadata_bytes": self._device_route_banks["metadata_bytes"] if self._device_route_banks else 0,

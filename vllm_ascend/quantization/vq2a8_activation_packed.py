@@ -63,7 +63,7 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
                 raise RuntimeError(f"Unsupported strided sign ABI {version}; require {STRIDED_SIGN_ABI}.")
         self._sign = sign
 
-    def packed(self, hidden, weight_scale, weight_bias, signs, spec, *, validity=None):
+    def packed(self, hidden, weight_scale, weight_bias, signs, spec, *, validity=None, raw_input_validity=None):
         """Return contiguous ``(FP8 rows, row scales, row biases)``.
 
         ``hidden`` and every metadata tensor contain one row for each selected
@@ -72,6 +72,8 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         """
 
         groups, width, block = self._check_packed(hidden, weight_scale, weight_bias, signs, spec)
+        if raw_input_validity is not None and (not self.fuse_sign or not callable(raw_input_validity)):
+            raise ValueError("Raw input validity requires native sign fusion and a callable consumer.")
         # ``hidden`` may be an expanded stride-zero view in gate/up. Preserve
         # baseline materialization unless direct native view access is chosen.
         if self.strided_sign:
@@ -83,16 +85,22 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
 
         if self.fuse_sign:
             signed, input_valid = self._sign(x, weight_scale, weight_bias, signs)
-            valid = input_valid.all()
+            if raw_input_validity is not None:
+                # The layer checker owns these fresh device flags until its
+                # queued scan; do not reduce them into another tiny task here.
+                raw_input_validity(input_valid)
+            else:
+                valid = input_valid.all()
         else:
             valid = torch.isfinite(x).all() & torch.isfinite(weight_scale).all()
             valid = valid & torch.isfinite(weight_bias).all()
             valid = valid & ((signs == -1) | (signs == 1)).all()
             signed = x * signs.float()
-        if validity is None:
-            self._validate(valid)
-        else:
-            validity(valid)
+        if raw_input_validity is None:
+            if validity is None:
+                self._validate(valid)
+            else:
+                validity(valid)
 
         signed_blocks = signed.reshape(groups, width // block, block)
         rotated = torch.empty((groups, width), dtype=torch.float32, device=hidden.device)

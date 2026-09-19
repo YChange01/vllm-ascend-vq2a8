@@ -43,6 +43,12 @@ def source_hashes(source=SOURCE):
         "activation_kernel.cpp",
         "activation_binding.cpp",
         "activation_launch.h",
+        "validity_kernel.cpp",
+        "validity_binding.cpp",
+        "validity_launch.h",
+        "activation_diagnostic_kernel.cpp",
+        "activation_diagnostic_binding.cpp",
+        "activation_diagnostic_launch.h",
         "layout.h",
         "launch.h",
     )

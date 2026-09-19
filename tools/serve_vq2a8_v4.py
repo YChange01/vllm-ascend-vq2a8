@@ -57,6 +57,7 @@ def parse_args(argv=None):
         default="rowwise",
         help="V4 v2 activation candidate; strided/direct require a new library and separate numerical acceptance",
     )
+    parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
@@ -96,9 +97,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--decoder-metadata-mode",
-        choices=("recursive", "planned", "planned_fast"),
+        choices=("recursive", "planned", "planned_fast", "position_template"),
         default="recursive",
-        help="Decoder metadata: recursive/planned baselines or opt-in compiled-check planned_fast",
+        help="Decoder metadata baseline, compiled checks, or opt-in position-owned producer templates",
     )
     parser.add_argument(
         "--host-profile",
@@ -120,7 +121,13 @@ def parse_args(argv=None):
     ):
         parser.error("--decode-graph decoder requires --graph-replay-stream caller and --max-model-len <=16.")
     if args.decoder_metadata_mode != "recursive" and args.decode_graph != "decoder":
-        parser.error("--decoder-metadata-mode planned/planned_fast requires --decode-graph decoder.")
+        parser.error("Non-recursive metadata requires --decode-graph decoder.")
+    if args.validity_mode == "fused" and (
+        args.compute_backend != "v2"
+        or not args.device_route_decode
+        or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    ):
+        parser.error("Fused validity requires V4 v2 device-route decode with native sign preparation.")
     if args.host_profile and args.decode_graph != "decoder":
         parser.error("--host-profile requires --decode-graph decoder.")
     if (
@@ -194,6 +201,8 @@ def build_command(args):
         additional["vq2a8_offline"]["v4_activation_reorder"] = args.activation_reorder
     if args.activation_preparation != "rowwise":
         additional["vq2a8_offline"]["v4_activation_preparation"] = args.activation_preparation
+    if args.validity_mode != "torch":
+        additional["vq2a8_offline"]["v4_validity_mode"] = args.validity_mode
     if args.decode_graph != "none":
         additional["vq2a8_offline"]["v4_decode_graph"] = args.decode_graph
         additional["vq2a8_offline"]["v4_graph_replay_stream"] = args.graph_replay_stream
@@ -314,7 +323,8 @@ def main(argv=None):
                 f"activation_reorder={args.activation_reorder}, activation_preparation={args.activation_preparation}, "
                 f"decode={'device_route_decode' if args.device_route_decode else 'batched'}, "
                 f"decode_graph={args.decode_graph}, graph_replay_stream={args.graph_replay_stream}, full residency). "
-                f"metadata_mode={args.decoder_metadata_mode}, host_profile={args.host_profile}. "
+                f"metadata_mode={args.decoder_metadata_mode}, validity_mode={args.validity_mode}, "
+                f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,
             )

@@ -3,8 +3,9 @@
 """Position-specialized B1 decoder capture, with live DSA metadata inputs.
 
 This deliberately does not enable vLLM's generic FULL graph dispatcher. Each
-short-context position has its own graph/pool; prefill, metadata construction,
-the LM head and sampling remain eager. Capture uses the real cache addresses,
+short-context position has its own graph/pool; prefill, the LM head and sampling
+remain eager. Metadata normally uses the eager builder; the opt-in position
+template producer keeps only live block/slot updates. Capture uses the real cache addresses,
 but restores *all* KV/compressor/indexer state after every trial. No request is
 used for warmup or capture, and no per-layer graph replay is nested inside it.
 """
@@ -517,8 +518,8 @@ class V4DecoderGraphBank:
     def __init__(self, model, max_model_len, *, backend=None, metadata_mode="recursive"):
         if type(max_model_len) is not int or not 1 <= max_model_len <= MAX_DECODER_GRAPH_CONTEXT:
             raise ValueError("Decoder graph context must be an integer in 1..16.")
-        if metadata_mode not in ("recursive", "planned", "planned_fast"):
-            raise ValueError("Decoder metadata mode must be recursive, planned or planned_fast.")
+        if metadata_mode not in ("recursive", "planned", "planned_fast", "position_template"):
+            raise ValueError("Decoder metadata mode must be recursive, planned, planned_fast or position_template.")
         self.model = model
         self.max_model_len = max_model_len
         self.metadata_mode = metadata_mode
@@ -537,6 +538,7 @@ class V4DecoderGraphBank:
         # Installed only after startup capture. This records host scopes, not
         # device elapsed time, and never inserts a stream/event fence.
         self.host_profiler = None
+        self.position_template_adapter = None
 
     def _host_phase(self, name):
         return nullcontext() if self.host_profiler is None else self.host_profiler.phase(name)
@@ -575,7 +577,13 @@ class V4DecoderGraphBank:
                 "recursive": DecoderMetadataBuffers,
                 "planned": PlannedDecoderMetadataBuffers,
                 "planned_fast": FastPlannedDecoderMetadataBuffers,
-            }[self.metadata_mode]
+            }.get(self.metadata_mode)
+            if buffers is None:
+                # Lazy import keeps the specialized producer separate from the
+                # general metadata protocols, including CPU-only validation.
+                from vllm_ascend.quantization.vq2a8_decoder_position_template import PositionTemplateBuffers
+
+                buffers = PositionTemplateBuffers
             metadata = buffers(context.attn_metadata)
             tokens = input_ids.clone()
             static_positions = positions.clone()
@@ -673,6 +681,9 @@ class V4DecoderGraphBank:
             for entry in self.entries.values():
                 entry["graph"].reset()
             self.entries.clear()
+            if self.position_template_adapter is not None:
+                self.position_template_adapter.detach()
+                self.position_template_adapter = None
             self.snapshot = None
             self.capture_state = self.computes = ()
             self.model = None
@@ -694,6 +705,9 @@ class V4DecoderGraphBank:
             "live_attention_metadata": True,
             "metadata_mode": self.metadata_mode,
             "metadata_tensor_copies": sum(entry["metadata"].copies for entry in self.entries.values()),
+            "position_template": (
+                self.position_template_adapter.report() if self.position_template_adapter is not None else None
+            ),
             "startup_state_restored": self.ready,
             "nested_moe_graphs": False,
             "ready": self.ready,

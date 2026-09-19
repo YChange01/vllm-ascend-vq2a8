@@ -44,8 +44,11 @@ def parse_args(argv=None):
         default="rowwise",
     )
     parser.add_argument(
-        "--decoder-metadata-mode", choices=("recursive", "planned", "planned_fast"), default="recursive"
+        "--decoder-metadata-mode",
+        choices=("recursive", "planned", "planned_fast", "position_template"),
+        default="recursive",
     )
+    parser.add_argument("--validity-mode", choices=("torch", "fused"), default="torch")
     parser.add_argument(
         "--host-profile", action="store_true", help="CPU-only ranges/counters; never a timing benchmark"
     )
@@ -59,6 +62,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.validity_mode == "fused" and (
+        args.compute_backend != "v2"
+        or args.activation_preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    ):
+        parser.error("Fused validity requires V4 v2 native sign preparation.")
     if args.physical_npu < 0 or not 1 <= args.timeout_s <= 7200 or args.kv_cache_mib <= 0:
         parser.error("Require nonnegative physical NPU, positive KV bytes and timeout in 1..7200 seconds.")
     if not math.isfinite(args.reserve_gib) or args.reserve_gib < max(1.0, args.kv_cache_mib / 1024):
@@ -80,6 +88,22 @@ def graph_report(worker):
     return worker.get_model().v4_graph_report()
 
 
+def set_template_verification(worker, enabled):
+    return worker.get_model().set_v4_position_template_verification(enabled)
+
+
+def require_template_evidence(report):
+    evidence = report.get("decoder", {}).get("position_template", {})
+    expected = {p + step for p, n in CASES for step in range(n - 1)}
+    if (
+        evidence.get("reference_verification_enabled") is not True
+        or evidence.get("reference_checks", 0) < REUSE_ROUNDS * sum(n - 1 for _, n in CASES)
+        or not expected.issubset(set(evidence.get("reference_positions", [])))
+        or evidence.get("original_builder_skips", 0) < REUSE_ROUNDS * sum(n - 1 for _, n in CASES)
+    ):
+        raise AssertionError("Missing position-template original-builder metadata equivalence evidence.")
+
+
 def compare_outputs(reference, candidate):
     if list(reference.token_ids) != list(candidate.token_ids):
         raise AssertionError("Decoder graph changed greedy tokens.")
@@ -99,6 +123,21 @@ def compare_outputs(reference, candidate):
             if not math.isclose(old.logprob, new.logprob, rel_tol=1e-5, abs_tol=1e-4):
                 raise AssertionError("Decoder graph changed top-five log probabilities beyond 1e-4/1e-5.")
     return maximum_error
+
+
+def verify_template_serving_path(llm, prompt, params, reference, unwrap):
+    """Compare a real producer-skip run; shadow calls must not mask side effects."""
+    unwrap(llm.collective_rpc(set_template_verification, args=(False,)))
+    before = unwrap(llm.collective_rpc(graph_report))["decoder"]
+    actual = llm.generate([{"prompt_token_ids": prompt}], params, use_tqdm=False)[0].outputs[0]
+    after = unwrap(llm.collective_rpc(graph_report))["decoder"]
+    delta = after["replays"] - before["replays"]
+    skips = after["position_template"]["original_builder_skips"] - before["position_template"]["original_builder_skips"]
+    if delta != len(reference.token_ids) - 1 or skips != delta:
+        raise AssertionError("Template serving-path replay did not skip the original builder.")
+    error = compare_outputs(reference, actual)
+    unwrap(llm.collective_rpc(set_template_verification, args=(True,)))
+    return error
 
 
 def run_model(args):
@@ -130,6 +169,7 @@ def run_model(args):
         v4_compute_backend=args.compute_backend,
         v4_activation_reorder=args.activation_reorder,
         v4_activation_preparation=args.activation_preparation,
+        v4_validity_mode=args.validity_mode,
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
@@ -143,6 +183,8 @@ def run_model(args):
     )
     with stage("load_and_capture_all_positions"):
         llm = LLM(**options)
+    if args.decoder_metadata_mode == "position_template":
+        single_worker_result(llm.collective_rpc(set_template_verification, args=(True,)))
     tokenizer = Tokenizer.from_file(str(model / "tokenizer.json"))
     seeds = [
         tokenizer.encode(text, add_special_tokens=False).ids
@@ -169,16 +211,28 @@ def run_model(args):
                 if delta != output_length - 1 or len(candidate.token_ids) != output_length:
                     raise AssertionError("The requested output count or actual decoder replay count differs.")
                 error = compare_outputs(reference, candidate)
+                if args.decoder_metadata_mode == "position_template":
+                    # The shadow builder could conceal a missing side effect.
+                    # Also exercise actual serving behavior without calling it.
+                    with stage(f"round{round_id}_p{prompt_length}_o{output_length}_template_no_shadow"):
+                        error = max(
+                            error, verify_template_serving_path(llm, prompt, params, reference, single_worker_result)
+                        )
                 rows.append(
                     {"round": round_id, "prompt": prompt_length, "output": output_length, "max_logprob_error": error}
                 )
+    report = single_worker_result(llm.collective_rpc(graph_report))
+    if args.decoder_metadata_mode == "position_template":
+        require_template_evidence(report)
     receipt = {
         "status": "PASS",
         "scope": "real_model_eager_vs_position_specialized_decoder",
         "hardware_execution_verified": True,
         "timing_valid": False,
         "cases": rows,
-        "graph": single_worker_result(llm.collective_rpc(graph_report)),
+        "graph": report,
+        "validity_mode": args.validity_mode,
+        "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
     }
     (output / "summary.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
@@ -202,6 +256,7 @@ def main(argv=None):
                     ),
                     "activation_reorder": args.activation_reorder,
                     "activation_preparation": args.activation_preparation,
+                    "validity_mode": args.validity_mode,
                     "decoder_metadata_mode": args.decoder_metadata_mode,
                     "host_profile": args.host_profile,
                     "device_execution": False,
@@ -230,6 +285,8 @@ def main(argv=None):
         return 1
     receipt = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     expected_replays = REUSE_ROUNDS * sum(count - 1 for _, count in CASES)
+    if args.decoder_metadata_mode == "position_template":
+        expected_replays *= 2  # Shadow equivalence plus actual producer-skip path.
     if (
         receipt.get("status") != "PASS"
         or receipt.get("hardware_execution_verified") is not True
@@ -237,6 +294,8 @@ def main(argv=None):
         or receipt.get("graph", {}).get("decoder", {}).get("replays") != expected_replays
     ):
         raise ValueError("Device probe receipt does not confirm all requested real decoder replays.")
+    if args.decoder_metadata_mode == "position_template":
+        require_template_evidence(receipt.get("graph", {}))
     return 0
 
 

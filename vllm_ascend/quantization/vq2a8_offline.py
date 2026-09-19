@@ -63,12 +63,24 @@ def _validate_cache_memory_fraction(value, policy):
 
 
 def _validate_v4_host_options(metadata_mode, host_profile, graph_mode, policy):
-    if metadata_mode not in ("recursive", "planned", "planned_fast"):
-        raise ValueError("v4_decoder_metadata_mode requires recursive|planned|planned_fast.")
+    if metadata_mode not in ("recursive", "planned", "planned_fast", "position_template"):
+        raise ValueError("v4_decoder_metadata_mode requires recursive|planned|planned_fast|position_template.")
     if metadata_mode != "recursive" and (policy != "ascendc_v4" or graph_mode != "decoder"):
         raise ValueError("Planned metadata requires V4 decoder graphs.")
     if type(host_profile) is not bool or (host_profile and (policy != "ascendc_v4" or graph_mode != "decoder")):
         raise ValueError("v4_host_profile must be boolean and requires V4 decoder graphs.")
+
+
+def _validate_v4_validity_options(mode, preparation, backend, policy, device_route):
+    if mode not in ("torch", "fused"):
+        raise ValueError("v4_validity_mode requires torch|fused.")
+    if mode == "fused" and (
+        policy != "ascendc_v4"
+        or backend != "v2"
+        or device_route is not True
+        or preparation not in ("sign_fused", "sign_fused_strided", "sign_fused_direct")
+    ):
+        raise ValueError("Fused validity requires V4 v2 device-route decode with native sign preparation.")
 
 
 def offline_engine_options(
@@ -96,6 +108,7 @@ def offline_engine_options(
     v4_compute_backend="v1",
     v4_activation_reorder="scalar",
     v4_activation_preparation="rowwise",
+    v4_validity_mode="torch",
     v4_decoder_metadata_mode="recursive",
     v4_host_profile=False,
     verbose_experts=False,
@@ -107,6 +120,9 @@ def offline_engine_options(
         v4_activation_reorder, v4_activation_preparation, v4_compute_backend, execution_policy
     )
     _validate_v4_host_options(v4_decoder_metadata_mode, v4_host_profile, v4_decode_graph, execution_policy)
+    _validate_v4_validity_options(
+        v4_validity_mode, v4_activation_preparation, v4_compute_backend, execution_policy, v4_device_route_decode
+    )
     if (
         v4_activation_preparation in ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct")
         and not v4_device_route_decode
@@ -201,6 +217,7 @@ def offline_engine_options(
                     else {}
                 ),
                 **({"v4_device_route_decode": True} if v4_device_route_decode else {}),
+                **({"v4_validity_mode": v4_validity_mode} if v4_validity_mode != "torch" else {}),
                 **(
                     {"v4_decoder_metadata_mode": v4_decoder_metadata_mode}
                     if v4_decoder_metadata_mode != "recursive"
@@ -267,6 +284,7 @@ def validate_offline_config(config) -> dict:
         "v4_compute_backend",
         "v4_activation_reorder",
         "v4_activation_preparation",
+        "v4_validity_mode",
         "v4_decoder_metadata_mode",
         "v4_host_profile",
         "v3_startup_trace",
@@ -351,6 +369,13 @@ def validate_offline_config(config) -> dict:
     elif "ascendc_library" in options or "ascendc_sha256" in options:
         raise ValueError("Native library options require explicit execution_policy=ascendc or ascendc_v4.")
     _validate_v4_compute_backend(options.get("v4_compute_backend", "v1"), options.get("execution_policy"))
+    _validate_v4_validity_options(
+        options.get("v4_validity_mode", "torch"),
+        options.get("v4_activation_preparation", "rowwise"),
+        options.get("v4_compute_backend", "v1"),
+        options.get("execution_policy"),
+        options.get("v4_device_route_decode", False),
+    )
     _validate_v4_activation_options(
         options.get("v4_activation_reorder", "scalar"),
         options.get("v4_activation_preparation", "rowwise"),
@@ -358,7 +383,7 @@ def validate_offline_config(config) -> dict:
         options.get("execution_policy"),
     )
     if options.get("execution_policy") != "ascendc_v4" and any(
-        key in options for key in ("v4_activation_reorder", "v4_activation_preparation")
+        key in options for key in ("v4_activation_reorder", "v4_activation_preparation", "v4_validity_mode")
     ):
         raise ValueError("V4 activation options require execution_policy=ascendc_v4.")
     if "v4_compute_backend" in options and options.get("execution_policy") != "ascendc_v4":
@@ -560,6 +585,7 @@ class OfflineMoEOwner:
                 require_v4_v2_features(
                     options.get("v4_activation_reorder", "scalar"),
                     options.get("v4_activation_preparation", "rowwise"),
+                    validity_mode=options.get("v4_validity_mode", "torch"),
                 )
             else:
                 from vllm_ascend.quantization.vq2a8_ascendc import load_pinned_library
@@ -690,6 +716,7 @@ class OfflineMoEOwner:
                     {
                         "v4_activation_reorder": self.options.get("v4_activation_reorder", "scalar"),
                         "v4_activation_preparation": self.options.get("v4_activation_preparation", "rowwise"),
+                        "v4_validity_mode": self.options.get("v4_validity_mode", "torch"),
                     }
                     if self.options.get("execution_policy") == "ascendc_v4"
                     and self.options.get("v4_compute_backend", "v1") == "v2"
