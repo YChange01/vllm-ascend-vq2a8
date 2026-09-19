@@ -220,7 +220,31 @@ class PositionTemplateBuffers(FastPlannedDecoderMetadataBuffers):
         for target, source, _ in targets.values():
             if target is not None:
                 expected = live.get(id(target), target)
-                torch.testing.assert_close(source, expected, rtol=0, atol=0)
+                try:
+                    torch.testing.assert_close(source, expected, rtol=0, atol=0)
+                except AssertionError as error:
+                    # Diagnostic-only CPU reads after a failed acceptance check.
+                    # Compare all words, including descriptor tails: never hide
+                    # an uninitialized producer output by truncating the check.
+                    names = sorted({node.name for node in self._nodes if node.target is target})
+                    paths = [
+                        f"{layer}.decode.{field.name}"
+                        for layer, value in self.tree.items()
+                        for field in fields(value.decode)
+                        if getattr(value.decode, field.name) is target
+                    ]
+                    actual_cpu = source.detach().reshape(-1).cpu()
+                    expected_cpu = expected.detach().reshape(-1).cpu()
+                    indices = (actual_cpu != expected_cpu).nonzero().flatten().tolist()
+                    samples = [(index, actual_cpu[index].item(), expected_cpu[index].item()) for index in indices[:8]]
+                    raise AssertionError(
+                        f"Position template metadata mismatch: position={self.position}, fields={names}, "
+                        f"paths={paths[:4]}, shape={tuple(source.shape)}, dtype={source.dtype}, "
+                        f"unequal_elements={len(indices)}/{source.numel()}, "
+                        f"first_flat_index={indices[0] if indices else None}, "
+                        f"last_flat_index={indices[-1] if indices else None}, "
+                        f"samples_index_actual_expected={samples}; full payload comparison, rtol=0, atol=0.\n{error}"
+                    ) from error
 
     def update(self, metadata):
         if type(metadata) is not PositionTemplateRequest or metadata.owner is not self or metadata.consumed:

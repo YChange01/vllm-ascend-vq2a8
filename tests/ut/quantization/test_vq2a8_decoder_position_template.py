@@ -202,6 +202,42 @@ def test_shadow_reference_checks_every_static_payload_and_live_fields():
     assert owner.copies == 0
 
 
+@pytest.mark.parametrize("field,last_defined", (("sas_metadata", 899), ("qli_metadata", 863)))
+@pytest.mark.parametrize("region", ("first", "last_defined", "first_reserved", "last_reserved"))
+def test_shadow_descriptor_mismatch_reports_location_without_skipping_any_word(field, last_defined, region):
+    owner, sources = bound_owner()
+    original = metadata(3, sources[(0, "block_table")], sources[(0, "slot_mapping")])
+    index = {"first": 0, "last_defined": last_defined, "first_reserved": last_defined + 1, "last_reserved": 1023}[
+        region
+    ]
+    getattr(original["layer0"].decode, field)[index] += 7
+    with pytest.raises(AssertionError) as failure:
+        owner.compare_reference(original, sources)
+    message = str(failure.value)
+    assert f"fields=['{field}']" in message
+    assert f"layer0.decode.{field}" in message
+    assert "position=3" in message
+    assert "unequal_elements=1/1024" in message
+    assert f"first_flat_index={index}" in message
+    assert f"last_flat_index={index}" in message
+    assert f"({index}, 10, 3)" in message
+    assert "rtol=0, atol=0" in message
+    assert owner.copies == 0
+
+
+def test_shadow_descriptor_mismatch_bounds_samples_but_reports_full_range():
+    owner, sources = bound_owner()
+    original = metadata(3, sources[(0, "block_table")], sources[(0, "slot_mapping")])
+    original["layer0"].decode.sas_metadata[900:] += 7
+    with pytest.raises(AssertionError) as failure:
+        owner.compare_reference(original, sources)
+    message = str(failure.value)
+    assert "unequal_elements=124/1024" in message
+    assert "first_flat_index=900" in message and "last_flat_index=1023" in message
+    assert "(907, 10, 3)" in message and "(908, 10, 3)" not in message
+    assert owner.copies == 0
+
+
 def fake_runner(positions=(3, 4)):
     table, slots = device([[2, 0]]), device([19])
     block = SimpleNamespace(

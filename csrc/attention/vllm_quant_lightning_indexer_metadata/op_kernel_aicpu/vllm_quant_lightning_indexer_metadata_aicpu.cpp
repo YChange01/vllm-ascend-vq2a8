@@ -866,12 +866,25 @@ bool VllmQuantLightningIndexerMetadataCpuKernel::BalanceSchedule(SplitResult &sp
 
 bool VllmQuantLightningIndexerMetadataCpuKernel::GenMetaData(SplitResult &splitRes)
 {
+    constexpr uint64_t outputBytes = QLI_META_SIZE * sizeof(QLI_METADATA_T);
+    static_assert(sizeof(QLI_METADATA_T) == sizeof(uint32_t));
+    static_assert(outputBytes >= sizeof(optiling::detail::QliMetaData));
+    auto shape = metaData_->GetTensorShape();
+    if (shape->GetDims() != 1 || shape->GetDimSize(0) != QLI_META_SIZE ||
+        metaData_->GetDataType() != DT_INT32 || metaData_->GetDataSize() < outputBytes) {
+        KERNEL_LOG_ERROR("QLI metadata output must be 1024 INT32 words with sufficient storage");
+        return false;
+    }
     optiling::detail::QliMetaData* metaDataPtr = (optiling::detail::QliMetaData*)metaData_->GetData();
     // The torch binding allocates an uninitialized buffer. Extra Vector
     // blocks can consult LI slots beyond aicCoreNum_; leave all unused slots
     // disabled, including cores absent from this runtime's available counts.
-    // Only initialize the defined ABI struct, not the reserved output tail.
-    *metaDataPtr = {};
+    // Include the reserved tail: full output comparisons must not depend on
+    // allocation history even though the attention consumer ignores that tail.
+    auto outputWords = static_cast<QLI_METADATA_T*>(metaData_->GetData());
+    for (uint32_t i = 0; i < QLI_META_SIZE; ++i) {
+        outputWords[i] = 0;
+    }
     // LI Metadata Generate
     for (size_t i = 0; i < aicCoreNum_; ++i) {
         if (i >= splitRes.usedCoreNum) {

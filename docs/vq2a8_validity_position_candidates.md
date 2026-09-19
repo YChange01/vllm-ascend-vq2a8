@@ -44,10 +44,66 @@ test -f "$VQ2_CANDIDATE_LIB"
 If the installed CANN location differs, use its real path. No expert conversion
 is needed; all commands below reuse `experts_vq_v4_v2_prepacked`.
 
+### Rebuild SAS/QLI metadata producers for full-output determinism
+
+Position-template acceptance compares all 1024 INT32 metadata words. The old
+SAS producer initialized only its 900 defined words, leaving 124 reserved words
+uninitialized; QLI likewise initialized 864 of 1024 words. A 124-element mismatch
+with an index in `[900, 1024)` is consistent with the SAS reserved tail, not proof
+of a numerical error in the decoder. The diagnostic now identifies the metadata
+field, layer, position and mismatch range. It still rejects every mismatch,
+including the reserved tail, with zero tolerance.
+
+The fix initializes the complete output in both AICPU producers, after checking
+the output shape, type and capacity. It does not change the defined scheduling
+fields. These producers belong to the main vllm-ascend custom-op package, **not**
+`libvq2a8_ascendc_v4_v2.so`. A Git update or rebuild of the standalone VQ2 library
+alone will not deploy this fix. Keep the existing standalone candidate library
+and prepacked expert directory; stop the server normally and rebuild/install the
+main package in its existing Python environment:
+
+```bash
+cd /home/g00872988/vllm-ascend-vq2a8-v023
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-9.1.0
+export ASCEND_TOOLKIT_HOME="$ASCEND_HOME_PATH"
+set -o pipefail
+# Preserve the installed custom-op bundle before the build replaces it.
+if [ -d vllm_ascend/_cann_ops_custom ]; then
+  tar -czf "/tmp/vq2-cann-ops-before-metadata-$(date +%Y%m%d_%H%M%S).tar.gz" \
+    vllm_ascend/_cann_ops_custom || exit 1
+fi
+env -u SOC_VERSION COMPILE_CUSTOM_KERNELS=1 MAX_JOBS=4 \
+  python -m pip install -v -e . --no-build-isolation --no-deps --force-reinstall \
+  2>&1 | tee /tmp/vq2-metadata-full-output-build.log
+```
+
+Only continue if the build exits successfully. `setup.py` detects the SoC with
+`npu-smi`; if detection fails, supply the actual target reported by this host,
+not an old server's chip suffix. This build replaces generated custom-op
+artifacts but does not rewrite model weights. Run tests in a fresh process so
+the loaded vendor library is the rebuilt one.
+
 ## Acceptance before serving
 
 Use an idle physical NPU 1. Stop the existing server normally before testing.
 `TASK_QUEUE_ENABLE=1` must precede Python, not follow `export` on the same line.
+
+Before loading the full model, check the rebuilt metadata producers without
+loading weights (`--model` reads only `config.json`):
+
+```bash
+TASK_QUEUE_ENABLE=1 timeout -k 10s 180s \
+  python -u tools/validate_vq2a8_sas_attention.py \
+  --model /home/g00872988/vq2a8 --physical-npu 1 --require-full-output
+```
+
+This runs QLI first, then SAS metadata and the short SWA attention oracle.
+Require `QLI_METADATA_PREFLIGHT=PASS`, `SAS_ATTENTION_PREFLIGHT=PASS` and
+`full_output_verified: true` with `compared_metadata_words: 1024` in every
+case receipt. It checks a zero reserved tail and exact repeated full outputs,
+and prints the loaded extension/vendor paths and hashes. It does not replace
+the real-model position-template, C4/C128 or decoder correctness gates below.
+An old loaded binary can leave nonzero tail words; do not bypass this failure.
 
 First gate the new checker against the original Torch predicate, including
 invalid/recovered graph inputs and queued owner-release pressure:

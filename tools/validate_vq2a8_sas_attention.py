@@ -32,7 +32,7 @@ DEFINED_WORDS = FA_CORES * FA_WORDS + FD_CORES * FD_WORDS
 BLOCK_SIZE, CACHE_PADDING = 128, 128
 
 
-def check_sas_metadata(values, heads):
+def check_sas_metadata(values, heads, *, require_full_output=False):
     """Check a short, single-request SWA schedule, with no flash-decode tasks."""
     if len(values) != SAS_WORDS or heads not in (64, 128):
         raise ValueError("SAS preflight expects 1024 int32 words and 64/128 query heads.")
@@ -60,6 +60,8 @@ def check_sas_metadata(values, heads):
         raise ValueError("SAS metadata does not cover the whole single request.")
     if any(values[FA_CORES * FA_WORDS : DEFINED_WORDS]):
         raise ValueError("SAS short-probe FD slots must all be disabled and initialized.")
+    if require_full_output and any(values[DEFINED_WORDS:]):
+        raise ValueError("SAS reserved metadata tail must be zero in full-output mode; rebuild custom AICPU ops.")
     return enabled
 
 
@@ -78,7 +80,7 @@ def expected_swa_output(query_len, key_len, heads, head_dim):
     return (visible / (visible + 1))[:, None, None] * value[None, None, :].expand(query_len, heads, head_dim)
 
 
-def run_sas_preflight(device, config, prompt_tokens=10):
+def run_sas_preflight(device, config, prompt_tokens=10, *, require_full_output=False):
     import importlib
 
     import torch
@@ -172,10 +174,11 @@ def run_sas_preflight(device, config, prompt_tokens=10):
             if metadata.dtype != torch.int32 or metadata.shape != (SAS_WORDS,) or metadata.device != device:
                 raise ValueError("SAS metadata has the wrong shape, dtype or device.")
             words = metadata.cpu().tolist()
-            active = check_sas_metadata(words, heads)
-            current_meta = words[:DEFINED_WORDS]  # reserved 124 words have no semantics
+            active = check_sas_metadata(words, heads, require_full_output=require_full_output)
+            current_meta = words if require_full_output else words[:DEFINED_WORDS]
             if repeat and current_meta != previous_meta:
-                raise ValueError("SAS defined metadata is not exactly repeatable.")
+                scope = "full 1024-word" if require_full_output else "defined"
+                raise ValueError(f"SAS {scope} metadata is not exactly repeatable.")
             previous_meta = current_meta
             print(f"SAS_START case={name} repeat={repeat} stage=attention active_fa_cores={active}", flush=True)
             # Match the production A5 PA_ND call: compute consumes seqused_kv
@@ -216,6 +219,10 @@ def run_sas_preflight(device, config, prompt_tokens=10):
             passed=True,
             active_fa_cores=active,
             repeats=3,
+            full_output_verified=require_full_output,
+            compared_metadata_words=SAS_WORDS if require_full_output else DEFINED_WORDS,
+            defined_metadata_words=DEFINED_WORDS,
+            total_metadata_words=SAS_WORDS,
             max_abs_error=max_error,
             elapsed_s=time.perf_counter() - start,
         )
@@ -229,6 +236,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--physical-npu", type=int, default=4)
     parser.add_argument("--model", type=Path, required=True, help="Read config.json only; never load weights.")
+    parser.add_argument(
+        "--require-full-output",
+        action="store_true",
+        help="Require a zero reserved tail and exact 1024-word repeatability.",
+    )
     args = parser.parse_args()
     if args.physical_npu < 0:
         parser.error("Physical NPU must be non-negative.")
@@ -249,8 +261,9 @@ def main():
     device = torch.device("npu:0")
     print("DEVICE " + json.dumps(_initialize_device(device)), flush=True)
     config = json.loads((args.model / "config.json").read_text())
-    run_preflight(device, config)  # also records loaded extension/vendor library hashes
-    run_sas_preflight(device, config)
+    # QLI also records loaded extension/vendor library hashes.
+    run_preflight(device, config, require_full_output=args.require_full_output)
+    run_sas_preflight(device, config, require_full_output=args.require_full_output)
 
 
 if __name__ == "__main__":

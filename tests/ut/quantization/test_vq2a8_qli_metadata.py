@@ -29,15 +29,22 @@ CONTEXT = r"""
 #include <string>
 #include <vector>
 namespace aicpu {
+enum DataType { DT_INT32, DT_INT16 };
 struct TensorShape {
     int64_t length;
+    int32_t dims = 1;
     int64_t GetDimSize(int) const { return length; }
+    int32_t GetDims() const { return dims; }
 };
 struct Tensor {
     void* data;
     TensorShape shape;
+    DataType dtype = DT_INT32;
+    uint64_t dataSize = static_cast<uint64_t>(shape.length) * sizeof(int32_t);
     void* GetData() { return data; }
     TensorShape* GetTensorShape() { return &shape; }
+    DataType GetDataType() const { return dtype; }
+    uint64_t GetDataSize() const { return dataSize; }
 };
 struct Attr {
     int64_t integer = 0;
@@ -75,17 +82,26 @@ HARNESS = r"""
 using namespace aicpu;
 using namespace optiling;
 int main(int argc, char** argv) {
-    assert(argc == 5);
+    assert(argc == 5 || argc == 6);
     const auto aic = std::atoi(argv[1]), aiv = std::atoi(argv[2]);
     int32_t seq = std::atoi(argv[3]);
     const bool valid = std::atoi(argv[4]);
-    // Canary on either side; the unused 160-int ABI tail must stay untouched.
+    // Canary on either side; the reserved 160-int tail is deterministic zero.
     std::array<uint32_t, QLI_META_SIZE + 2> storage;
     std::vector<uint32_t> previous;
     for (int repeat = 0; repeat < 3; ++repeat) {
         const uint32_t poison = 0xa5a50000U + repeat;
         storage.fill(poison);
         Tensor q{&seq, {1}}, k{&seq, {1}}, out{storage.data() + 1, {QLI_META_SIZE}};
+        if (argc == 6) {
+            const std::string invalidOutput = argv[5];
+            if (invalidOutput == "shape") out.shape.length = QLI_META_SIZE - 1;
+            else if (invalidOutput == "rank") out.shape.dims = 2;
+            else if (invalidOutput == "dtype") out.dtype = DT_INT16;
+            else if (invalidOutput == "capacity") out.dataSize -= sizeof(int32_t);
+            else if (invalidOutput == "zero_capacity") out.dataSize = 0;
+            else assert(false);
+        }
         CpuKernelContext ctx{{&q, &k}, {&out}, {}};
         const std::map<std::string, int64_t> attrs{
             {"aic_core_num", aic}, {"aiv_core_num", aiv}, {"num_heads_q", 64},
@@ -128,10 +144,11 @@ int main(int argc, char** argv) {
         // FD is disabled in this operator; every Vector FD slot must be zero.
         for (const auto& row : meta->LDMetadata) for (auto value : row) assert(value == 0);
         constexpr size_t words = sizeof(detail::QliMetaData) / sizeof(uint32_t);
-        std::vector<uint32_t> current(storage.begin() + 1, storage.begin() + 1 + words);
+        static_assert(words == 864);
+        for (size_t i = 1 + words; i < 1 + QLI_META_SIZE; ++i) assert(storage[i] == 0);
+        std::vector<uint32_t> current(storage.begin() + 1, storage.end() - 1);
         if (repeat) assert(current == previous);
         previous = current;
-        for (size_t i = 1 + words; i < storage.size(); ++i) assert(storage[i] == poison);
     }
 }
 """
@@ -176,6 +193,11 @@ def test_real_scheduler_available_core_counts_and_disabled_slots(scheduler, core
 @pytest.mark.parametrize("cores", [(0, 64), (28, 0), (28, 55), (32, 32), (37, 74), (36, 73)])
 def test_real_scheduler_rejects_unsafe_counts_before_writing(scheduler, cores):
     subprocess.run([str(scheduler), *map(str, cores), "10", "0"], check=True, timeout=10)
+
+
+@pytest.mark.parametrize("invalid_output", ["shape", "rank", "dtype", "capacity", "zero_capacity"])
+def test_real_scheduler_rejects_bad_output_before_writing(scheduler, invalid_output):
+    subprocess.run([str(scheduler), "32", "64", "10", "0", invalid_output], check=True, timeout=10)
 
 
 def valid_metadata():
@@ -231,7 +253,7 @@ SAS_HARNESS = r"""
 using namespace aicpu;
 using namespace optiling;
 int main(int argc, char** argv) {
-    assert(argc == 8);
+    assert(argc == 8 || argc == 9);
     const auto aic = std::atoi(argv[1]), aiv = std::atoi(argv[2]);
     int32_t qlen = std::atoi(argv[3]), klen = std::atoi(argv[4]);
     const int heads = std::atoi(argv[5]), ratio = std::atoi(argv[6]);
@@ -245,6 +267,15 @@ int main(int argc, char** argv) {
         storage.fill(poison);
         Tensor q{cq.data(), {2}}, k{ck.data(), {2}}, usedQ{&qlen, {1}}, usedK{&klen, {1}};
         Tensor out{storage.data() + 1, {SAS_META_SIZE}};
+        if (argc == 9) {
+            const std::string invalidOutput = argv[8];
+            if (invalidOutput == "shape") out.shape.length = SAS_META_SIZE - 1;
+            else if (invalidOutput == "rank") out.shape.dims = 2;
+            else if (invalidOutput == "dtype") out.dtype = DT_INT16;
+            else if (invalidOutput == "capacity") out.dataSize -= sizeof(int32_t);
+            else if (invalidOutput == "zero_capacity") out.dataSize = 0;
+            else assert(false);
+        }
         CpuKernelContext ctx{{&q, &k, nullptr, &usedQ, &usedK}, {&out}, {}};
         const std::map<std::string, int64_t> attrs{
             {"aic_core_num", aic}, {"aiv_core_num", aiv}, {"num_heads_q", heads},
@@ -304,10 +335,10 @@ int main(int argc, char** argv) {
         }
         constexpr size_t words = sizeof(detail::SasMetaData) / sizeof(uint32_t);
         static_assert(words == 900);
-        std::vector<uint32_t> current(storage.begin() + 1, storage.begin() + 1 + words);
+        for (size_t i = 1 + words; i < 1 + SAS_META_SIZE; ++i) assert(storage[i] == 0);
+        std::vector<uint32_t> current(storage.begin() + 1, storage.end() - 1);
         if (repeat) assert(current == previous);
         previous = current;
-        for (size_t i = 1 + words; i < storage.size(); ++i) assert(storage[i] == poison);
     }
 }
 """
@@ -364,3 +395,10 @@ def test_real_sas_scheduler_initializes_entire_abi(sas_scheduler, cores, lengths
 @pytest.mark.parametrize("cores", [(0, 64), (28, 0), (37, 74), (36, 73)])
 def test_real_sas_scheduler_rejects_abi_overflow_before_writing(sas_scheduler, cores):
     subprocess.run([str(sas_scheduler), *map(str, cores), "10", "10", "128", "1", "0"], check=True, timeout=10)
+
+
+@pytest.mark.parametrize("invalid_output", ["shape", "rank", "dtype", "capacity", "zero_capacity"])
+def test_real_sas_scheduler_rejects_bad_output_before_writing(sas_scheduler, invalid_output):
+    subprocess.run(
+        [str(sas_scheduler), "32", "64", "10", "10", "128", "1", "0", invalid_output], check=True, timeout=10
+    )

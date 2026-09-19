@@ -25,13 +25,13 @@ import time
 from pathlib import Path
 
 # Shared C++ ABI: vllm_quant_lightning_indexer_metadata.h. The 160-word
-# reserved tail is not consumed and is deliberately excluded from comparisons.
+# reserved tail is ignored by the legacy check; full-output mode requires zero.
 QLI_WORDS = 1024
 LI_CORES, LD_CORES, WORDS_PER_CORE = 36, 72, 8
 DEFINED_WORDS = (LI_CORES + LD_CORES) * WORDS_PER_CORE
 
 
-def check_metadata(values):
+def check_metadata(values, *, require_full_output=False):
     """Validate the single-request, no-flash-decode split schedule and ABI."""
     if len(values) != QLI_WORDS:
         raise ValueError("QLI metadata must contain 1024 int32 words.")
@@ -51,10 +51,12 @@ def check_metadata(values):
         raise ValueError("QLI metadata did not cover the complete single request.")
     if any(values[LI_CORES * WORDS_PER_CORE : DEFINED_WORDS]):
         raise ValueError("QLI no-FD metadata must leave every LD slot disabled and zeroed.")
+    if require_full_output and any(values[DEFINED_WORDS:]):
+        raise ValueError("QLI reserved metadata tail must be zero in full-output mode; rebuild custom AICPU ops.")
     return enabled
 
 
-def run_preflight(device, config, prompt_tokens=10):
+def run_preflight(device, config, prompt_tokens=10, *, require_full_output=False):
     # This function is also called inside the supervised offline process,
     # before LLM construction. No production attention hot-path is changed.
     import torch
@@ -120,12 +122,23 @@ def run_preflight(device, config, prompt_tokens=10):
             if result.dtype != torch.int32 or result.shape != (QLI_WORDS,) or result.device != device:
                 raise ValueError("QLI returned the wrong dtype, shape or device.")
             values = result.cpu().tolist()
-            active = check_metadata(values)
-            current = values[:DEFINED_WORDS]
+            active = check_metadata(values, require_full_output=require_full_output)
+            current = values if require_full_output else values[:DEFINED_WORDS]
             if repeat and current != previous:
-                raise ValueError("QLI defined metadata is not exactly repeatable.")
+                scope = "full 1024-word" if require_full_output else "defined"
+                raise ValueError(f"QLI {scope} metadata is not exactly repeatable.")
             previous = current
-        record = dict(case=name, passed=True, active_li_cores=active, repeats=3, elapsed_s=time.perf_counter() - start)
+        record = dict(
+            case=name,
+            passed=True,
+            active_li_cores=active,
+            repeats=3,
+            full_output_verified=require_full_output,
+            compared_metadata_words=QLI_WORDS if require_full_output else DEFINED_WORDS,
+            defined_metadata_words=DEFINED_WORDS,
+            total_metadata_words=QLI_WORDS,
+            elapsed_s=time.perf_counter() - start,
+        )
         results.append(record)
         print("QLI_RESULT " + json.dumps(record), flush=True)
     print("QLI_METADATA_PREFLIGHT=PASS MODEL_VERIFIED=False", flush=True)
@@ -136,6 +149,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--physical-npu", type=int, default=4)
     parser.add_argument("--model", type=Path, help="Read config.json only; never load model weights.")
+    parser.add_argument(
+        "--require-full-output",
+        action="store_true",
+        help="Require a zero reserved tail and exact 1024-word repeatability.",
+    )
     args = parser.parse_args()
     if args.physical_npu < 0:
         parser.error("Physical NPU must be non-negative.")
@@ -159,7 +177,7 @@ def main():
         if args.model
         else {"index_n_heads": 64, "index_head_dim": 128, "index_topk": 512}
     )
-    run_preflight(device, config)
+    run_preflight(device, config, require_full_output=args.require_full_output)
 
 
 if __name__ == "__main__":
