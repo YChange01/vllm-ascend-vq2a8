@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tests.ut.quantization.test_vq2a8_activation_packed import TorchSignOps, assert_bytes, fixture, reference
+from tests.ut.quantization.test_vq2a8_activation_direct import StridedSignOracle
+from tests.ut.quantization.test_vq2a8_activation_packed import assert_bytes, fixture, reference
 from vllm_ascend.quantization.vq2a8_activation import RowwiseVQ2A8Preparation
 from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
 from vllm_ascend.quantization.vq2a8_v4_device_route import DeviceRouteDecodeState, DeviceRouteGraphCompute
@@ -30,11 +31,11 @@ class ProjectionInputOracle:
         return output, torch.ones_like(slots, dtype=torch.int32)
 
 
-@pytest.mark.parametrize("mode", ["rowwise", "rowwise_packed", "sign_fused"])
+@pytest.mark.parametrize("mode", ["rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct"])
 @pytest.mark.parametrize("path", ["eager", "graph_compute"])
 @pytest.mark.parametrize("invalid_sign", [False, True])
 def test_device_projection_uses_selected_preparation_and_retains_each_input_flag(monkeypatch, mode, path, invalid_sign):
-    native = TorchSignOps()
+    native = StridedSignOracle()
     monkeypatch.setattr(torch.ops, "vq2a8_ascendc_v4_v2", native)
     factory_owner = AscendCV4V2VQ2TP1MoE.__new__(AscendCV4V2VQ2TP1MoE)
     factory_owner.v4_activation_preparation = mode
@@ -45,7 +46,9 @@ def test_device_projection_uses_selected_preparation_and_retains_each_input_flag
         assert type(preparation) is RowwiseVQ2A8Preparation
     else:
         assert isinstance(preparation, PackedRowwiseVQ2A8Preparation)
-        assert preparation.fuse_sign is (mode == "sign_fused")
+        assert preparation.fuse_sign is mode.startswith("sign_fused")
+        assert preparation.strided_sign is (mode in ("sign_fused_strided", "sign_fused_direct"))
+        assert preparation.direct_output is (mode == "sign_fused_direct")
 
     hidden, scale, bias, signs, spec = fixture(2048, 3)
     hidden = hidden[:1].expand(3, -1)
@@ -81,7 +84,7 @@ def test_device_projection_uses_selected_preparation_and_retains_each_input_flag
         output = compute._project(hidden, slots, "gate_up", flags.append)
     assert output.shape == (3, 1) and output.dtype == torch.bfloat16
     assert all(bool(flag) for flag in flags) is (not invalid_sign)
-    assert len(native.calls) == (1 if mode == "sign_fused" else 0)
+    assert len(native.calls) == (1 if mode.startswith("sign_fused") else 0)
     if not invalid_sign:
         selected = tuple(value.index_select(0, slots) for value in (scale, bias, signs))
         expected = reference(hidden, *selected, spec)

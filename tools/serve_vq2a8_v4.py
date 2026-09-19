@@ -53,9 +53,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--activation-preparation",
-        choices=("rowwise", "rowwise_packed", "sign_fused", "fused"),
+        choices=("rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct", "fused"),
         default="rowwise",
-        help="V4 v2: rowwise baseline, packed decode, sign-only fusion, or legacy full fusion (separate acceptance)",
+        help="V4 v2 activation candidate; strided/direct require a new library and separate numerical acceptance",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -96,9 +96,9 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--decoder-metadata-mode",
-        choices=("recursive", "planned"),
+        choices=("recursive", "planned", "planned_fast"),
         default="recursive",
-        help="Decoder metadata: recursive baseline or opt-in shared-subtree update plan",
+        help="Decoder metadata: recursive/planned baselines or opt-in compiled-check planned_fast",
     )
     parser.add_argument(
         "--host-profile",
@@ -120,10 +120,13 @@ def parse_args(argv=None):
     ):
         parser.error("--decode-graph decoder requires --graph-replay-stream caller and --max-model-len <=16.")
     if args.decoder_metadata_mode != "recursive" and args.decode_graph != "decoder":
-        parser.error("--decoder-metadata-mode planned requires --decode-graph decoder.")
+        parser.error("--decoder-metadata-mode planned/planned_fast requires --decode-graph decoder.")
     if args.host_profile and args.decode_graph != "decoder":
         parser.error("--host-profile requires --decode-graph decoder.")
-    if args.activation_preparation in ("rowwise_packed", "sign_fused") and not args.device_route_decode:
+    if (
+        args.activation_preparation in ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct")
+        and not args.device_route_decode
+    ):
         parser.error("Packed decode preparation requires --device-route-decode; prefill keeps rowwise arithmetic.")
     if (
         args.activation_reorder != "scalar" or args.activation_preparation != "rowwise"

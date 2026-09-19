@@ -59,8 +59,10 @@ def test_optional_profile_directory_uses_vllm_profiler_config_without_making_dir
     assert not directory.exists()
 
 
-@pytest.mark.parametrize("preparation", ("rowwise", "rowwise_packed", "sign_fused"))
-@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+@pytest.mark.parametrize(
+    "preparation", ("rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct")
+)
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned", "planned_fast"))
 @pytest.mark.parametrize("host_profile", (False, True))
 def test_decoder_optimization_options_round_trip_without_changing_engine_contract(
     tmp_path, preparation, metadata_mode, host_profile
@@ -105,7 +107,9 @@ def test_decoder_optimization_options_round_trip_without_changing_engine_contrac
     assert json.loads(value(command, "--compilation-config")) == {"mode": 0, "cudagraph_mode": "NONE"}
 
 
-@pytest.mark.parametrize("option", (["--decoder-metadata-mode", "planned"], ["--host-profile"]))
+@pytest.mark.parametrize(
+    "option", (["--decoder-metadata-mode", "planned"], ["--decoder-metadata-mode", "planned_fast"], ["--host-profile"])
+)
 @pytest.mark.parametrize("graph_mode", ("none", "moe"))
 def test_decoder_host_options_reject_non_decoder_modes(option, graph_mode):
     with pytest.raises(SystemExit) as exc:
@@ -113,7 +117,7 @@ def test_decoder_host_options_reject_non_decoder_modes(option, graph_mode):
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct"))
 @pytest.mark.parametrize("backend,device_route", (("v1", False), ("v1", True), ("v2", False)))
 def test_packed_preparation_requires_v2_and_device_route_at_cli(preparation, backend, device_route):
     argv = ["--compute-backend", backend, "--activation-preparation", preparation]
@@ -124,7 +128,7 @@ def test_packed_preparation_requires_v2_and_device_route_at_cli(preparation, bac
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused"))
+@pytest.mark.parametrize("preparation", ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct"))
 def test_packed_preparation_can_be_tested_without_enabling_graphs(preparation):
     args = server.parse_args(
         ["--compute-backend", "v2", "--device-route-decode", "--activation-preparation", preparation]

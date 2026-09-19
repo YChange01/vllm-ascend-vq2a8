@@ -39,9 +39,13 @@ def parse_args(argv=None):
     parser.add_argument("--compute-backend", choices=("v1", "v2"), default="v2")
     parser.add_argument("--activation-reorder", choices=("scalar", "vectorized"), default="scalar")
     parser.add_argument(
-        "--activation-preparation", choices=("rowwise", "rowwise_packed", "sign_fused", "fused"), default="rowwise"
+        "--activation-preparation",
+        choices=("rowwise", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct", "fused"),
+        default="rowwise",
     )
-    parser.add_argument("--decoder-metadata-mode", choices=("recursive", "planned"), default="recursive")
+    parser.add_argument(
+        "--decoder-metadata-mode", choices=("recursive", "planned", "planned_fast"), default="recursive"
+    )
     parser.add_argument(
         "--host-profile", action="store_true", help="CPU-only ranges/counters; never a timing benchmark"
     )

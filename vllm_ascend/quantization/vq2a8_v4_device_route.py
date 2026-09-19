@@ -317,7 +317,12 @@ class DeviceRouteDecodeState(FastMoEState):
         # Slot count is static host metadata, not device route data. Each row
         # still performs the original one-row RHT/bias GEMV and FP8 conversion.
         with self.scope("preparation"):
-            if getattr(runtime, "v4_activation_preparation", "rowwise") in ("rowwise_packed", "sign_fused"):
+            if getattr(runtime, "v4_activation_preparation", "rowwise") in (
+                "rowwise_packed",
+                "sign_fused",
+                "sign_fused_strided",
+                "sign_fused_direct",
+            ):
                 quantized, scale, bias = runtime._row_preparation.packed(
                     hidden, weight_scale, weight_bias, signs, spec, validity=self.retain
                 )
@@ -487,7 +492,12 @@ class DeviceRouteGraphCompute:
         bank, spec = self.banks[kind]
         weight_scale, weight_bias, signs, valid = bank.select(slots)
         retain((valid != 0).all())
-        if getattr(self.runtime, "v4_activation_preparation", "rowwise") in ("rowwise_packed", "sign_fused"):
+        if getattr(self.runtime, "v4_activation_preparation", "rowwise") in (
+            "rowwise_packed",
+            "sign_fused",
+            "sign_fused_strided",
+            "sign_fused_direct",
+        ):
             quantized, scale, bias = self.preparations[kind].packed(
                 hidden, weight_scale, weight_bias, signs, spec, validity=retain
             )

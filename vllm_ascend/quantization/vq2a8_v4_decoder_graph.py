@@ -292,6 +292,155 @@ class PlannedDecoderMetadataBuffers:
                 self.copies += 1
 
 
+class FastPlannedDecoderMetadataBuffers(PlannedDecoderMetadataBuffers):
+    """Opt-in compiled check actions; no validation survives an update.
+
+    The ``planned`` implementation remains the A/B reference. This variant
+    binds each node's check and child access at startup instead of dispatching
+    node kinds and constructing pending work tuples on every token. Tensor
+    contracts are memoized only within one update, including shared captured
+    targets reached through many distinct source views. Replacement source
+    objects still receive their own validation. No copies occur until *all*
+    actions have completed successfully.
+
+    As with the baseline, metadata must not be concurrently mutated during an
+    update. The graph bank serializes replay; these checks do not add any NPU
+    scalar reads, new immutable fields, or cross-request source caches.
+    """
+
+    def __init__(self, metadata):
+        super().__init__(metadata)
+        actions = {}
+        self._validate = self._compile_action(self._root, actions)
+
+    def _compile_action(self, index, actions):
+        if index in actions:
+            return actions[index]
+        node = self._nodes[index]
+        target, name = node.target, node.name
+
+        if node.kind in ("tensor", "immutable_tensor"):
+            expected, pointer = node.contract
+            target_id = id(target)
+            immutable = node.kind == "immutable_tensor"
+            cpu = expected[3].type == "cpu"
+
+            def check(source, seen, views, targets):
+                if seen[index] is source:
+                    return
+                seen[index] = source
+                if not isinstance(source, torch.Tensor):
+                    raise ValueError(f"Decoder metadata tensor contract changed: {name}.")
+                source_id = id(source)
+                source_view = views.get(source_id)
+                if source_view is None:
+                    # Retain the object alongside its view so even unusual
+                    # accessors cannot recycle its id during this update.
+                    source_view = (source, _tensor_contract(source), source.data_ptr())
+                    views[source_id] = source_view
+                target_view = views.get(target_id)
+                if target_view is None:
+                    target_view = (target, _tensor_contract(target), target.data_ptr())
+                    views[target_id] = target_view
+                if source_view[1] != expected or target_view[1] != expected or target_view[2] != pointer:
+                    raise ValueError(f"Decoder metadata tensor contract changed: {name}.")
+                if immutable:
+                    if source_view[2] != pointer:
+                        raise ValueError(f"Decoder immutable metadata storage changed: {name}.")
+                    return
+                previous = targets.get(target_id)
+                if previous is not None:
+                    if previous[2] != source_view[2]:
+                        raise ValueError("Decoder metadata alias topology changed; an input would otherwise be frozen.")
+                    return
+                if cpu and not torch.equal(target, source):
+                    raise ValueError(f"Decoder CPU metadata values changed for this position: {name}.")
+                targets[target_id] = (None if cpu else target, source, source_view[2])
+
+        elif node.kind == "constant":
+            expected_type = node.contract
+
+            def check(source, seen, views, targets):
+                if seen[index] is source:
+                    return
+                seen[index] = source
+                if type(source) is not expected_type:
+                    raise ValueError(f"Decoder metadata type changed: {name}.")
+                if source != target:
+                    raise ValueError(f"Decoder metadata constant changed for this position: {name}.")
+
+        else:
+            expected_type, structure = node.contract
+            children = tuple((key, self._compile_action(child, actions)) for key, child in node.children)
+            if node.kind == "dict":
+
+                def check(source, seen, views, targets):
+                    if seen[index] is source:
+                        return
+                    seen[index] = source
+                    if type(source) is not expected_type:
+                        raise ValueError(f"Decoder metadata type changed: {name}.")
+                    if source.keys() != structure:
+                        raise ValueError(f"Decoder metadata keys changed: {name}.")
+                    for key, child in children:
+                        child(source[key], seen, views, targets)
+
+            elif node.kind == "sequence":
+
+                def check(source, seen, views, targets):
+                    if seen[index] is source:
+                        return
+                    seen[index] = source
+                    if type(source) is not expected_type:
+                        raise ValueError(f"Decoder metadata type changed: {name}.")
+                    if len(source) != structure:
+                        raise ValueError(f"Decoder metadata length changed: {name}.")
+                    for key, child in children:
+                        child(source[key], seen, views, targets)
+
+            elif node.kind == "dataclass":
+
+                def check(source, seen, views, targets):
+                    if seen[index] is source:
+                        return
+                    seen[index] = source
+                    if type(source) is not expected_type:
+                        raise ValueError(f"Decoder metadata type changed: {name}.")
+                    if source.__dataclass_fields__.keys() != structure:
+                        raise ValueError(f"Decoder metadata dataclass fields changed: {name}.")
+                    for key, child in children:
+                        child(getattr(source, key), seen, views, targets)
+
+            else:
+                # _compile has a closed set of node kinds. Only RopeDataProxy
+                # can arrive here, with one validated _data child.
+                child = children[0][1]
+
+                def check(source, seen, views, targets):
+                    if seen[index] is source:
+                        return
+                    seen[index] = source
+                    if type(source) is not expected_type:
+                        raise ValueError(f"Decoder metadata type changed: {name}.")
+                    if source.idx != structure:
+                        raise ValueError("Decoder rotary proxy cosine/sine selector changed.")
+                    child(source._data, seen, views, targets)
+
+        actions[index] = check
+        return check
+
+    def update(self, metadata):
+        targets = {}
+        # A one-slot identity memo per node avoids allocating (node, id) tuples
+        # for shared DAG paths. A different object revalidates that node; even
+        # alternating replacements are checked rather than using stale state.
+        self._validate(metadata, [object()] * len(self._nodes), {}, targets)
+        for target, source, _ in targets.values():
+            if target is not None:
+                target.copy_(source)
+                self.copies += 1
+
+
 def decode_position(metadata, max_model_len):
     """Use existing scheduler-built CPU lengths, never positions.item()."""
     if not isinstance(metadata, dict) or not metadata:
@@ -368,8 +517,8 @@ class V4DecoderGraphBank:
     def __init__(self, model, max_model_len, *, backend=None, metadata_mode="recursive"):
         if type(max_model_len) is not int or not 1 <= max_model_len <= MAX_DECODER_GRAPH_CONTEXT:
             raise ValueError("Decoder graph context must be an integer in 1..16.")
-        if metadata_mode not in ("recursive", "planned"):
-            raise ValueError("Decoder metadata mode must be recursive or planned.")
+        if metadata_mode not in ("recursive", "planned", "planned_fast"):
+            raise ValueError("Decoder metadata mode must be recursive, planned or planned_fast.")
         self.model = model
         self.max_model_len = max_model_len
         self.metadata_mode = metadata_mode
@@ -422,7 +571,11 @@ class V4DecoderGraphBank:
             self._inputs(input_ids, positions)
             if decode_position(context.attn_metadata, self.max_model_len) != position:
                 raise ValueError("Startup metadata position differs from its graph key.")
-            buffers = PlannedDecoderMetadataBuffers if self.metadata_mode == "planned" else DecoderMetadataBuffers
+            buffers = {
+                "recursive": DecoderMetadataBuffers,
+                "planned": PlannedDecoderMetadataBuffers,
+                "planned_fast": FastPlannedDecoderMetadataBuffers,
+            }[self.metadata_mode]
             metadata = buffers(context.attn_metadata)
             tokens = input_ids.clone()
             static_positions = positions.clone()

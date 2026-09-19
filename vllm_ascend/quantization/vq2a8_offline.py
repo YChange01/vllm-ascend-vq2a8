@@ -42,8 +42,15 @@ def _validate_v4_compute_backend(value, policy):
 def _validate_v4_activation_options(reorder, preparation, backend, policy):
     if reorder not in ("scalar", "vectorized"):
         raise ValueError("v4_activation_reorder requires scalar|vectorized.")
-    if preparation not in ("rowwise", "rowwise_packed", "sign_fused", "fused"):
-        raise ValueError("v4_activation_preparation requires rowwise|rowwise_packed|sign_fused|fused.")
+    if preparation not in (
+        "rowwise",
+        "rowwise_packed",
+        "sign_fused",
+        "sign_fused_strided",
+        "sign_fused_direct",
+        "fused",
+    ):
+        raise ValueError("Invalid v4_activation_preparation mode.")
     if (reorder != "scalar" or preparation != "rowwise") and (backend != "v2" or policy != "ascendc_v4"):
         raise ValueError("V4 activation optimizations require execution_policy=ascendc_v4 and v4_compute_backend=v2.")
 
@@ -56,8 +63,8 @@ def _validate_cache_memory_fraction(value, policy):
 
 
 def _validate_v4_host_options(metadata_mode, host_profile, graph_mode, policy):
-    if metadata_mode not in ("recursive", "planned"):
-        raise ValueError("v4_decoder_metadata_mode requires recursive|planned.")
+    if metadata_mode not in ("recursive", "planned", "planned_fast"):
+        raise ValueError("v4_decoder_metadata_mode requires recursive|planned|planned_fast.")
     if metadata_mode != "recursive" and (policy != "ascendc_v4" or graph_mode != "decoder"):
         raise ValueError("Planned metadata requires V4 decoder graphs.")
     if type(host_profile) is not bool or (host_profile and (policy != "ascendc_v4" or graph_mode != "decoder")):
@@ -100,7 +107,10 @@ def offline_engine_options(
         v4_activation_reorder, v4_activation_preparation, v4_compute_backend, execution_policy
     )
     _validate_v4_host_options(v4_decoder_metadata_mode, v4_host_profile, v4_decode_graph, execution_policy)
-    if v4_activation_preparation in ("rowwise_packed", "sign_fused") and not v4_device_route_decode:
+    if (
+        v4_activation_preparation in ("rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct")
+        and not v4_device_route_decode
+    ):
         raise ValueError("Packed activation preparation requires v4_device_route_decode=true.")
     if execution_policy not in ("ascendc", "ascendc_v4") and (
         ascendc_library is not None or ascendc_sha256 is not None
@@ -411,9 +421,12 @@ def validate_offline_config(config) -> dict:
         key in options for key in ("v4_decoder_metadata_mode", "v4_host_profile")
     ):
         raise ValueError("V4 host options require execution_policy=ascendc_v4.")
-    if options.get("v4_activation_preparation") in ("rowwise_packed", "sign_fused") and not options.get(
-        "v4_device_route_decode"
-    ):
+    if options.get("v4_activation_preparation") in (
+        "rowwise_packed",
+        "sign_fused",
+        "sign_fused_strided",
+        "sign_fused_direct",
+    ) and not options.get("v4_device_route_decode"):
         raise ValueError("Packed activation preparation requires v4_device_route_decode=true.")
     if graph_mode not in ("none", "moe", "decoder") or (
         "v4_decode_graph" in options and options.get("execution_policy") != "ascendc_v4"

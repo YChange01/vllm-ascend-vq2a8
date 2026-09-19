@@ -296,7 +296,7 @@ def test_packed_probe_task_queue_environment_defaults_without_overriding(value):
     before = dict(parent)
     child = validate.probe_environment(args, parent)
     assert parent == before and child is not parent
-    assert child["TASK_QUEUE_ENABLE"] == ("2" if value is None else value)
+    assert child["TASK_QUEUE_ENABLE"] == ("1" if value is None else value)
     assert child["UNCHANGED"] == "yes"
 
 

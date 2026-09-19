@@ -6,6 +6,11 @@ baseline. They are not a claim of 30 ms TPOT or of hardware validation.
 No new native build or weight conversion is required: sign-only fusion uses
 the existing perf3 library's `activation_sign` ABI 1, not `activation_quantize`.
 
+For the later opt-in `planned_fast`, `sign_fused_strided`, and
+`sign_fused_direct` candidates, see [the separate acceptance guide](vq2a8_v4_direct.md).
+The two new activation modes require a new native library; the options in this
+document continue to work with perf3.
+
 ## Changes and boundaries
 
 | Option | Behavior |
@@ -37,7 +42,7 @@ Stop only your own serving process before running the standalone probes. Do
 not run another full model concurrently or reset other users' devices.
 
 ```bash
-python -u tools/validate_vq2a8_activation_packed.py \
+TASK_QUEUE_ENABLE=1 python -u tools/validate_vq2a8_activation_packed.py \
   --library build/vq2a8-ascendc-v4-v2-perf3/libvq2a8_ascendc_v4_v2.so \
   --physical-npu 1 --queue-lifetime --timeout-s 300
 ```
@@ -46,10 +51,11 @@ Require `V4_PACKED_ACTIVATION=PASS` and inspect its summary. This compares
 q/scale/bias byte-for-byte with the existing rowwise path and checks graph
 validity and queued lifetime. It does not load or verify the full model.
 Do not relax tolerance after a failure or start the candidate as accepted.
-For this isolated lifetime probe, an unset `TASK_QUEUE_ENABLE` defaults to `2`;
+For this isolated lifetime probe, an unset `TASK_QUEUE_ENABLE` defaults to `1`;
 an explicitly inherited `0` is rejected, not silently overridden. Queue
 capacity itself is not measured. The bounded queue test is not full-model
-lifetime evidence.
+lifetime evidence. Use `1` for this stack: `2` is unsupported during graph
+capture on the tested torch_npu runtime.
 
 ## 2. Real decoder acceptance
 
@@ -61,7 +67,7 @@ to every model command below; otherwise the model's original expert directory
 is used. No artifact is overwritten.
 
 ```bash
-python -u tools/validate_vq2a8_v4_decoder_graph.py \
+TASK_QUEUE_ENABLE=1 python -u tools/validate_vq2a8_v4_decoder_graph.py \
   --model /home/g00872988/vq2a8 \
   --library build/vq2a8-ascendc-v4-v2-perf3/libvq2a8_ascendc_v4_v2.so \
   --physical-npu 1 --compute-backend v2 \
@@ -82,7 +88,7 @@ This example isolates the metadata optimization. Keep all other launch flags,
 model/library/artifact, card, request parameters and concurrency identical.
 
 ```bash
-python -u tools/serve_vq2a8_v4.py \
+TASK_QUEUE_ENABLE=1 python -u tools/serve_vq2a8_v4.py \
   --model /home/g00872988/vq2a8 \
   --library build/vq2a8-ascendc-v4-v2-perf3/libvq2a8_ascendc_v4_v2.so \
   --physical-npu 1 --compute-backend v2 \

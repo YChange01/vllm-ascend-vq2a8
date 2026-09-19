@@ -7,10 +7,12 @@ module consumes those batched rows directly instead of rebuilding dictionaries
 and stacking them again.  It deliberately retains the original one-row RHT and
 bias GEMVs: batching either operation changes rounding on NPU.
 
-The optional native path is intentionally narrow.  It uses the already shipped
-``activation_sign`` operator only for sign multiplication and input validation;
-row scaling, amax, division, clamping, and FP8 conversion remain Torch
-operations because the native quantizer has not met the byte-exact oracle.
+The optional native path is intentionally narrow: sign multiplication and input
+validation only. The baseline uses the shipped ``activation_sign``; separate
+strided/direct candidates consume BF16/FP32 input views and optionally write
+MatMul outputs directly into final buffers. Row scaling, amax, division,
+clamping, and FP8 conversion remain Torch operations because the native
+quantizer has not met the byte-exact oracle.
 """
 
 from __future__ import annotations
@@ -23,14 +25,21 @@ from vllm_ascend.quantization.vq2a8_reference import VQ2_FP8_MIN_SCALE
 PACKED_GROUP_LIMIT = 6
 PACKED_WIDTHS = (2048, 4096)
 SIGN_FUSION_ABI = 1
+STRIDED_SIGN_ABI = 1
 
 
 class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
     """Prepare one activation row per selected expert without Python repacking."""
 
-    def __init__(self, *, compact=False, validity=None, fuse_sign=False, native_ops=None):
+    def __init__(
+        self, *, compact=False, validity=None, fuse_sign=False, native_ops=None, strided_sign=False, direct_output=False
+    ):
         super().__init__(compact=compact, validity=validity)
+        if (strided_sign and not fuse_sign) or (direct_output and not strided_sign):
+            raise ValueError("Direct output requires strided sign fusion; strided sign requires fuse_sign.")
         self.fuse_sign = fuse_sign
+        self.strided_sign = strided_sign
+        self.direct_output = direct_output
         self._sign = None
         if not fuse_sign:
             return
@@ -44,6 +53,14 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
             ) from error
         if type(version) is not int or version != SIGN_FUSION_ABI:
             raise RuntimeError(f"Unsupported packed sign fusion ABI {version}; require {SIGN_FUSION_ABI}.")
+        if strided_sign:
+            try:
+                version = native.activation_sign_strided_version()
+                sign = native.activation_sign_strided
+            except (AttributeError, RuntimeError) as error:
+                raise RuntimeError("Strided sign fusion requires a rebuilt library; no implicit fallback.") from error
+            if type(version) is not int or version != STRIDED_SIGN_ABI:
+                raise RuntimeError(f"Unsupported strided sign ABI {version}; require {STRIDED_SIGN_ABI}.")
         self._sign = sign
 
     def packed(self, hidden, weight_scale, weight_bias, signs, spec, *, validity=None):
@@ -55,9 +72,13 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         """
 
         groups, width, block = self._check_packed(hidden, weight_scale, weight_bias, signs, spec)
-        # ``hidden`` may be an expanded stride-zero view in gate/up.  The old
-        # stack path materialized FP32 rows, so make that conversion explicit.
-        x = hidden.to(dtype=torch.float32).contiguous()
+        # ``hidden`` may be an expanded stride-zero view in gate/up. Preserve
+        # baseline materialization unless direct native view access is chosen.
+        if self.strided_sign:
+            self._check_strided_hidden(hidden)
+            x = hidden
+        else:
+            x = hidden.to(dtype=torch.float32).contiguous()
         self._ensure_hadamard(hidden.device, block)
 
         if self.fuse_sign:
@@ -74,21 +95,43 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
             validity(valid)
 
         signed_blocks = signed.reshape(groups, width // block, block)
-        rotated = torch.empty_like(x)
+        rotated = torch.empty((groups, width), dtype=torch.float32, device=hidden.device)
         bias = torch.empty(groups, dtype=torch.float32, device=hidden.device)
         for group_index in range(groups):
             # Keep these as independent one-row GEMMs.  A batched GEMM is not
             # byte-equivalent to RowwiseVQ2A8Preparation on Ascend 950.
-            row = (signed_blocks[group_index : group_index + 1] @ self._hadamard).reshape(1, width)
-            rotated[group_index : group_index + 1].copy_(row)
-            row_bias = row @ weight_bias[group_index]
-            bias[group_index : group_index + 1].copy_(row_bias)
+            if self.direct_output:
+                # Identical input ranks and GEMM geometries; only destinations
+                # change. NPU out= dispatch still needs independent bitwise
+                # acceptance, so this remains a separate opt-in candidate.
+                row = rotated[group_index : group_index + 1]
+                torch.matmul(
+                    signed_blocks[group_index : group_index + 1],
+                    self._hadamard,
+                    out=row.reshape(1, width // block, block),
+                )
+                torch.matmul(row, weight_bias[group_index], out=bias[group_index : group_index + 1])
+            else:
+                row = (signed_blocks[group_index : group_index + 1] @ self._hadamard).reshape(1, width)
+                rotated[group_index : group_index + 1].copy_(row)
+                row_bias = row @ weight_bias[group_index]
+                bias[group_index : group_index + 1].copy_(row_bias)
 
         transformed = rotated * weight_scale
         fp8_max = torch.finfo(torch.float8_e4m3fn).max
         scale = torch.clamp(transformed.abs().amax(dim=-1) / fp8_max, min=VQ2_FP8_MIN_SCALE)
         quantized = torch.clamp(transformed / scale.unsqueeze(-1), -fp8_max, fp8_max).to(torch.float8_e4m3fn)
         return quantized.contiguous(), scale.contiguous(), bias.contiguous()
+
+    @staticmethod
+    def _check_strided_hidden(hidden):
+        if hidden.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("Strided sign input requires BF16 or FP32.")
+        row_stride, column_stride = hidden.stride()
+        if column_stride != 1 or (row_stride != 0 and row_stride < hidden.shape[1]):
+            raise ValueError("Strided sign input requires unit columns and expanded or non-overlapping rows.")
+        if hidden.data_ptr() % 32 or (hidden.shape[0] > 1 and (row_stride * hidden.element_size()) % 32):
+            raise ValueError("Strided sign input base and row stride require 32-byte alignment.")
 
     @staticmethod
     def _check_packed(hidden, weight_scale, weight_bias, signs, spec):

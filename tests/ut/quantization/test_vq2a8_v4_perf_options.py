@@ -36,7 +36,9 @@ def test_independent_native_feature_checks():
 
 
 @pytest.mark.parametrize("reorder", ["scalar", "vectorized"])
-@pytest.mark.parametrize("preparation", ["rowwise", "fused"])
+@pytest.mark.parametrize(
+    "preparation", ["rowwise", "fused", "rowwise_packed", "sign_fused", "sign_fused_strided", "sign_fused_direct"]
+)
 @pytest.mark.parametrize("graph", ["none", "moe", "decoder"])
 def test_independent_v4_perf_options(tmp_path, reorder, preparation, graph):
     opts = options(
@@ -64,7 +66,11 @@ def test_unknown_activation_option_rejected(tmp_path, key, value):
         offline.validate_offline_config(config(opts))
 
 
-@pytest.mark.parametrize("extra", [{"v4_activation_reorder": "vectorized"}, {"v4_activation_preparation": "fused"}])
+@pytest.mark.parametrize(
+    "extra",
+    [{"v4_activation_reorder": "vectorized"}]
+    + [{"v4_activation_preparation": mode} for mode in ("fused", "sign_fused_strided", "sign_fused_direct")],
+)
 def test_new_native_optimizations_never_leak_to_v1(tmp_path, extra):
     with pytest.raises(ValueError, match="v4_compute_backend=v2"):
         options(tmp_path, **extra)

@@ -33,6 +33,13 @@ CASE = "v4_v2_activation_packed"
 REPO = Path(__file__).resolve().parents[1]
 LIBRARY_NAME = "libvq2a8_ascendc_v4_v2.so"
 QUEUE_ITERATIONS = 513
+DEFAULT_PREPARATION_MODES = ("rowwise_packed", "sign_fused")
+STRIDED_PREPARATION_MODES = ("sign_fused_strided", "sign_fused_direct")
+PREPARATION_MODES = DEFAULT_PREPARATION_MODES + STRIDED_PREPARATION_MODES
+INPUT_DTYPES = ("bf16", "fp32")
+INPUT_LAYOUTS = ("contiguous", "expanded", "padded")
+PAD_COLUMNS = 16  # Keep the BF16 and FP32 row starts 32-byte aligned.
+BF16_BOUNDARIES = ("tiny", "subnormal_min", "signed_zero", "boundary_mixed")
 
 
 def parse_args(argv=None):
@@ -41,11 +48,14 @@ def parse_args(argv=None):
     parser.add_argument("--physical-npu", type=int, default=1)
     parser.add_argument("--timeout-s", type=int, default=300)
     parser.add_argument("--queue-lifetime", action="store_true")
+    parser.add_argument("--preparation-modes", nargs="+", choices=PREPARATION_MODES, default=DEFAULT_PREPARATION_MODES)
     parser.add_argument("--allow-busy", action="store_true")
     parser.add_argument("--report-dir", type=Path)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if len(set(args.preparation_modes)) != len(args.preparation_modes):
+        parser.error("--preparation-modes must not contain duplicates")
     if args.physical_npu < 0 or args.timeout_s <= 0 or (args.child and args.plan_only):
         parser.error("Require physical NPU >= 0, timeout > 0; --child cannot use --plan-only")
     args.launch_blocking = "0"
@@ -64,6 +74,8 @@ def child_command(args):
         str(args.physical_npu),
         "--timeout-s",
         str(args.timeout_s),
+        "--preparation-modes",
+        *args.preparation_modes,
     ]
     return command + (["--queue-lifetime"] if args.queue_lifetime else [])
 
@@ -73,7 +85,9 @@ def probe_environment(args, environ=None):
 
     environment = child_environment(args, environ)
     if args.queue_lifetime:
-        environment.setdefault("TASK_QUEUE_ENABLE", "2")
+        # This probe also captures NPU graphs; the target runtime rejects
+        # queue mode 2 during capture. Keep explicit caller policy untouched.
+        environment.setdefault("TASK_QUEUE_ENABLE", "1")
     return environment
 
 
@@ -89,17 +103,137 @@ def assert_bits(actual, expected, name):
         raise AssertionError(f"{name}: {differences} unequal bytes; no tolerance or fallback")
 
 
-def fixture(device, width, groups):
+def fixture(device, width, groups, *, dtype=None):
     import torch
 
     generator = torch.Generator(device="cpu").manual_seed(width * 10 + groups)
-    hidden = torch.randn(groups, width, generator=generator).bfloat16().to(device)
+    hidden = torch.randn(groups, width, generator=generator).to(dtype=dtype or torch.bfloat16).to(device)
     scale = torch.randn(groups, width, generator=generator).to(device)
     bias = torch.randn(groups, width, generator=generator).to(device)
     signs = torch.where(torch.arange(groups * width).reshape(groups, width) % 3 == 0, -1, 1)
     signs = signs.to(device=device, dtype=torch.int8)
     spec = SimpleNamespace(columns=width, rht_true_columns=width, rht_block_size=128)
     return hidden, scale, bias, signs, spec
+
+
+def preparation_for_mode(mode, native):
+    from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
+
+    if mode not in PREPARATION_MODES:
+        raise ValueError(f"Unsupported activation preparation mode {mode}")
+    options = {"fuse_sign": mode != "rowwise_packed", "native_ops": native}
+    if mode in STRIDED_PREPARATION_MODES:
+        options.update(strided_sign=True, direct_output=mode == "sign_fused_direct")
+    return PackedRowwiseVQ2A8Preparation(**options)
+
+
+def require_mode_abis(native, modes):
+    """Fail closed without probing new symbols for the old perf3 modes."""
+
+    version = native.activation_preparation_version()
+    if type(version) is not int or version != 1:
+        raise ValueError(f"Activation-sign ABI mismatch: {version!r}")
+    versions = {"activation_preparation": version}
+    if any(mode in STRIDED_PREPARATION_MODES for mode in modes):
+        try:
+            version = native.activation_sign_strided_version()
+        except (AttributeError, RuntimeError) as error:
+            raise ValueError(
+                "Selected strided/direct preparation requires a rebuilt strided-sign ABI; no fallback"
+            ) from error
+        if type(version) is not int or version != 1:
+            raise ValueError(f"Strided activation-sign ABI mismatch: {version!r}")
+        versions["activation_sign_strided"] = version
+    return versions
+
+
+def input_layout_values(device, width, groups, dtype, layout):
+    import torch
+
+    values = list(fixture(device, width, groups, dtype={"bf16": torch.bfloat16, "fp32": torch.float32}[dtype]))
+    if layout == "expanded":
+        owner = values[0][:1].clone()
+        values[0] = owner.expand(groups, -1)
+    elif layout == "padded":
+        owner = torch.full((groups, width + 2 * PAD_COLUMNS), 19, dtype=values[0].dtype, device=device)
+        values[0] = owner[:, PAD_COLUMNS : PAD_COLUMNS + width].copy_(values[0])
+    elif layout == "contiguous":
+        owner = values[0]
+    else:
+        raise ValueError(f"Unknown input layout {layout}")
+    return values, owner
+
+
+def extended_numeric_cases(modes):
+    return [
+        (f"{mode}_k{width}_g{groups}_{dtype}_{layout}", mode, width, groups, dtype, layout)
+        for width in (2048, 4096)
+        for groups in range(1, 7)
+        for dtype in INPUT_DTYPES
+        for layout in INPUT_LAYOUTS
+        for mode in modes
+        if mode in STRIDED_PREPARATION_MODES
+    ]
+
+
+def bf16_boundary_cases(modes):
+    return [
+        (f"{mode}_k{width}_g6_bf16_{layout}_{boundary}", mode, width, layout, boundary)
+        for width in (2048, 4096)
+        for layout in INPUT_LAYOUTS
+        for boundary in BF16_BOUNDARIES
+        for mode in modes
+        if mode in STRIDED_PREPARATION_MODES
+    ]
+
+
+def bf16_boundary_pattern(boundary):
+    import torch
+
+    # Build exact BF16 bits on the CPU, so CPU arithmetic/flush-to-zero policy
+    # cannot erase the subnormal input before the device conversion is tested.
+    # 0x0080 is finfo(BF16).tiny; 0x0001 is tiny / 128.
+    patterns = {
+        "tiny": (0x0080, 0x8080),
+        "subnormal_min": (0x0001, 0x8001),
+        "signed_zero": (0x0000, 0x8000),
+        "boundary_mixed": (0x0000, 0x8000, 0x0001, 0x8001, 0x007F, 0x807F, 0x0080, 0x8080, 0x0081, 0x8081),
+    }
+    return torch.tensor(patterns[boundary], dtype=torch.uint16).view(torch.bfloat16)
+
+
+def check_native_sign_boundary(native, values, name):
+    """Compare the signed FP32 intermediate before FP8 can hide a mismatch."""
+
+    hidden, scale, bias, signs, _ = values
+    actual, actual_valid = native.activation_sign_strided(hidden, scale, bias, signs)
+    expected, expected_valid = native.activation_sign(hidden.float().contiguous(), scale, bias, signs)
+    assert_bits(actual, expected, f"{name}_signed_fp32")
+    assert_bits(actual_valid, expected_valid, f"{name}_native_validity")
+
+
+def run_bf16_boundary_checks(device, native, stage, modes):
+    import torch
+
+    completed = []
+    for name, mode, width, layout, boundary in bf16_boundary_cases(modes):
+        with stage(name):
+            values, owner = input_layout_values(device, width, 6, "bf16", layout)
+            pattern = bf16_boundary_pattern(boundary)
+            row = pattern.repeat((width + pattern.numel() - 1) // pattern.numel())[:width]
+            target = owner if layout == "expanded" else values[0]
+            target.copy_(row.expand(target.shape[0], -1).contiguous().to(device))
+            # Check raw copied BF16 bits as well, including the sign of zero.
+            assert_bits(values[0].contiguous(), row.expand(6, -1).contiguous(), f"{name}_input_bits")
+            check_native_sign_boundary(native, values, name)
+            flags = []
+            outputs = preparation_for_mode(mode, native).packed(*values, validity=flags.append)
+            torch.npu.synchronize()
+            if len(flags) != 1 or not bool(flags[0]):
+                raise AssertionError(f"{name} rejected finite boundary input")
+            check_outputs(outputs, reference(values), name)
+        completed.append(name)
+    return completed
 
 
 def reference(values):
@@ -125,40 +259,54 @@ def check_outputs(actual, expected, name):
         assert_bits(got, want, f"{name}_{field}")
 
 
-def expected_numeric_results():
+def expected_numeric_results(modes=DEFAULT_PREPARATION_MODES):
     results = []
     for width in (2048, 4096):
         for groups in range(1, 7):
-            for mode in ("rowwise_packed", "sign_fused"):
+            for mode in modes:
                 results.append(f"{mode}_k{width}_g{groups}_random")
         for case in ("zero", "tiny", "impulse", "expanded"):
-            for mode in ("rowwise_packed", "sign_fused"):
+            for mode in modes:
                 results.append(f"{mode}_k{width}_g6_{case}")
-    return results
+    return (
+        results + [case[0] for case in extended_numeric_cases(modes)] + [case[0] for case in bf16_boundary_cases(modes)]
+    )
 
 
-def expected_graph_results():
-    return [
-        f"{mode}_k{width}_{layout}"
-        for width in (2048, 4096)
-        for layout in ("contiguous", "expanded")
-        for mode in ("rowwise_packed", "sign_fused")
-    ]
+def graph_cases(modes=DEFAULT_PREPARATION_MODES):
+    cases = []
+    for width in (2048, 4096):
+        cases.extend(
+            (f"{mode}_k{width}_{layout}", mode, width, "bf16", layout)
+            for layout in ("contiguous", "expanded")
+            for mode in modes
+            if mode in DEFAULT_PREPARATION_MODES
+        )
+        cases.extend(
+            (f"{mode}_k{width}_{dtype}_{layout}", mode, width, dtype, layout)
+            for dtype in INPUT_DTYPES
+            for layout in INPUT_LAYOUTS
+            for mode in modes
+            if mode in STRIDED_PREPARATION_MODES
+        )
+    return cases
 
 
-def run_numeric_checks(device, native, stage):
+def expected_graph_results(modes=DEFAULT_PREPARATION_MODES):
+    return [case[0] for case in graph_cases(modes)]
+
+
+def run_numeric_checks(device, native, stage, modes=DEFAULT_PREPARATION_MODES):
     import torch
-
-    from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
 
     completed = []
     for width in (2048, 4096):
         for groups in range(1, 7):
             values = fixture(device, width, groups)
-            for mode, fuse_sign in (("rowwise_packed", False), ("sign_fused", True)):
+            for mode in modes:
                 name = f"{mode}_k{width}_g{groups}_random"
                 with stage(name):
-                    preparation = PackedRowwiseVQ2A8Preparation(fuse_sign=fuse_sign, native_ops=native)
+                    preparation = preparation_for_mode(mode, native)
                     flags = []
                     actual = preparation.packed(*values, validity=flags.append)
                     torch.npu.synchronize()
@@ -177,10 +325,10 @@ def run_numeric_checks(device, native, stage):
                 values[0][:, -1] = -1
             else:
                 values[0] = values[0][:1].expand(6, -1)
-            for mode, fuse_sign in (("rowwise_packed", False), ("sign_fused", True)):
+            for mode in modes:
                 name = f"{mode}_k{width}_g6_{case}"
                 with stage(name):
-                    preparation = PackedRowwiseVQ2A8Preparation(fuse_sign=fuse_sign, native_ops=native)
+                    preparation = preparation_for_mode(mode, native)
                     flags = []
                     actual = preparation.packed(*values, validity=flags.append)
                     torch.npu.synchronize()
@@ -188,32 +336,41 @@ def run_numeric_checks(device, native, stage):
                         raise AssertionError(f"{name} rejected finite input")
                     check_outputs(actual, reference(values), name)
                 completed.append(name)
+    for name, mode, width, groups, dtype, layout in extended_numeric_cases(modes):
+        with stage(name):
+            values, owner = input_layout_values(device, width, groups, dtype, layout)
+            before = owner.clone()
+            flags = []
+            actual = preparation_for_mode(mode, native).packed(*values, validity=flags.append)
+            torch.npu.synchronize()
+            if len(flags) != 1 or not bool(flags[0]):
+                raise AssertionError(f"{name} rejected finite input")
+            check_outputs(actual, reference(values), name)
+            assert_bits(owner, before, f"{name}_input_storage_unchanged")
+        completed.append(name)
+    completed.extend(run_bf16_boundary_checks(device, native, stage, modes))
     return completed
 
 
-def run_invalid_checks(device, native, stage):
+def run_invalid_checks(device, native, stage, modes=DEFAULT_PREPARATION_MODES):
     import torch
 
-    from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
-
     with stage("invalid_values"):
-        for fuse_sign in (False, True):
+        for mode in modes:
             for field, bad in ((0, float("nan")), (1, float("inf")), (2, -float("inf")), (3, 0)):
                 values = list(fixture(device, 2048, 6))
                 values[field].view(-1)[-1] = bad
                 flags = []
-                preparation = PackedRowwiseVQ2A8Preparation(fuse_sign=fuse_sign, native_ops=native)
+                preparation = preparation_for_mode(mode, native)
                 preparation.packed(*values, validity=flags.append)
                 torch.npu.synchronize()
                 if len(flags) != 1 or bool(flags[0]):
-                    raise AssertionError(f"mode={fuse_sign} accepted invalid field {field}")
+                    raise AssertionError(f"mode={mode} accepted invalid field {field}")
     return True
 
 
-def run_graph_checks(device, native, stage):
+def run_graph_checks(device, native, stage, modes=DEFAULT_PREPARATION_MODES):
     import torch
-
-    from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
 
     completed = []
     cases = (
@@ -229,65 +386,109 @@ def run_graph_checks(device, native, stage):
         ("recovered_sign", None, None, True),
     )
     for width in (2048, 4096):
-        for expanded in (False, True):
-            for mode, fuse_sign in (("rowwise_packed", False), ("sign_fused", True)):
-                layout = "expanded" if expanded else "contiguous"
-                graph_name = f"{mode}_k{width}_{layout}"
-                with stage(f"graph_prepare_{graph_name}"):
-                    values = list(fixture(device, width, 6))
-                    hidden_owner = values[0]
-                    if expanded:
-                        hidden_owner = values[0][:1].clone()
-                        values[0] = hidden_owner.expand(6, -1)
-                    flags = []
-                    preparation = PackedRowwiseVQ2A8Preparation(fuse_sign=fuse_sign, native_ops=native)
-                    preparation.prepare_for_graph(device, values[-1].rht_block_size)
-                    for _ in range(2):
-                        preparation.packed(*values, validity=flags.append)
-                    torch.npu.synchronize()
-                    flags.clear()
-                    graph = torch.npu.NPUGraph()
-                    with torch.npu.graph(graph):
-                        outputs = preparation.packed(*values, validity=flags.append)
-                    captured_flag = flags[-1]
-                try:
-                    for case, target, bad, expected_valid in cases:
-                        with stage(f"graph_replay_{graph_name}_{case}"):
-                            hidden_owner.fill_(-0.25)
-                            values[1].fill_(1.0)
-                            values[2].fill_(0.125)
-                            values[3].fill_(1)
-                            targets = {
-                                "hidden": hidden_owner,
-                                "scale": values[1],
-                                "bias": values[2],
-                                "signs": values[3],
-                            }
-                            if target is not None:
-                                targets[target].view(-1)[-1] = bad
-                            graph.replay()
-                            torch.npu.synchronize()
-                            if bool(captured_flag) != expected_valid:
-                                raise AssertionError(f"{graph_name} replayed stale validity for {case}")
-                            if expected_valid:
-                                check_outputs(outputs, reference(values), f"{graph_name}_{case}")
-                    completed.append(graph_name)
-                finally:
-                    torch.npu.synchronize()
-                    graph.reset()
+        for graph_name, mode, case_width, dtype, layout in graph_cases(modes):
+            if case_width != width:
+                continue
+            with stage(f"graph_prepare_{graph_name}"):
+                values, hidden_owner = input_layout_values(device, width, 6, dtype, layout)
+                flags = []
+                preparation = preparation_for_mode(mode, native)
+                preparation.prepare_for_graph(device, values[-1].rht_block_size)
+                for _ in range(2):
+                    preparation.packed(*values, validity=flags.append)
+                torch.npu.synchronize()
+                flags.clear()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    outputs = preparation.packed(*values, validity=flags.append)
+                captured_flag = flags[-1]
+            try:
+                for case, target, bad, expected_valid in cases:
+                    with stage(f"graph_replay_{graph_name}_{case}"):
+                        hidden_owner.fill_(-0.25)
+                        values[1].fill_(1.0)
+                        values[2].fill_(0.125)
+                        values[3].fill_(1)
+                        targets = {
+                            # Expanded rows share the owner; padded rows need
+                            # a logical element, not the padding sentinel.
+                            "hidden": hidden_owner if layout == "expanded" else values[0],
+                            "scale": values[1],
+                            "bias": values[2],
+                            "signs": values[3],
+                        }
+                        if target is not None:
+                            targets[target][-1, -1] = bad
+                        graph.replay()
+                        torch.npu.synchronize()
+                        if bool(captured_flag) != expected_valid:
+                            raise AssertionError(f"{graph_name} replayed stale validity for {case}")
+                        if expected_valid:
+                            check_outputs(outputs, reference(values), f"{graph_name}_{case}")
+                completed.append(graph_name)
+            finally:
+                torch.npu.synchronize()
+                graph.reset()
     return completed
 
 
-def run_queue_checks(device, native, stage):
+def queue_input_cases(modes):
+    return [
+        (f"{mode}_k{width}_{dtype}_{layout}", mode, width, dtype, layout)
+        for mode in modes
+        if mode in STRIDED_PREPARATION_MODES
+        for width in (2048, 4096)
+        for dtype in INPUT_DTYPES
+        for layout in INPUT_LAYOUTS
+    ]
+
+
+def run_strided_queue_case(device, native, stage, case):
     import torch
 
-    from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
+    name, mode, width, dtype, layout = case
+    with stage(f"queue_lifetime_{name}"):
+        template, template_owner = input_layout_values(device, width, 6, dtype, layout)
+        preparation = preparation_for_mode(mode, native)
+        expected_first = reference(template)
+        flags = []
+        first = preparation.packed(*template, validity=flags.append)
+        first_valid = flags[-1]
+        for iteration in range(QUEUE_ITERATIONS):
+            owner = template_owner.clone()
+            if layout == "expanded":
+                hidden = owner.expand(6, -1)
+            elif layout == "padded":
+                hidden = owner[:, PAD_COLUMNS : PAD_COLUMNS + width]
+            else:
+                hidden = owner
+            hidden.fill_((iteration % 7 - 3) / 8)
+            values = [hidden, *(value.clone() for value in template[1:4]), template[4]]
+            flags.clear()
+            output = preparation.packed(*values, validity=flags.append)
+            # Device work must not rely on these Python owners remaining alive.
+            del values, hidden, owner
+        final_valid = flags[-1]
+        output_finite = torch.stack([torch.isfinite(value.float()).all() for value in output]).all()
+        torch.npu.synchronize()
+        if not bool(first_valid & final_valid & output_finite):
+            raise AssertionError(f"{name} queue-lifetime validity failed")
+        check_outputs(first, expected_first, f"{name}_retained")
+        template_owner.fill_(((QUEUE_ITERATIONS - 1) % 7 - 3) / 8)
+        check_outputs(output, reference(template), f"{name}_final")
+    return name
+
+
+def run_queue_checks(device, native, stage, modes=DEFAULT_PREPARATION_MODES):
+    import torch
 
     completed = []
-    for mode, fuse_sign in (("rowwise_packed", False), ("sign_fused", True)):
+    for mode in modes:
+        if mode in STRIDED_PREPARATION_MODES:
+            continue
         with stage(f"queue_lifetime_{mode}"):
             values = list(fixture(device, 2048, 6))
-            preparation = PackedRowwiseVQ2A8Preparation(fuse_sign=fuse_sign, native_ops=native)
+            preparation = preparation_for_mode(mode, native)
             flags = []
             first = tuple(value.clone() for value in preparation.packed(*values, validity=flags.append))
             first_valid = flags[-1]
@@ -303,10 +504,14 @@ def run_queue_checks(device, native, stage):
             check_outputs(first, reference(fixture(device, 2048, 6)), f"{mode}_retained")
             check_outputs(output, reference(values), f"{mode}_final")
         completed.append(mode)
-    return {"modes": completed, "iterations": QUEUE_ITERATIONS, "explicit_per_iteration_sync": False}
+    input_cases = [run_strided_queue_case(device, native, stage, case) for case in queue_input_cases(modes)]
+    evidence = {"modes": list(modes), "iterations": QUEUE_ITERATIONS, "explicit_per_iteration_sync": False}
+    if input_cases:
+        evidence.update(input_cases=input_cases, input_owners_dropped_before_fence=True, retained_outputs_checked=True)
+    return evidence
 
 
-def validate_child_evidence(result, *, queue_lifetime):
+def validate_child_evidence(result, *, queue_lifetime, modes=DEFAULT_PREPARATION_MODES):
     """Reject a successful exit unless its final event proves every gate."""
 
     if result.get("status") != "PASS":
@@ -326,24 +531,40 @@ def validate_child_evidence(result, *, queue_lifetime):
         or not isinstance(results, dict)
         or set(results) != required
         or results.get("invalid") is not True
-        or results.get("numeric") != expected_numeric_results()
-        or results.get("graph") != expected_graph_results()
+        or results.get("numeric") != expected_numeric_results(modes)
+        or results.get("graph") != expected_graph_results(modes)
         or not isinstance(library, dict)
         or not library.get("path")
         or len(library.get("sha256", "")) != 64
     ):
         raise ValueError("Incomplete or spoofed child evidence")
+    if any(mode in STRIDED_PREPARATION_MODES for mode in modes):
+        native_abis = final.get("native_abis")
+        if (
+            final.get("preparation_modes") != list(modes)
+            or not isinstance(native_abis, dict)
+            or native_abis != {"activation_preparation": 1, "activation_sign_strided": 1}
+            or any(type(version) is not int for version in native_abis.values())
+        ):
+            raise ValueError("Incomplete selected-mode or strided ABI evidence")
     if queue_lifetime:
         lifetime = results["queue_lifetime"]
         if (
             not isinstance(lifetime, dict)
-            or lifetime.get("modes") != ["rowwise_packed", "sign_fused"]
+            or lifetime.get("modes") != list(modes)
             or lifetime.get("iterations") != QUEUE_ITERATIONS
             or lifetime.get("explicit_per_iteration_sync") is not False
             or lifetime.get("requires_runtime_task_queue_enabled") is not True
             or lifetime.get("task_queue_enable") not in ("1", "2")
         ):
             raise ValueError("Incomplete queue-lifetime child evidence")
+        expected_cases = [case[0] for case in queue_input_cases(modes)]
+        if expected_cases and (
+            lifetime.get("input_cases") != expected_cases
+            or lifetime.get("input_owners_dropped_before_fence") is not True
+            or lifetime.get("retained_outputs_checked") is not True
+        ):
+            raise ValueError("Incomplete strided queue-lifetime input coverage")
     return final
 
 
@@ -381,17 +602,23 @@ def run_case_child(args):
             identity = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
             torch.ops.load_library(str(path))
             native = torch.ops.vq2a8_ascendc_v4_v2
-            if native.activation_preparation_version() != 1:
-                raise ValueError("Activation-sign ABI mismatch")
-            emit(CASE, "INFO", library=identity, device=info)
+            native_abis = require_mode_abis(native, args.preparation_modes)
+            emit(
+                CASE,
+                "INFO",
+                library=identity,
+                device=info,
+                preparation_modes=args.preparation_modes,
+                native_abis=native_abis,
+            )
         with torch.inference_mode():
             results = {
-                "numeric": run_numeric_checks(device, native, stage),
-                "invalid": run_invalid_checks(device, native, stage),
-                "graph": run_graph_checks(device, native, stage),
+                "numeric": run_numeric_checks(device, native, stage, args.preparation_modes),
+                "invalid": run_invalid_checks(device, native, stage, args.preparation_modes),
+                "graph": run_graph_checks(device, native, stage, args.preparation_modes),
             }
             if args.queue_lifetime:
-                results["queue_lifetime"] = run_queue_checks(device, native, stage)
+                results["queue_lifetime"] = run_queue_checks(device, native, stage, args.preparation_modes)
                 results["queue_lifetime"].update(
                     task_queue_enable=task_queue_enable,
                     requires_runtime_task_queue_enabled=True,
@@ -403,6 +630,8 @@ def run_case_child(args):
             "CASE_PASS",
             results=results,
             library=identity,
+            preparation_modes=list(args.preparation_modes),
+            native_abis=native_abis,
             device_execution_verified=True,
             graph_verified=True,
             model_integration_verified=False,
@@ -424,6 +653,8 @@ def main(argv=None):
     report = {
         "scope": "packed_m1_activation_only",
         "command": child_command(args),
+        "preparation_modes": list(args.preparation_modes),
+        "requires_strided_sign_abi": any(mode in STRIDED_PREPARATION_MODES for mode in args.preparation_modes),
         "status": "PLANNED",
         "device_execution_verified": False,
         "graph_verified": False,
@@ -459,7 +690,7 @@ def main(argv=None):
             report.update(status=result["status"], result=result)
             if result["status"] == "PASS":
                 try:
-                    validate_child_evidence(result, queue_lifetime=args.queue_lifetime)
+                    validate_child_evidence(result, queue_lifetime=args.queue_lifetime, modes=args.preparation_modes)
                 except ValueError as error:
                     report.update(status="FAIL", error=str(error))
                 else:

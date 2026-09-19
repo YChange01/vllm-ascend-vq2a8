@@ -65,13 +65,19 @@ def require_v4_v2_features(reorder="scalar", preparation="rowwise", *, native_op
         "rowwise",
         "rowwise_packed",
         "sign_fused",
+        "sign_fused_strided",
+        "sign_fused_direct",
         "fused",
     ):
         raise ValueError("Invalid V4 v2 activation options.")
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
         (reorder == "vectorized", "activation_reorder_version"),
-        (preparation in ("fused", "sign_fused"), "activation_preparation_version"),
+        (
+            preparation in ("fused", "sign_fused", "sign_fused_strided", "sign_fused_direct"),
+            "activation_preparation_version",
+        ),
+        (preparation in ("sign_fused_strided", "sign_fused_direct"), "activation_sign_strided_version"),
     ):
         if selected:
             try:
@@ -204,19 +210,35 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     def __init__(self, *args, v4_activation_reorder="scalar", v4_activation_preparation="rowwise", **kwargs):
         if v4_activation_reorder not in ("scalar", "vectorized"):
             raise ValueError("V4 v2 activation reorder requires scalar|vectorized.")
-        if v4_activation_preparation not in ("rowwise", "rowwise_packed", "sign_fused", "fused"):
-            raise ValueError("V4 v2 activation preparation requires rowwise|rowwise_packed|sign_fused|fused.")
+        if v4_activation_preparation not in (
+            "rowwise",
+            "rowwise_packed",
+            "sign_fused",
+            "sign_fused_strided",
+            "sign_fused_direct",
+            "fused",
+        ):
+            raise ValueError("Invalid V4 v2 activation preparation mode.")
         self.v4_activation_reorder = v4_activation_reorder
         self.v4_activation_preparation = v4_activation_preparation
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
     def make_v4_preparation(self, *, compact=False, validity=None):
-        if self.v4_activation_preparation in ("rowwise_packed", "sign_fused"):
+        if self.v4_activation_preparation in (
+            "rowwise_packed",
+            "sign_fused",
+            "sign_fused_strided",
+            "sign_fused_direct",
+        ):
             from vllm_ascend.quantization.vq2a8_activation_packed import PackedRowwiseVQ2A8Preparation
 
             return PackedRowwiseVQ2A8Preparation(
-                compact=compact, validity=validity, fuse_sign=self.v4_activation_preparation == "sign_fused"
+                compact=compact,
+                validity=validity,
+                fuse_sign=self.v4_activation_preparation != "rowwise_packed",
+                strided_sign=self.v4_activation_preparation in ("sign_fused_strided", "sign_fused_direct"),
+                direct_output=self.v4_activation_preparation == "sign_fused_direct",
             )
         if self.v4_activation_preparation == "fused":
             from vllm_ascend.quantization.vq2a8_activation_fused import FusedV4V2Preparation

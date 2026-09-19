@@ -178,7 +178,7 @@ def test_native_fusion_retains_queue_owners_and_device_checks():
     binding = (root / "activation_binding.cpp").read_text()
     kernel = (root / "activation_kernel.cpp").read_text()
     assert "RunOpApiV2" not in binding
-    assert binding.count("const auto launchStream = stream.stream();") == 2
+    assert binding.count("const auto launchStream = stream.stream();") == 3
     assert "[launchStream, blocks, x, weightScale, weightBias, signs, output, valid, rows, width]" in binding
     assert "[launchStream, blocks, rotated, weightScale, rowBias, quantized, scale, valid, rows, width]" in binding
     assert "recordStream(tensor.storage().data_ptr(), stream)" in binding

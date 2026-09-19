@@ -16,6 +16,7 @@ from tools.validate_vq2a8_v4_decoder_graph import CASES, compare_outputs, parse_
 from vllm_ascend.quantization.vq2a8_v4_decoder_graph import (
     DecoderMetadataBuffers,
     DecoderStateSnapshot,
+    FastPlannedDecoderMetadataBuffers,
     PlannedDecoderMetadataBuffers,
     V4DecoderGraphBank,
     decode_position,
@@ -77,7 +78,9 @@ def test_position_requires_consistent_cpu_metadata_and_range():
         decode_position(mixed, 16)
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_metadata_clones_owners_rejects_constants_and_unknown_backend_fields(buffers):
     source = metadata()
     owner = buffers(source)
@@ -90,7 +93,9 @@ def test_metadata_clones_owners_rejects_constants_and_unknown_backend_fields(buf
         buffers({"future_event": object()})
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_immutable_rope_owner_is_not_copied_and_replacement_is_rejected(buffers):
     @dataclass
     class Rotary:
@@ -104,7 +109,9 @@ def test_immutable_rope_owner_is_not_copied_and_replacement_is_rejected(buffers)
         owner.update(Rotary(tensor.clone()))
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_changed_alias_topology_is_rejected_before_copy(buffers):
     tensor = torch.tensor([1])
     owner = buffers({"x": tensor, "y": tensor})
@@ -114,7 +121,9 @@ def test_changed_alias_topology_is_rejected_before_copy(buffers):
     owner.update({"x": tensor, "y": tensor})
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_explicit_rope_proxy_retains_layer_lookup_and_rejects_selector_change(buffers):
     # Load the actual backend proxy class without its torch_npu imports.
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/ops/rope_dsv4.py"
@@ -149,7 +158,9 @@ def device_metadata(value):
     return torch.Tensor._make_subclass(MetadataDeviceTensor, torch.tensor(value), False)
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_metadata_checks_complete_before_any_copy_and_refreshes_each_request(buffers):
     source = {"dynamic": device_metadata([1]), "constant": 3}
     owner = buffers(source)
@@ -169,7 +180,9 @@ def test_metadata_checks_complete_before_any_copy_and_refreshes_each_request(buf
     assert target.tolist() == [99] and owner.copies == 4
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 def test_metadata_alias_divergence_rejected_before_device_copy(buffers):
     tensor = device_metadata([1])
     owner = buffers({"x": tensor, "y": tensor})
@@ -181,7 +194,9 @@ def test_metadata_alias_divergence_rejected_before_device_copy(buffers):
     assert owner.tree["x"].tolist() == [7] and owner.copies == 1
 
 
-@pytest.mark.parametrize("buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers))
+@pytest.mark.parametrize(
+    "buffers", (DecoderMetadataBuffers, PlannedDecoderMetadataBuffers, FastPlannedDecoderMetadataBuffers)
+)
 @pytest.mark.parametrize(
     "replacement,match",
     (
@@ -375,7 +390,7 @@ def make_bank(metadata_mode="recursive"):
     return bank, backend, cache, context
 
 
-@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned", "planned_fast"))
 def test_capture_restores_state_and_replay_refreshes_token_outputs_validity_and_escapes(metadata_mode):
     bank, backend, cache, context = make_bank(metadata_mode)
     assert torch.equal(cache, torch.tensor([99.0]))
@@ -389,7 +404,11 @@ def test_capture_restores_state_and_replay_refreshes_token_outputs_validity_and_
     assert first.data_ptr() != invalid.data_ptr() != last.data_ptr()
     assert context.attn_metadata["layer"].decode.seq_lens_list == [4]
     assert backend.capturing is None
-    expected = PlannedDecoderMetadataBuffers if metadata_mode == "planned" else DecoderMetadataBuffers
+    expected = {
+        "recursive": DecoderMetadataBuffers,
+        "planned": PlannedDecoderMetadataBuffers,
+        "planned_fast": FastPlannedDecoderMetadataBuffers,
+    }[metadata_mode]
     assert type(bank.entries[3]["metadata"]) is expected
     assert bank.report()["metadata_mode"] == metadata_mode
 
@@ -399,7 +418,7 @@ def test_decoder_bank_rejects_unknown_metadata_mode():
         V4DecoderGraphBank(object(), 16, backend=Backend(), metadata_mode="unsafe")
 
 
-@pytest.mark.parametrize("metadata_mode", ("recursive", "planned"))
+@pytest.mark.parametrize("metadata_mode", ("recursive", "planned", "planned_fast"))
 def test_host_ranges_cover_replay_without_fences_or_changing_results(metadata_mode):
     from vllm_ascend.quantization.vq2a8_host_profile import HostProfileRecorder
 
