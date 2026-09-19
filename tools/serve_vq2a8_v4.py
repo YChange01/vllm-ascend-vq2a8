@@ -63,6 +63,7 @@ def parse_args(argv=None):
     parser.add_argument("--select-sign", choices=("separate", "fused"), default="separate")
     parser.add_argument("--activation-tail", choices=("torch", "fused_reorder"), default="torch")
     parser.add_argument("--b1-schedule", choices=("baseline", "tile_major"), default="baseline")
+    parser.add_argument("--swiglu-mode", choices=("torch", "fused_select_sign"), default="torch")
     parser.add_argument(
         "--route-mapping",
         choices=("torch", "fused"),
@@ -123,6 +124,21 @@ def parse_args(argv=None):
         help="Opt-in torch-NPU profiler export directory, controlled by /start_profile and /stop_profile",
     )
     args = parser.parse_args(argv)
+    if args.swiglu_mode != "torch":
+        # Keep this launcher standard-library-only; the worker repeats the gate.
+        if args.compute_backend != "v2" or not args.device_route_decode or args.decode_graph != "decoder":
+            parser.error("Fused SwiGLU/select/sign requires V4 v2 device-route decoder graphs.")
+        if (
+            args.select_sign != "fused"
+            or args.activation_preparation != "sign_fused_direct"
+            or args.activation_tail != "torch"
+            or args.activation_reorder != "vectorized"
+            or args.b1_schedule != "baseline"
+        ):
+            parser.error(
+                "Fused SwiGLU/select/sign requires fused select/sign, sign_fused_direct preparation, "
+                "Torch tail, vectorized reorder and baseline B1 schedule."
+            )
     if args.b1_schedule != "baseline" or args.activation_reorder in ("chunk_reuse2", "chunk_reuse4"):
         # This launcher deliberately imports only the standard library.
         # The worker repeats these contracts before loading the artifact.
@@ -251,6 +267,7 @@ def build_command(args):
         ("select_sign", "separate"),
         ("activation_tail", "torch"),
         ("b1_schedule", "baseline"),
+        ("swiglu_mode", "torch"),
     ):
         if getattr(args, name) != default:
             additional["vq2a8_offline"]["v4_" + name] = getattr(args, name)
@@ -380,7 +397,7 @@ def main(argv=None):
                 f"route_mapping={args.route_mapping}, "
                 f"runtime_guard={args.runtime_guard}, select_sign={args.select_sign}, "
                 f"activation_tail={args.activation_tail}, decoder_input_mode={args.decoder_input_mode}, "
-                f"b1_schedule={args.b1_schedule}, "
+                f"b1_schedule={args.b1_schedule}, swiglu_mode={args.swiglu_mode}, "
                 f"host_profile={args.host_profile}. "
                 "Confirm this card is available; no other jobs are stopped.",
                 flush=True,

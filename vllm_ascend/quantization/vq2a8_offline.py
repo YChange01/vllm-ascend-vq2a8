@@ -122,6 +122,7 @@ def offline_engine_options(
     v4_select_sign="separate",
     v4_activation_tail="torch",
     v4_b1_schedule="baseline",
+    v4_swiglu_mode="torch",
     v4_decoder_metadata_mode="recursive",
     v4_decoder_input_mode="general",
     v4_host_profile=False,
@@ -144,6 +145,7 @@ def offline_engine_options(
         v4_activation_tail,
         decoder_input_mode=v4_decoder_input_mode,
         b1_schedule=v4_b1_schedule,
+        swiglu_mode=v4_swiglu_mode,
         backend=v4_compute_backend,
         policy=execution_policy,
         preparation=v4_activation_preparation,
@@ -251,6 +253,7 @@ def offline_engine_options(
                 **({"v4_select_sign": v4_select_sign} if v4_select_sign != "separate" else {}),
                 **({"v4_activation_tail": v4_activation_tail} if v4_activation_tail != "torch" else {}),
                 **({"v4_b1_schedule": v4_b1_schedule} if v4_b1_schedule != "baseline" else {}),
+                **({"v4_swiglu_mode": v4_swiglu_mode} if v4_swiglu_mode != "torch" else {}),
                 **({"v4_decoder_input_mode": v4_decoder_input_mode} if v4_decoder_input_mode != "general" else {}),
                 **(
                     {"v4_decoder_metadata_mode": v4_decoder_metadata_mode}
@@ -324,6 +327,7 @@ def validate_offline_config(config) -> dict:
         "v4_select_sign",
         "v4_activation_tail",
         "v4_b1_schedule",
+        "v4_swiglu_mode",
         "v4_decoder_metadata_mode",
         "v4_decoder_input_mode",
         "v4_host_profile",
@@ -415,6 +419,7 @@ def validate_offline_config(config) -> dict:
         options.get("v4_activation_tail", "torch"),
         decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
         b1_schedule=options.get("v4_b1_schedule", "baseline"),
+        swiglu_mode=options.get("v4_swiglu_mode", "torch"),
         backend=options.get("v4_compute_backend", "v1"),
         policy=options.get("execution_policy"),
         preparation=options.get("v4_activation_preparation", "rowwise"),
@@ -452,6 +457,7 @@ def validate_offline_config(config) -> dict:
             "v4_select_sign",
             "v4_activation_tail",
             "v4_b1_schedule",
+            "v4_swiglu_mode",
         )
     ):
         raise ValueError("V4 activation options require execution_policy=ascendc_v4.")
@@ -663,6 +669,11 @@ class OfflineMoEOwner:
                         if options.get("v4_b1_schedule", "baseline") != "baseline"
                         else {}
                     ),
+                    **(
+                        {"swiglu_mode": options["v4_swiglu_mode"]}
+                        if options.get("v4_swiglu_mode", "torch") != "torch"
+                        else {}
+                    ),
                     runtime_guard=options.get("v4_runtime_guard", "signature"),
                     decoder_input_mode=options.get("v4_decoder_input_mode", "general"),
                 )
@@ -803,6 +814,11 @@ class OfflineMoEOwner:
                         **(
                             {"v4_b1_schedule": self.options["v4_b1_schedule"]}
                             if self.options.get("v4_b1_schedule", "baseline") != "baseline"
+                            else {}
+                        ),
+                        **(
+                            {"v4_swiglu_mode": self.options["v4_swiglu_mode"]}
+                            if self.options.get("v4_swiglu_mode", "torch") != "torch"
                             else {}
                         ),
                     }

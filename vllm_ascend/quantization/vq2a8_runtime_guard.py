@@ -21,6 +21,7 @@ RUNTIME_FIELDS = (
     ("v4_route_mapping", "torch"),
     ("v4_select_sign", "separate"),
     ("v4_activation_tail", "torch"),
+    ("v4_swiglu_mode", "torch"),
     ("v4_runtime_guard", "signature"),
 )
 CONFIG_FIELDS = ("top_k", "hidden_size", "num_shared", "renormalize", "routed_scale", "swiglu_limit")

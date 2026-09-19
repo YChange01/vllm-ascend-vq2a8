@@ -42,6 +42,7 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         strided_sign=False,
         direct_output=False,
         fuse_select=False,
+        fuse_swiglu=False,
     ):
         super().__init__(compact=compact, validity=validity)
         if (strided_sign and not fuse_sign) or (direct_output and not strided_sign):
@@ -50,12 +51,19 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
         self.strided_sign = strided_sign
         self.direct_output = direct_output
         self._select_sign = None
+        self._swiglu_select_sign = None
+        if fuse_swiglu and not fuse_select:
+            raise ValueError("SwiGLU fusion requires explicit resident select/sign fusion.")
         if fuse_select:
             if not direct_output:
                 raise ValueError("Resident select/sign fusion requires direct strided preparation.")
             from vllm_ascend.quantization.vq2a8_select_sign import FusedSelectSign
 
             self._select_sign = FusedSelectSign(native_ops=native_ops)
+        if fuse_swiglu:
+            from vllm_ascend.quantization.vq2a8_select_sign import FusedSwigluSelectSign
+
+            self._swiglu_select_sign = FusedSwigluSelectSign(native_ops=native_ops)
         self._sign = None
         if not fuse_sign:
             return
@@ -189,6 +197,35 @@ class PackedRowwiseVQ2A8Preparation(RowwiseVQ2A8Preparation):
             return normalized.contiguous(), scale.contiguous(), bias.contiguous()
         quantized = torch.clamp(normalized, -fp8_max, fp8_max).to(torch.float8_e4m3fn)
         return quantized.contiguous(), scale.contiguous(), bias.contiguous()
+
+    def packed_resident_swiglu(self, bank, gate_up, slots, spec, *, swiglu_limit, validity, raw_statuses=None):
+        """I graph-down path: keep RHT, bias GEMV and the Torch FP8 tail unchanged."""
+        if self._swiglu_select_sign is None:
+            raise ValueError("Resident SwiGLU preparation requires explicit SwiGLU/select/sign fusion.")
+        if gate_up.ndim != 2 or not 1 <= gate_up.shape[0] <= PACKED_GROUP_LIMIT:
+            raise ValueError("Resident SwiGLU preparation requires 1..6 gate/up rows.")
+        width = gate_up.shape[1] // 2
+        if (
+            gate_up.shape[1] != 2 * width
+            or width not in PACKED_WIDTHS
+            or (
+                spec.columns,
+                spec.rht_true_columns,
+                spec.rht_block_size,
+            )
+            != (width, width, 128)
+        ):
+            raise ValueError("Resident SwiGLU preparation requires unpadded K2048/4096 and RHT128.")
+        signed, weight_scale, weight_bias, select_valid, input_valid = self._swiglu_select_sign(
+            bank, gate_up, slots, swiglu_limit
+        )
+        if raw_statuses is not None:
+            raw_statuses.extend((select_valid, input_valid))
+        else:
+            validity((select_valid != 0).all())
+            validity(input_valid.all())
+        self._ensure_hadamard(gate_up.device, spec.rht_block_size)
+        return self._from_signed(signed, weight_scale, weight_bias, spec)
 
     @staticmethod
     def _check_strided_hidden(hidden):

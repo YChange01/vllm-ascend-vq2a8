@@ -71,6 +71,7 @@ def require_v4_v2_features(
     runtime_guard="signature",
     decoder_input_mode="general",
     b1_schedule="baseline",
+    swiglu_mode="torch",
     native_ops=None,
 ):
     """Check only explicitly selected native extensions before weight loading."""
@@ -99,6 +100,7 @@ def require_v4_v2_features(
         preparation=preparation,
         reorder=reorder,
         b1_schedule=b1_schedule,
+        swiglu_mode=swiglu_mode,
     )
     native = torch.ops.vq2a8_ascendc_v4_v2 if native_ops is None else native_ops
     for selected, feature in (
@@ -115,6 +117,7 @@ def require_v4_v2_features(
         (validity_mode == "fused_vectorized", "layer_validity_vectorized_version"),
         (route_mapping == "fused", "route_mapping_version"),
         (select_sign == "fused", "select_sign_version"),
+        (swiglu_mode == "fused_select_sign", "swiglu_select_sign_version"),
         (activation_tail == "fused_reorder", "activation_tail_reorder_version"),
         (runtime_guard == "native", "runtime_guard_version"),
         (decoder_input_mode == "b1_packed", "decoder_input_plan_version"),
@@ -257,6 +260,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
     v4_select_sign = "separate"
     v4_activation_tail = "torch"
     v4_b1_schedule = "baseline"
+    v4_swiglu_mode = "torch"
     residency_plan = staticmethod(v4_v2_resident_plan)
 
     def __init__(
@@ -270,6 +274,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
         v4_select_sign="separate",
         v4_activation_tail="torch",
         v4_b1_schedule="baseline",
+        v4_swiglu_mode="torch",
         **kwargs,
     ):
         if v4_activation_reorder not in ("scalar", "vectorized", "row_reuse", "chunk_reuse2", "chunk_reuse4"):
@@ -301,13 +306,17 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             preparation=v4_activation_preparation,
             reorder=v4_activation_reorder,
             b1_schedule=v4_b1_schedule,
+            swiglu_mode=v4_swiglu_mode,
         )
         self.v4_runtime_guard = v4_runtime_guard
         self.v4_select_sign = v4_select_sign
         self.v4_activation_tail = v4_activation_tail
         self.v4_b1_schedule = v4_b1_schedule
+        self.v4_swiglu_mode = v4_swiglu_mode
         self.v4_candidate_graph_build_calls = 0
         self.v4_candidate_reference_calls = 0
+        self.v4_swiglu_graph_build_calls = 0
+        self.v4_swiglu_reference_calls = 0
         super().__init__(*args, **kwargs)
         self._v2_payload_locations = {}
 
@@ -327,6 +336,7 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
                 strided_sign=self.v4_activation_preparation in ("sign_fused_strided", "sign_fused_direct"),
                 direct_output=self.v4_activation_preparation == "sign_fused_direct",
                 fuse_select=self.v4_select_sign == "fused",
+                fuse_swiglu=self.v4_swiglu_mode == "fused_select_sign",
             )
         if self.v4_activation_preparation == "fused":
             from vllm_ascend.quantization.vq2a8_activation_fused import FusedV4V2Preparation
@@ -471,6 +481,13 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
                 self.v4_activation_reorder in ("chunk_reuse2", "chunk_reuse4") or self.v4_b1_schedule != "baseline"
             ) and not hasattr(bank, "project_candidate"):
                 raise RuntimeError("Rebuild the V4 v2 library for J/K candidates; no fallback.")
+            if self.v4_swiglu_mode == "fused_select_sign":
+                try:
+                    swiglu = bank.swiglu_select_sign
+                except (AttributeError, RuntimeError) as error:
+                    raise RuntimeError("Resident bank lacks I SwiGLU select/sign; no fallback.") from error
+                if not callable(swiglu):
+                    raise RuntimeError("Resident bank lacks I SwiGLU select/sign; no fallback.")
             if bank.metadata()[3] != len(ids) * V4_V2_BANK_WORDS * 8:
                 raise RuntimeError("V4 v2 native bank metadata differs from the residency plan.")
             banks[kind] = (bank, spec)
@@ -574,6 +591,9 @@ class AscendCV4V2VQ2TP1MoE(AscendCV4VQ2TP1MoE):
             "preload_h2d_s": self.timing.get("h2d_s", 0.0),
             "activation_reorder": self.v4_activation_reorder,
             "b1_schedule": self.v4_b1_schedule,
+            "swiglu_mode": self.v4_swiglu_mode,
+            "swiglu_graph_build_calls": getattr(self, "v4_swiglu_graph_build_calls", 0),
+            "swiglu_reference_calls": getattr(self, "v4_swiglu_reference_calls", 0),
             "candidate_graph_build_calls": self.v4_candidate_graph_build_calls,
             "candidate_reference_calls": self.v4_candidate_reference_calls,
             "activation_reorder_row_reuse_scope": "m1_only_m_gt1_vectorized"

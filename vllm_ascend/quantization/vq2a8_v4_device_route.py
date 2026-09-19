@@ -493,6 +493,10 @@ class DeviceRouteDecodeState(FastMoEState):
             gate = self._project(runtime, hidden.expand(slots.numel(), -1), slots, "gate_up", raw_statuses)
         with self.scope("swiglu"):
             activation = deepseek_v4_swiglu_reference(gate, runtime.config.swiglu_limit)
+            if getattr(runtime, "v4_swiglu_mode", "torch") == "fused_select_sign":
+                # Independent eager reference, including singleton prefill.
+                # This is a host construction/execution count, not NPU timing.
+                runtime.v4_swiglu_reference_calls = getattr(runtime, "v4_swiglu_reference_calls", 0) + 1
         with self.scope("down"):
             values = self._project(runtime, activation, slots, "down", raw_statuses)
         with self.scope("mix_shared"):
@@ -521,6 +525,7 @@ class DeviceRouteGraphCompute:
     Construction is startup-only. Each projection owns a prebuilt RHT constant
     even when gate/up and down use different blocks. __call__ does not mutate
     the eager optimization state's validity, counters, or preparation cache.
+    Separate candidate graph-build counters count host calls, not replays.
     All bank/root owners remain reachable for the graph's entire lifetime.
     """
 
@@ -543,6 +548,9 @@ class DeviceRouteGraphCompute:
         self.root = dict(runtime.root)
         self.banks = dict(runtime._device_route_banks if banks is None else banks)
         self.config = runtime.config
+        self._swiglu_mode = getattr(runtime, "v4_swiglu_mode", "torch")
+        if self._swiglu_mode not in ("torch", "fused_select_sign"):
+            raise ValueError("V4 SwiGLU mode must be torch or fused_select_sign.")
         self._runtime_guard_mode = getattr(runtime, "v4_runtime_guard", "signature")
         if self._runtime_guard_mode not in RUNTIME_GUARD_MODES:
             raise ValueError("V4 runtime guard must be signature or planned or native.")
@@ -562,6 +570,7 @@ class DeviceRouteGraphCompute:
             "activation_preparation": getattr(runtime, "v4_activation_preparation", "rowwise"),
             "activation_reorder": getattr(runtime, "v4_activation_reorder", "scalar"),
             "b1_schedule": getattr(runtime, "v4_b1_schedule", "baseline"),
+            "swiglu_mode": self._swiglu_mode,
             "validity_mode": getattr(runtime, "v4_validity_mode", "torch"),
             "route_mapping": getattr(runtime, "v4_route_mapping", "torch"),
             "select_sign": getattr(runtime, "v4_select_sign", "separate"),
@@ -595,6 +604,7 @@ class DeviceRouteGraphCompute:
             getattr(runtime, "v4_activation_preparation", "rowwise"),
             getattr(runtime, "v4_activation_reorder", "scalar"),
             getattr(runtime, "v4_b1_schedule", "baseline"),
+            getattr(runtime, "v4_swiglu_mode", "torch"),
             getattr(runtime, "v4_validity_mode", "torch"),
             getattr(runtime, "v4_route_mapping", "torch"),
             getattr(runtime, "v4_select_sign", "separate"),
@@ -740,8 +750,14 @@ class DeviceRouteGraphCompute:
         slots, mapped_valid = self._route_mapping(ids, lookup)
         flags.append(mapped_valid)
         gate = self._project(hidden.expand(slots.numel(), -1), slots, "gate_up", flags.append, raw_statuses)
-        activation = deepseek_v4_swiglu_reference(gate, self.config.swiglu_limit)
-        values = self._project(activation, slots, "down", flags.append, raw_statuses)
+        if self._swiglu_mode == "fused_select_sign":
+            values = self._project_swiglu_down(gate, slots, flags.append, raw_statuses)
+            # Executed during graph build/warmup, never interpreted as one
+            # Python invocation per replay or evidence of device performance.
+            self.runtime.v4_swiglu_graph_build_calls = getattr(self.runtime, "v4_swiglu_graph_build_calls", 0) + 1
+        else:
+            activation = deepseek_v4_swiglu_reference(gate, self.config.swiglu_limit)
+            values = self._project(activation, slots, "down", flags.append, raw_statuses)
         result = (values.reshape(1, slots.numel(), hidden.shape[1]).float() * weights.unsqueeze(-1)).sum(1)
         result *= self.config.routed_scale
         if self.config.num_shared:
@@ -751,3 +767,22 @@ class DeviceRouteGraphCompute:
             return result, self._layer_validity(raw_statuses, [gate, values, result], flags)
         flags.append(torch.isfinite(result).all())
         return result, torch.stack(flags).all()
+
+    def _project_swiglu_down(self, gate_up, slots, retain, raw_statuses=None):
+        bank, spec = self.banks["down"]
+        prepared = self.preparations["down"].packed_resident_swiglu(
+            bank,
+            gate_up,
+            slots,
+            spec,
+            swiglu_limit=self.config.swiglu_limit,
+            validity=retain,
+            raw_statuses=raw_statuses,
+        )
+        project = _graph_projector(self.runtime, self.runtime.project_v4_prepared)
+        output, valid = project(bank, *prepared, slots)
+        if raw_statuses is None:
+            retain((valid != 0).all() & torch.isfinite(output).all())
+        else:
+            raw_statuses.append(valid)
+        return output

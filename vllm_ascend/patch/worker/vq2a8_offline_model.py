@@ -181,6 +181,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
         self._v4_select_sign = options.get("v4_select_sign", "separate")
         self._v4_activation_tail = options.get("v4_activation_tail", "torch")
         self._v4_b1_schedule = options.get("v4_b1_schedule", "baseline")
+        self._v4_swiglu_mode = options.get("v4_swiglu_mode", "torch")
         self._v4_device_route_decode = options.get("v4_device_route_decode", False)
         self._v4_serving_batched_ready = False
         self._v4_decode_graph = options.get("v4_decode_graph", "none")
@@ -300,6 +301,7 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             f"select_sign={getattr(self, '_v4_select_sign', 'separate')} "
             f"activation_tail={getattr(self, '_v4_activation_tail', 'torch')} "
             f"b1_schedule={getattr(self, '_v4_b1_schedule', 'baseline')} "
+            f"swiglu_mode={getattr(self, '_v4_swiglu_mode', 'torch')} "
             "expert_payload_runtime_loading=False",
             flush=True,
         )
@@ -584,6 +586,21 @@ class VQ2A8TP1OfflineForCausalLM(AscendDeepseekV4ForCausalLM):
             "select_sign": getattr(self, "_v4_select_sign", "separate"),
             "activation_tail": getattr(self, "_v4_activation_tail", "torch"),
             "b1_schedule": getattr(self, "_v4_b1_schedule", "baseline"),
+            "swiglu_mode": getattr(self, "_v4_swiglu_mode", "torch"),
+            "swiglu_candidates": {
+                "scope": "graph_build_only_eager_and_prefill_torch",
+                "eager_reference": "deepseek_v4_swiglu_reference",
+                "graph_build_calls": sum(
+                    getattr(layer, "v4_swiglu_graph_build_calls", 0)
+                    for layer in self.model.offline_owner.layers.values()
+                ),
+                "reference_calls": sum(
+                    getattr(layer, "v4_swiglu_reference_calls", 0) for layer in self.model.offline_owner.layers.values()
+                ),
+                # Capture-time dispatch and Python reference calls are not
+                # device execution evidence; the validator checks real replays.
+                "counters_prove_device_execution": False,
+            },
             "projection_candidates": {
                 "scope": "graph_build_only_eager_and_prefill_vectorized",
                 "graph_build_calls": sum(

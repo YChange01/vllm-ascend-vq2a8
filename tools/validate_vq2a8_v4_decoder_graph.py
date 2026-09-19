@@ -5,7 +5,8 @@
 
 Runs on one idle NPU in a new worker. Exercises 3->4, 7->8, 11->12 compressor
 boundaries, changing token IDs and repeated request/cache-slot reuse. Both modes
-use the *same* resident payload and selected arithmetic/preparation backend.
+use the *same* resident payload. Graph-only candidates retain their independent
+eager reference, including the original Torch SwiGLU for candidate I.
 """
 
 from __future__ import annotations
@@ -29,6 +30,8 @@ from tools.vq2a8_candidate_options import add_candidate_arguments, validate_cand
 
 CASES = ((1, 4), (3, 4), (7, 4), (11, 4), (12, 4), (1, 15))
 REUSE_ROUNDS = 2
+SWIGLU_REFERENCE = "deepseek_v4_swiglu_reference"
+SWIGLU_SCOPE = "graph_build_only_eager_and_prefill_torch"
 
 
 def parse_args(argv=None):
@@ -121,6 +124,39 @@ def require_template_evidence(report):
         or evidence.get("original_builder_skips", 0) < REUSE_ROUNDS * sum(n - 1 for _, n in CASES)
     ):
         raise AssertionError("Missing position-template original-builder metadata equivalence evidence.")
+
+
+def swiglu_eager_evidence(before, after):
+    """Require an actual original-Torch eager pass, not startup counter reuse."""
+    for report in (before, after):
+        evidence = report.get("swiglu_candidates", {})
+        if (
+            report.get("swiglu_mode") != "fused_select_sign"
+            or report.get("effective_graph_mode") != "none"
+            or evidence.get("scope") != SWIGLU_SCOPE
+            or evidence.get("eager_reference") != SWIGLU_REFERENCE
+            or evidence.get("counters_prove_device_execution") is not False
+            or any(
+                type(evidence.get(key)) is not int or evidence[key] < 0
+                for key in ("graph_build_calls", "reference_calls")
+            )
+            or type(report.get("decoder", {}).get("replays")) is not int
+            or report["decoder"]["replays"] < 0
+        ):
+            raise AssertionError("Missing I original-Torch eager-reference report with graphs disabled.")
+    deltas = {
+        key: after["swiglu_candidates"][key] - before["swiglu_candidates"][key]
+        for key in ("graph_build_calls", "reference_calls")
+    }
+    replays = after["decoder"]["replays"] - before["decoder"]["replays"]
+    if deltas["reference_calls"] < 1 or deltas["graph_build_calls"] != 0 or replays != 0:
+        raise AssertionError("I reference pass must call original Torch SwiGLU without graph build or replay.")
+    return {
+        "implementation": SWIGLU_REFERENCE,
+        "graph_disabled": True,
+        **deltas,
+        "decoder_replays": replays,
+    }
 
 
 def compare_outputs(reference, candidate):
@@ -234,6 +270,7 @@ def run_model(args):
         v4_select_sign=args.select_sign,
         v4_activation_tail=args.activation_tail,
         v4_b1_schedule=args.b1_schedule,
+        v4_swiglu_mode=getattr(args, "swiglu_mode", "torch"),
         v4_decode_graph="decoder",
         v4_graph_replay_stream="caller",
         v4_decoder_metadata_mode=args.decoder_metadata_mode,
@@ -266,8 +303,12 @@ def run_model(args):
                 temperature=0, max_tokens=output_length, ignore_eos=True, detokenize=False, logprobs=5
             )
             with stage(f"round{round_id}_p{prompt_length}_o{output_length}_eager"):
-                single_worker_result(llm.collective_rpc(graph_switch, args=(False,)))
+                eager_before = single_worker_result(llm.collective_rpc(graph_switch, args=(False,)))
                 reference = llm.generate([{"prompt_token_ids": prompt}], params, use_tqdm=False)[0].outputs[0]
+                swiglu_reference = None
+                if getattr(args, "swiglu_mode", "torch") == "fused_select_sign":
+                    eager_after = single_worker_result(llm.collective_rpc(graph_report))
+                    swiglu_reference = swiglu_eager_evidence(eager_before, eager_after)
             with stage(f"round{round_id}_p{prompt_length}_o{output_length}_decoder"):
                 before = single_worker_result(llm.collective_rpc(graph_switch, args=(True,)))
                 candidate = llm.generate([{"prompt_token_ids": prompt}], params, use_tqdm=False)[0].outputs[0]
@@ -309,6 +350,8 @@ def run_model(args):
                         "prompt": prompt_length,
                         "output": output_length,
                         "max_logprob_error": error,
+                        "decoder_replays": delta,
+                        "swiglu_eager_reference": swiglu_reference,
                         "input_fastpath_calls": input_hits,
                         "input_serving_comparison": input_comparison,
                     }
@@ -330,6 +373,8 @@ def run_model(args):
         "activation_tail": args.activation_tail,
         "activation_reorder": args.activation_reorder,
         "b1_schedule": args.b1_schedule,
+        "swiglu_mode": getattr(args, "swiglu_mode", "torch"),
+        "swiglu_reference": SWIGLU_REFERENCE,
         "projection_reference": "vectorized_baseline"
         if args.activation_reorder in ("chunk_reuse2", "chunk_reuse4") or args.b1_schedule != "baseline"
         else "selected_backend",
@@ -337,6 +382,7 @@ def run_model(args):
         "decoder_metadata_mode": args.decoder_metadata_mode,
         "library_sha256": options["additional_config"]["vq2a8_offline"]["ascendc_sha256"],
     }
+    validate_receipt(args, receipt)
     (output / "summary.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     print("V4_DECODER_GRAPH=PASS SUMMARY=" + str(output / "summary.json"), flush=True)
     emit("v4_decoder_graph", "CASE_PASS", scope=receipt["scope"])
@@ -433,6 +479,58 @@ def validate_receipt(args, receipt):
             )
         ):
             raise ValueError("Missing J/K graph candidate and independent vectorized reference evidence.")
+    swiglu_mode = getattr(args, "swiglu_mode", "torch")
+    if (
+        receipt.get("swiglu_mode", "torch") != swiglu_mode
+        or receipt.get("graph", {}).get("swiglu_mode", "torch") != swiglu_mode
+    ):
+        raise ValueError("Missing requested I SwiGLU mode evidence.")
+    if swiglu_mode == "fused_select_sign":
+        graph = receipt.get("graph", {})
+        evidence = graph.get("swiglu_candidates", {})
+        if (
+            any(
+                graph.get(key) != value
+                for key, value in (
+                    ("requested_graph_mode", "decoder"),
+                    ("compute_backend", "v2"),
+                    ("activation_preparation", "sign_fused_direct"),
+                    ("select_sign", "fused"),
+                    ("activation_tail", "torch"),
+                    ("activation_reorder", "vectorized"),
+                    ("b1_schedule", "baseline"),
+                )
+            )
+            or receipt.get("swiglu_reference") != SWIGLU_REFERENCE
+            or evidence.get("eager_reference") != SWIGLU_REFERENCE
+            or evidence.get("scope") != SWIGLU_SCOPE
+            or evidence.get("counters_prove_device_execution") is not False
+            or any(
+                type(evidence.get(key)) is not int or evidence[key] < 1
+                for key in ("graph_build_calls", "reference_calls")
+            )
+        ):
+            raise ValueError("Missing I graph candidate and independent original-Torch reference evidence.")
+        for row in receipt["cases"]:
+            reference = row.get("swiglu_eager_reference") or {}
+            if (
+                reference.get("implementation") != SWIGLU_REFERENCE
+                or reference.get("graph_disabled") is not True
+                or type(reference.get("reference_calls")) is not int
+                or reference["reference_calls"] < 1
+                or any(
+                    type(reference.get(key)) is not int or reference[key] != 0
+                    for key in ("graph_build_calls", "decoder_replays")
+                )
+                or type(row.get("decoder_replays")) is not int
+                or row["decoder_replays"] != row["output"] - 1
+            ):
+                raise ValueError("Missing per-case I independent original-Torch eager/decoder replay evidence.")
+        if (
+            sum(row["swiglu_eager_reference"]["reference_calls"] for row in receipt["cases"])
+            > evidence["reference_calls"]
+        ):
+            raise ValueError("I per-case reference evidence exceeds recorded original-Torch calls.")
 
 
 def main(argv=None):
@@ -451,6 +549,7 @@ def main(argv=None):
                     ),
                     "activation_reorder": args.activation_reorder,
                     "b1_schedule": args.b1_schedule,
+                    "swiglu_mode": getattr(args, "swiglu_mode", "torch"),
                     "activation_preparation": args.activation_preparation,
                     "validity_mode": args.validity_mode,
                     "route_mapping": args.route_mapping,
