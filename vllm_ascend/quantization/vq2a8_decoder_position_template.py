@@ -338,20 +338,27 @@ class PositionTemplateAdapter:
             for name in ("speculative_config", "lora_config", "kv_transfer_config")
         ):
             raise ValueError("Position template does not support speculation, LoRA or KV transfer.")
-        if any(
-            getattr(runner, name, False)
+        # Ascend's config normalization can leave cascade_attn_enabled=True
+        # even for a non-cascade DSA step. This is permission to evaluate the
+        # heuristic, not evidence of an active cascade. build() separately
+        # rejects every non-None cascade_attn_prefix_lens before template use.
+        unsupported_features = [
+            name
             for name in (
                 "use_cp",
                 "use_async_scheduling",
                 "use_async_spec_decode",
-                "cascade_attn_enabled",
                 "is_multimodal_model",
                 "enable_prompt_embeds",
                 "is_mm_prefix_lm",
                 "enable_hamming_sparse",
             )
-        ):
-            raise ValueError("Position template runner has unsupported dynamic features.")
+            if getattr(runner, name, False)
+        ]
+        if unsupported_features:
+            raise ValueError(
+                "Position template runner has unsupported dynamic features: " + ", ".join(unsupported_features) + "."
+            )
         if any(
             getattr(config.cache_config, name, False) for name in ("enable_prefix_caching", "kv_sharing_fast_prefill")
         ):

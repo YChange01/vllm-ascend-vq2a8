@@ -238,6 +238,9 @@ def fake_runner(positions=(3, 4)):
             num_computed_tokens_cpu_tensor=torch.tensor([positions[0]]),
         ),
         attn_groups=[[group]],
+        # The Ascend platform can normalize disable_cascade_attn to False;
+        # a true heuristic capability flag does not mean an active cascade.
+        cascade_attn_enabled=True,
         with_prefill=False,
         attn_state=State.DecodeOnly,
         optimistic_seq_lens_cpu=torch.tensor([positions[0] + 1]),
@@ -262,6 +265,62 @@ def fake_runner(positions=(3, 4)):
 
 def build_args(request="a"):
     return dict(num_tokens=1, num_reqs=1, max_query_len=1, num_scheduled_tokens={request: 1})
+
+
+@pytest.mark.parametrize("capability", (False, True))
+def test_cascade_capability_without_active_prefixes_allows_templates(capability):
+    runner, bank, calls = fake_runner()
+    runner.cascade_attn_enabled = capability
+    adapter = install_position_template(runner, bank)
+    request, extra = runner._build_attention_metadata(**build_args(), cascade_attn_prefix_lens=None)
+    bank.entries[3]["metadata"].update(request)
+    assert extra is None
+    assert adapter.hits == 1
+    assert not calls
+
+
+@pytest.mark.parametrize("capability", (False, True))
+@pytest.mark.parametrize("prefixes", ([], [[0]], [[128]]))
+def test_any_explicit_cascade_prefixes_still_fail_before_template_use(capability, prefixes):
+    runner, bank, calls = fake_runner()
+    runner.cascade_attn_enabled = capability
+    adapter = install_position_template(runner, bank)
+    with pytest.raises(ValueError, match="alternate decode builders"):
+        runner._build_attention_metadata(**build_args(), cascade_attn_prefix_lens=prefixes)
+    assert not calls
+    assert adapter.hits == 0
+    assert all(entry["metadata"].copies == 0 for entry in bank.entries.values())
+
+
+@pytest.mark.parametrize(
+    "feature",
+    (
+        "use_cp",
+        "use_async_scheduling",
+        "use_async_spec_decode",
+        "is_multimodal_model",
+        "enable_prompt_embeds",
+        "is_mm_prefix_lm",
+        "enable_hamming_sparse",
+    ),
+)
+@pytest.mark.parametrize("during_replay", (False, True))
+def test_unsupported_dynamic_features_are_named_and_still_rejected(feature, during_replay):
+    runner, bank, calls = fake_runner()
+    if during_replay:
+        adapter = install_position_template(runner, bank)
+    setattr(runner, feature, True)
+    with pytest.raises(ValueError, match=f"unsupported dynamic features: {feature}"):
+        if during_replay:
+            runner._build_attention_metadata(**build_args())
+        else:
+            install_position_template(runner, bank)
+    assert not calls
+    assert all(entry["metadata"].copies == 0 for entry in bank.entries.values())
+    if during_replay:
+        assert adapter.hits == 0
+    else:
+        assert not hasattr(runner, "_vq2a8_position_template")
 
 
 def test_instance_adapter_really_skips_original_builder_and_supports_changed_requests():
