@@ -41,6 +41,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # scenarios in an environment without an NPU. Do not set it to False in
     # other scenarios.
     "COMPILE_CUSTOM_KERNELS": lambda: bool(int(os.getenv("COMPILE_CUSTOM_KERNELS", "1"))),
+    # Build the optional VQ2A8 kernels through the standard package build.
+    # Valid values: 0 (default, disabled), 1 (enabled). Linux Ascend950 only;
+    # COMPILE_CUSTOM_KERNELS must also be enabled. Not sensitive.
+    "VLLM_ASCEND_BUILD_VQ2A8": lambda: bool(int(os.getenv("VLLM_ASCEND_BUILD_VQ2A8", "0"))),
     # The CXX compiler used for compiling the package. If not set, the default
     # value is None, which means the system default CXX compiler will be used.
     "CXX_COMPILER": lambda: os.getenv("CXX_COMPILER", None),

@@ -1557,10 +1557,21 @@ class AscendDSAImpl(DSAAttentionImpl):
         num_tokens = o_proj_input.shape[0]
         group_hidden_dim = o_proj_input.shape[1] * o_proj_input.shape[2] // self.n_local_groups
         o_proj_input = o_proj_input.view(num_tokens, self.n_local_groups, group_hidden_dim)
-        # A5 (Ascend950) uses an FP8-quantized o_proj path (dynamic MX quant
-        # + quantized batch matmul). Preserve it as-is: it predates and is
-        # orthogonal to the OTP / olora_tp paths below, so it must win first.
-        if get_ascend_device_type() in {AscendDeviceType.A5}:
+        is_a5 = get_ascend_device_type() == AscendDeviceType.A5
+        if is_a5 and isinstance(self.wo_a.quant_method, AscendUnquantizedLinearMethod):
+            # A5 is a hardware capability, not a checkpoint quantization mode.
+            # Its unquantized loader retains [G * R, K], unlike the grouped
+            # FP8 post-load layout below and the non-A5 wo_a loader. Use views
+            # of the BF16/FP16 root weight; do not invent MX weight scales.
+            weight = self.wo_a.weight
+            expected = (self.n_local_groups * self.o_lora_rank, group_hidden_dim)
+            if tuple(weight.shape) != expected:
+                raise ValueError(f"A5 unquantized wo_a expects weight shape {expected}, got {tuple(weight.shape)}.")
+            grouped_weight = weight.view(self.n_local_groups, self.o_lora_rank, group_hidden_dim)
+            o = torch.bmm(o_proj_input.transpose(0, 1), grouped_weight.transpose(1, 2))
+            output[...] = self.wo_b(o.transpose(0, 1).reshape(num_tokens, -1))
+        elif is_a5:
+            # Preserve the existing quantized A5 path and its required scales.
             o = o_proj_input
             o, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(o, dst_type=torch.float8_e4m3fn)
             o = torch_npu.npu_transpose_quant_batchmatmul(

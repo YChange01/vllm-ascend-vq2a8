@@ -774,6 +774,10 @@ class NPUWorker(WorkerBase):
         # may cause performance degradation at runtime.
         if get_ascend_device_type() != AscendDeviceType.A5:
             self._warm_up_atb()
+        if getattr(self.model_runner.get_model(), "_v4_decode_graph", None) == "decoder":
+            # Explicit position-specialized decoder capture checkpoints and
+            # restores KV/compressor/indexer buffers before worker readiness.
+            self.model_runner.get_model().prepare_v4_graphs(runner=self.model_runner)
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:

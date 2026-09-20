@@ -84,8 +84,10 @@ bool KvQuantSparseAttnSharedkvMetadataCpuKernel::CheckSingleParam() {
     KERNEL_CHECK_NULLPTR(metaShape, false, "shape of metadata is null");
     KERNEL_CHECK_NULLPTR(metaData_->GetData(), false, "data of metadata is null");
     // 核心数校验
-    if (aicCoreNum_ == 0 || aivCoreNum_ == 0) {
-        KERNEL_LOG_ERROR("AIC num or AIV num should not be 0, but got %u and %u", aicCoreNum_, aivCoreNum_);
+    if (aicCoreNum_ == 0 || aicCoreNum_ > AIC_CORE_NUM ||
+        aivCoreNum_ == 0 || aivCoreNum_ > AIV_CORE_NUM) {
+        KERNEL_LOG_ERROR("Core counts exceed SAS metadata capacity or are zero: aic:%u, aiv:%u",
+                         aicCoreNum_, aivCoreNum_);
         return false;
     }
     // batch_size 非负校验
@@ -1008,7 +1010,27 @@ bool KvQuantSparseAttnSharedkvMetadataCpuKernel::BalanceSchedule(SplitResult &sp
 
 bool KvQuantSparseAttnSharedkvMetadataCpuKernel::GenMetaData(SplitResult &splitRes)
 {
+    constexpr uint64_t outputBytes = SAS_META_SIZE * sizeof(SAS_METADATA_T);
+    static_assert(sizeof(SAS_METADATA_T) == sizeof(uint32_t));
+    static_assert(outputBytes >= sizeof(optiling::detail::SasMetaData));
+    auto shape = metaData_->GetTensorShape();
+    if (shape->GetDims() != 1 || shape->GetDimSize(0) != SAS_META_SIZE ||
+        metaData_->GetDataType() != DT_INT32 || metaData_->GetDataSize() < outputBytes) {
+        KERNEL_LOG_ERROR("SAS metadata output must be 1024 INT32 words with sufficient storage");
+        return false;
+    }
     optiling::detail::SasMetaData* metaDataPtr = (optiling::detail::SasMetaData*)metaData_->GetData();
+
+    // The consumer indexes the fixed 36-FA/72-FD ABI by its block ID. Runtime
+    // platform counts can be smaller than the launch envelope. torch::empty
+    // does not initialize the remaining slots: a stale enable/interval would
+    // send those cores to arbitrary GM addresses. Initialize the entire output,
+    // including the reserved tail, so full metadata comparisons are deterministic.
+    // N128's idle-core FA_S2_MAX_NUM barrier counts are populated below.
+    auto outputWords = static_cast<SAS_METADATA_T*>(metaData_->GetData());
+    for (uint32_t i = 0; i < SAS_META_SIZE; ++i) {
+        outputWords[i] = 0;
+    }
 
     // FA Metadata Generate
     if (isN128) {

@@ -76,8 +76,12 @@ bool VllmQuantLightningIndexerMetadataCpuKernel::CheckSingleParam()
     auto metaShape = metaData_->GetTensorShape();
     KERNEL_CHECK_NULLPTR(metaShape, false, "shape of metadata is null");
     KERNEL_CHECK_NULLPTR(metaData_->GetData(), false, "data of metadata is null");
-    // 核心数校验
-    if (aicCoreNum_ == 0 || aivCoreNum_ == 0 || (aivCoreNum_ % aicCoreNum_ != 0)) {
+    // The consumer maps Vector block i to Cube metadata i / 2. Available
+    // core counts need not be divisible (e.g. Ascend950 reports 28/64).
+    // Require enough Vector partners, and bound both fixed metadata arrays.
+    constexpr uint32_t VECTOR_CORES_PER_CUBE = 2;
+    if (aicCoreNum_ == 0 || aicCoreNum_ > AIC_CORE_NUM || aivCoreNum_ > AIV_CORE_NUM ||
+        aivCoreNum_ < VECTOR_CORES_PER_CUBE * aicCoreNum_) {
         KERNEL_LOG_ERROR("Core num invalid: aic:%u, aiv:%u", aicCoreNum_, aivCoreNum_);
         return false;
     }
@@ -862,7 +866,25 @@ bool VllmQuantLightningIndexerMetadataCpuKernel::BalanceSchedule(SplitResult &sp
 
 bool VllmQuantLightningIndexerMetadataCpuKernel::GenMetaData(SplitResult &splitRes)
 {
+    constexpr uint64_t outputBytes = QLI_META_SIZE * sizeof(QLI_METADATA_T);
+    static_assert(sizeof(QLI_METADATA_T) == sizeof(uint32_t));
+    static_assert(outputBytes >= sizeof(optiling::detail::QliMetaData));
+    auto shape = metaData_->GetTensorShape();
+    if (shape->GetDims() != 1 || shape->GetDimSize(0) != QLI_META_SIZE ||
+        metaData_->GetDataType() != DT_INT32 || metaData_->GetDataSize() < outputBytes) {
+        KERNEL_LOG_ERROR("QLI metadata output must be 1024 INT32 words with sufficient storage");
+        return false;
+    }
     optiling::detail::QliMetaData* metaDataPtr = (optiling::detail::QliMetaData*)metaData_->GetData();
+    // The torch binding allocates an uninitialized buffer. Extra Vector
+    // blocks can consult LI slots beyond aicCoreNum_; leave all unused slots
+    // disabled, including cores absent from this runtime's available counts.
+    // Include the reserved tail: full output comparisons must not depend on
+    // allocation history even though the attention consumer ignores that tail.
+    auto outputWords = static_cast<QLI_METADATA_T*>(metaData_->GetData());
+    for (uint32_t i = 0; i < QLI_META_SIZE; ++i) {
+        outputWords[i] = 0;
+    }
     // LI Metadata Generate
     for (size_t i = 0; i < aicCoreNum_; ++i) {
         if (i >= splitRes.usedCoreNum) {

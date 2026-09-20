@@ -202,3 +202,7 @@ if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()
+
+# VQ2A8 is an explicit Ascend950 build option. Ordinary package builds do not
+# compile or load its specialized kernels.
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/vq2a8.cmake)

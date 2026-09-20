@@ -1,0 +1,18 @@
+Source provenance and licensing status
+=====================================
+
+kernel.cpp and layout.h adapt the user-supplied internal expert implementation
+mat_fp4_aic.cce/mat_fp4_aiv.cce and its layout. launch.h also retains its original
+provenance annotation. The original materials were
+provided in a conversation on 2026-09-09, not as a separately licensed public
+upstream dependency.
+
+The original extraction explicitly recorded that these materials were company
+internal and that inclusion in this repository did not grant a new license or
+relicense them under Apache-2.0. This clean extraction preserves that status.
+It does not assert authorization to contribute the derived implementation to
+vllm-project/vllm-ascend.
+
+Before an upstream contribution or redistribution under a new license, obtain
+and review the original copyright/license notices and the rights holder's
+permission. This file is a provenance warning, not a license grant.
